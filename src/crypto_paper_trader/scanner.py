@@ -251,6 +251,7 @@ def run_multi_asset_rotation_backtest(
 
         executions = ledger.fetch_all_executions()
         final_snapshot = snapshot
+        ledger.close()
 
     sell_executions = [item for item in executions if item.side == OrderSide.SELL]
     winning_pnls = [

@@ -113,8 +113,8 @@ class StrategyConfig:
     rsi_period: int = 14
     atr_period: int = 14
     volume_climax_multiplier: float = 1.5
-    rsi_entry_min: float = 48.0
-    rsi_entry_max: float = 60.0
+    rsi_entry_min: float = 44.0
+    rsi_entry_max: float = 64.0
     rsi_oversold_threshold: float = 28.0
     rsi_overbought_exit: float = 64.0
     atr_stop_loss_multiplier: float = 2.2

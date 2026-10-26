@@ -22,7 +22,14 @@ class NullNotificationService:
     """No-op notification service used when mobile alerts are disabled."""
 
     def send_alert(self, message: str) -> bool:
-        """Ignore alert message and return False."""
+        """Ignore alert message and return False.
+
+        Args:
+            message: Alert text payload.
+
+        Returns:
+            Always False indicating no external message was sent.
+        """
         return False
 
 
@@ -30,7 +37,15 @@ def discover_telegram_chat_id(
     bot_token: str,
     timeout_seconds: float = 15.0,
 ) -> str:
-    """Auto-discover the recipient chat_id from recent Telegram Bot getUpdates."""
+    """Auto-discover the recipient chat_id from recent Telegram Bot getUpdates.
+
+    Args:
+        bot_token: Telegram Bot HTTP API token provided by BotFather.
+        timeout_seconds: HTTP request timeout in seconds.
+
+    Returns:
+        Discovered numeric chat_id string if available, otherwise empty string.
+    """
     endpoint = f"https://api.telegram.org/bot{bot_token.strip()}/getUpdates"
     try:
         with httpx.Client(timeout=timeout_seconds) as client:
@@ -52,7 +67,13 @@ def discover_telegram_chat_id(
 
 
 class TelegramNotificationService:
-    """Telegram Bot API client for pushing instant mobile trading notifications."""
+    """Telegram Bot API client for pushing instant mobile trading notifications.
+
+    Args:
+        bot_token: Telegram Bot HTTP API token provided by BotFather.
+        chat_id: Target Telegram user or channel numeric chat identifier.
+        timeout_seconds: HTTP request timeout in seconds.
+    """
 
     def __init__(
         self,
@@ -65,7 +86,14 @@ class TelegramNotificationService:
         self._timeout_seconds = timeout_seconds
 
     def send_alert(self, message: str) -> bool:
-        """Send a trading alert message to the user mobile Telegram app."""
+        """Send a trading alert message to the user mobile Telegram app.
+
+        Args:
+            message: Plain-text message content to deliver.
+
+        Returns:
+            True if Telegram accepted the message, False on network failure.
+        """
         if not self._bot_token:
             return False
 
@@ -100,7 +128,13 @@ class TelegramNotificationService:
 
 
 class NtfyNotificationService:
-    """Free registration-less mobile push notifier powered by ntfy.sh."""
+    """Free registration-less mobile push notifier powered by ntfy.sh.
+
+    Args:
+        topic: Unique secret topic name subscribed in the ntfy mobile app.
+        base_url: Base HTTP URL for the ntfy server.
+        timeout_seconds: HTTP request timeout in seconds.
+    """
 
     def __init__(
         self,
@@ -113,7 +147,14 @@ class NtfyNotificationService:
         self._timeout_seconds = timeout_seconds
 
     def send_alert(self, message: str) -> bool:
-        """Push a real-time alert to the ntfy mobile application."""
+        """Push a real-time alert to the ntfy mobile application.
+
+        Args:
+            message: Plain-text message content to deliver.
+
+        Returns:
+            True if the ntfy server accepted the push, False otherwise.
+        """
         if not self._topic:
             return False
 
@@ -138,7 +179,12 @@ class NtfyNotificationService:
 
 
 class DiscordNotificationService:
-    """Discord Webhook client for free mobile and desktop trade notifications."""
+    """Discord Webhook client for free mobile and desktop trade notifications.
+
+    Args:
+        webhook_url: Full Discord channel webhook URL.
+        timeout_seconds: HTTP request timeout in seconds.
+    """
 
     def __init__(
         self,
@@ -149,7 +195,14 @@ class DiscordNotificationService:
         self._timeout_seconds = timeout_seconds
 
     def send_alert(self, message: str) -> bool:
-        """Send a trading alert message to a Discord webhook channel."""
+        """Send a trading alert message to a Discord webhook channel.
+
+        Args:
+            message: Plain-text message content to deliver.
+
+        Returns:
+            True if Discord accepted the webhook payload, False otherwise.
+        """
         if not self._webhook_url:
             return False
 
@@ -167,13 +220,24 @@ class DiscordNotificationService:
 
 
 class MultiChannelNotificationService:
-    """Composite notifier that broadcasts alerts across all configured channels."""
+    """Composite notifier that broadcasts alerts across all configured channels.
+
+    Args:
+        channels: Sequence of active NotificationService implementations.
+    """
 
     def __init__(self, channels: list[NotificationService]) -> None:
         self._channels = channels
 
     def send_alert(self, message: str) -> bool:
-        """Broadcast an alert to every configured mobile notification channel."""
+        """Broadcast an alert to every configured mobile notification channel.
+
+        Args:
+            message: Plain-text message content to deliver.
+
+        Returns:
+            True if at least one channel delivered the message successfully.
+        """
         delivered = False
         for channel in self._channels:
             if channel.send_alert(message):
@@ -182,7 +246,11 @@ class MultiChannelNotificationService:
 
 
 def build_notifier_from_env() -> NotificationService:
-    """Construct active mobile notification services from environment variables."""
+    """Construct active mobile notification services from environment variables.
+
+    Returns:
+        MultiChannelNotificationService if any channel is configured, else Null.
+    """
     channels: list[NotificationService] = []
 
     ntfy_topic = os.getenv("NTFY_TOPIC", "").strip()
@@ -215,11 +283,19 @@ def build_notifier_from_env() -> NotificationService:
 
 
 def translate_exit_reason(reason: str) -> str:
-    """Translate an internal exit reason code into a user-friendly Spanish label."""
+    """Translate an internal exit reason code into a user-friendly Spanish label.
+
+    Args:
+        reason: Internal exit trigger identifier string.
+
+    Returns:
+        Descriptive Spanish explanation of the exit trigger.
+    """
     translations = {
         "TAKE_PROFIT": "META DE GANANCIA ALCANZADA (TAKE PROFIT)",
         "STOP_LOSS": "LIMITE DE PROTECCION ACTIVADO (STOP LOSS)",
         "SIGNAL_REVERSAL": "TOMA DE GANANCIA POR SOBRECOMPRA",
+        "TRAILING_STOP": "GANANCIA PROTEGIDA (TRAILING STOP)",
     }
     return translations.get(reason, reason)
 
@@ -232,7 +308,19 @@ def format_execution_alert(
     stop_loss_price: float | None = None,
     take_profit_price: float | None = None,
 ) -> str:
-    """Format a TradeExecution into a Spanish mobile notification summary."""
+    """Format a TradeExecution into a Spanish mobile notification summary.
+
+    Args:
+        execution: Completed buy or sell TradeExecution record.
+        available_cash_usdt: Remaining uninvested USDT balance.
+        cop_per_usdt_rate: Exchange rate from USDT to Colombian Pesos.
+        is_live_order: True if executed on real Binance Spot account, False for paper.
+        stop_loss_price: Optional protective stop loss price for BUY alerts.
+        take_profit_price: Optional target take profit price for BUY alerts.
+
+    Returns:
+        Multi-line Spanish summary of trade details and portfolio balances.
+    """
     mode_label = "BINANCE REAL" if is_live_order else "SIMULACION"
     base_asset = (
         execution.symbol[:-4]

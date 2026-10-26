@@ -4,7 +4,12 @@ import logging
 from dataclasses import dataclass
 
 from crypto_paper_trader.config import TradingSystemConfig
-from crypto_paper_trader.domain import Candle, MarketSignal, PortfolioSnapshot
+from crypto_paper_trader.domain import (
+    Candle,
+    MarketSignal,
+    PortfolioSnapshot,
+    SignalType,
+)
 from crypto_paper_trader.execution import LedgerRepository, PaperTradingEngine
 from crypto_paper_trader.ingestion import MarketDataProvider
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
@@ -16,7 +21,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class CycleEvaluationResult:
-    """Result of a single real-time market evaluation and execution cycle."""
+    """Result of a single real-time market evaluation and execution cycle.
+
+    Args:
+        latest_candle: Most recent market candle processed.
+        signal: Strategy signal computed from the rolling window.
+        snapshot: Updated portfolio valuation snapshot.
+    """
 
     latest_candle: Candle
     signal: MarketSignal
@@ -24,7 +35,13 @@ class CycleEvaluationResult:
 
 
 class RealTimeTradingOrchestrator:
-    """Asynchronous coordinator for ingestion, strategy evaluation, and execution."""
+    """Asynchronous coordinator for ingestion, strategy evaluation, and execution.
+
+    Args:
+        config: Full trading system configuration.
+        market_data_provider: Market data provider implementation.
+        trading_engine: Stateful paper trading engine.
+    """
 
     def __init__(
         self,
@@ -36,9 +53,18 @@ class RealTimeTradingOrchestrator:
         self._provider = market_data_provider
         self._engine = trading_engine
         self._candle_buffer: dict[int, Candle] = {}
+        self._last_log_time: float = 0.0
+        self._last_logged_signal: SignalType | None = None
 
     def _upsert_candle(self, candle: Candle) -> list[Candle]:
-        """Insert or update a candle in the rolling window by open_time epoch."""
+        """Insert or update a candle in the rolling window by open_time epoch.
+
+        Args:
+            candle: Historical or live Candle record.
+
+        Returns:
+            Sorted list of buffered candles trimmed to bootstrap_candle_limit.
+        """
         epoch_key = int(candle.open_time.timestamp())
         self._candle_buffer[epoch_key] = candle
 
@@ -51,7 +77,11 @@ class RealTimeTradingOrchestrator:
         return [self._candle_buffer[key] for key in sorted(self._candle_buffer.keys())]
 
     async def bootstrap_market_history(self) -> list[Candle]:
-        """Load initial historical candles into the rolling memory buffer."""
+        """Load initial historical candles into the rolling memory buffer.
+
+        Returns:
+            Chronological list of bootstrapped candles.
+        """
         historical_candles = await self._provider.fetch_historical_candles()
         ordered_candles: list[Candle] = []
         for candle in historical_candles:
@@ -66,7 +96,14 @@ class RealTimeTradingOrchestrator:
         return ordered_candles
 
     def process_candle_event(self, candle: Candle) -> CycleEvaluationResult:
-        """Process a single candle tick through risk checks, strategy, and execution."""
+        """Process a single candle tick through risk checks, strategy, and execution.
+
+        Args:
+            candle: Incoming live or historical candle.
+
+        Returns:
+            CycleEvaluationResult summarizing signal and portfolio equity.
+        """
         rolling_candles = self._upsert_candle(candle)
 
         self._engine.evaluate_protective_exits(
@@ -87,19 +124,28 @@ class RealTimeTradingOrchestrator:
             timestamp=candle.close_time,
         )
 
-        logger.info(
-            "Tick processed | symbol=%s price=%.4f signal=%s rsi=%.2f "
-            "fast_ema=%.4f slow_ema=%.4f atr=%.4f equity=%.4f USDT (%.0f COP)",
-            signal.symbol,
-            signal.reference_price,
-            signal.signal_type.value,
-            signal.rsi_value,
-            signal.fast_ema,
-            signal.slow_ema,
-            signal.atr_value,
-            snapshot.total_equity_usdt,
-            snapshot.total_equity_cop,
+        now_ts = candle.close_time.timestamp()
+        should_log = (
+            (now_ts - self._last_log_time >= 25.0)
+            or (signal.signal_type != self._last_logged_signal)
+            or (candle.is_closed)
         )
+        if should_log:
+            self._last_log_time = now_ts
+            self._last_logged_signal = signal.signal_type
+            logger.info(
+                "Tick processed | symbol=%s price=%.4f signal=%s rsi=%.2f "
+                "fast_ema=%.4f slow_ema=%.4f atr=%.4f equity=%.4f USDT (%.0f COP)",
+                signal.symbol,
+                signal.reference_price,
+                signal.signal_type.value,
+                signal.rsi_value,
+                signal.fast_ema,
+                signal.slow_ema,
+                signal.atr_value,
+                snapshot.total_equity_usdt,
+                snapshot.total_equity_cop,
+            )
         return CycleEvaluationResult(
             latest_candle=candle,
             signal=signal,
@@ -109,7 +155,14 @@ class RealTimeTradingOrchestrator:
     async def run_realtime_session(
         self, max_ws_events: int | None = None
     ) -> list[CycleEvaluationResult]:
-        """Run the end-to-end real-time paper trading loop over WebSockets."""
+        """Run the end-to-end real-time paper trading loop over WebSockets.
+
+        Args:
+            max_ws_events: Optional cap on WebSocket events for bounded runs.
+
+        Returns:
+            List of CycleEvaluationResult objects produced during the session.
+        """
         await self.bootstrap_market_history()
         results: list[CycleEvaluationResult] = []
 
@@ -128,7 +181,17 @@ def build_default_orchestrator(
     notifier: NotificationService | None = None,
     live_client: BinanceSpotAuthenticatedClient | None = None,
 ) -> RealTimeTradingOrchestrator:
-    """Assemble a RealTimeTradingOrchestrator with its ledger and engine."""
+    """Assemble a RealTimeTradingOrchestrator with its ledger and engine.
+
+    Args:
+        config: Full trading system configuration.
+        provider: MarketDataProvider implementation for REST and WebSocket IO.
+        notifier: Optional mobile notification service.
+        live_client: Optional authenticated Binance client for live orders.
+
+    Returns:
+        Configured RealTimeTradingOrchestrator instance.
+    """
     ledger = LedgerRepository(db_path=config.ledger_db_path)
     engine = PaperTradingEngine(
         capital_config=config.capital,

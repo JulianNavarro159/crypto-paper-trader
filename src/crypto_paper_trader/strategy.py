@@ -14,7 +14,15 @@ from crypto_paper_trader.validation import (
 
 
 def compute_ema(series: pd.Series, span: int) -> pd.Series:
-    """Compute vectorized Exponential Moving Average over a price series."""
+    """Compute vectorized Exponential Moving Average over a price series.
+
+    Args:
+        series: Input numeric price series.
+        span: Lookback span in periods.
+
+    Returns:
+        Series containing the exponential moving average values.
+    """
     return series.ewm(span=span, adjust=False).mean()
 
 
@@ -23,7 +31,16 @@ def compute_bollinger_bands(
     period: int,
     std_multiplier: float,
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Compute vectorized Bollinger Bands (lower, middle, upper)."""
+    """Compute vectorized Bollinger Bands (lower, middle, upper).
+
+    Args:
+        close_series: Series of closing prices.
+        period: Moving average and standard deviation lookback window.
+        std_multiplier: Multiplier applied to rolling standard deviation.
+
+    Returns:
+        Tuple of (lower_band, middle_band, upper_band) Series.
+    """
     middle_band = close_series.rolling(window=period, min_periods=1).mean()
     rolling_std = (
         close_series.rolling(window=period, min_periods=1).std(ddof=0).fillna(0.0)
@@ -34,7 +51,15 @@ def compute_bollinger_bands(
 
 
 def compute_rsi(close_series: pd.Series, period: int) -> pd.Series:
-    """Compute vectorized Relative Strength Index using Wilder smoothing."""
+    """Compute vectorized Relative Strength Index using Wilder smoothing.
+
+    Args:
+        close_series: Series of closing prices.
+        period: Lookback window for RSI calculation.
+
+    Returns:
+        Series of RSI values bounded between 0 and 100.
+    """
     delta = close_series.diff()
     gains = delta.clip(lower=0.0)
     losses = -delta.clip(upper=0.0)
@@ -55,7 +80,17 @@ def compute_atr(
     close_series: pd.Series,
     period: int,
 ) -> pd.Series:
-    """Compute vectorized Average True Range volatility indicator."""
+    """Compute vectorized Average True Range volatility indicator.
+
+    Args:
+        high_series: Series of high prices.
+        low_series: Series of low prices.
+        close_series: Series of close prices.
+        period: Lookback window for smoothing true range.
+
+    Returns:
+        Series of strictly positive ATR values.
+    """
     previous_close = close_series.shift(1)
     true_range_components = pd.concat(
         [
@@ -70,7 +105,15 @@ def compute_atr(
 
 
 def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
-    """Enrich an OHLCV DataFrame with multi-regime technical indicators and signals."""
+    """Enrich an OHLCV DataFrame with multi-regime technical indicators and signals.
+
+    Args:
+        frame: Validated DataFrame containing OHLCV columns.
+        config: Strategy hyperparameters.
+
+    Returns:
+        New DataFrame with trend, momentum, volatility, and signal_type columns.
+    """
     enriched = frame.copy()
     enriched["fast_ema"] = compute_ema(enriched["close_price"], config.fast_ema_period)
     enriched["slow_ema"] = compute_ema(enriched["close_price"], config.slow_ema_period)
@@ -124,7 +167,21 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         & (enriched["rsi"] <= config.rsi_entry_max)
     )
 
-    buy_mask = climax_dip_rebound | uptrend_pullback
+    trend_momentum_breakout = (
+        (enriched["fast_ema"] > enriched["slow_ema"])
+        & (enriched["close_price"] > enriched["trend_ema"])
+        & (
+            (enriched["fast_ema"] - enriched["slow_ema"])
+            >= (enriched["fast_ema"] - enriched["slow_ema"]).shift(1)
+        )
+        & (enriched["close_price"] > enriched["high_price"].shift(1))
+        & (enriched["close_price"] > enriched["open_price"])
+        & (enriched["volume"] >= (enriched["vol_sma"] * 1.10))
+        & (enriched["rsi"] >= 50.0)
+        & (enriched["rsi"] <= 68.0)
+    )
+
+    buy_mask = climax_dip_rebound | uptrend_pullback | trend_momentum_breakout
     sell_mask = (enriched["rsi"] >= config.rsi_overbought_exit) | (
         enriched["high_price"] >= enriched["bb_upper"]
     )
@@ -143,7 +200,16 @@ def build_market_signal_from_row(
     symbol: str,
     config: StrategyConfig,
 ) -> MarketSignal:
-    """Construct a MarketSignal domain instance from an enriched DataFrame row."""
+    """Construct a MarketSignal domain instance from an enriched DataFrame row.
+
+    Args:
+        row: Series from an indicator-enriched OHLCV DataFrame.
+        symbol: Trading pair identifier.
+        config: Strategy configuration parameters.
+
+    Returns:
+        MarketSignal with dynamic ATR stop loss and take profit levels.
+    """
     reference_price = float(row["close_price"])
     raw_atr = float(row["atr"])
     effective_atr = max(raw_atr, reference_price * 0.0025)
@@ -181,7 +247,19 @@ def evaluate_market_signal(
     symbol: str,
     config: StrategyConfig,
 ) -> MarketSignal:
-    """Evaluate a sequence of candles and produce a deterministic trading signal."""
+    """Evaluate a sequence of candles and produce a deterministic trading signal.
+
+    Args:
+        candles: Historical and latest market candles in chronological order.
+        symbol: Trading pair identifier.
+        config: Strategy configuration parameters.
+
+    Returns:
+        MarketSignal containing the decision and protective price levels.
+
+    Raises:
+        MarketDataValidationError: If input candles fail validation checks.
+    """
     min_required_rows = (
         max(
             config.slow_ema_period,

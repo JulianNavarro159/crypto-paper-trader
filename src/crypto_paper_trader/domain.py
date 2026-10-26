@@ -26,6 +26,7 @@ class ExitReason(str, Enum):
     STOP_LOSS = "STOP_LOSS"
     TAKE_PROFIT = "TAKE_PROFIT"
     SIGNAL_REVERSAL = "SIGNAL_REVERSAL"
+    TRAILING_STOP = "TRAILING_STOP"
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ class Position:
     entry_fee_usdt: float
     stop_loss_price: float
     take_profit_price: float
+    peak_price: float = 0.0
 
 
 @dataclass(frozen=True)

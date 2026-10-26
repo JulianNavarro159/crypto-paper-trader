@@ -31,7 +31,31 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class BacktestPerformanceReport:
-    """Comprehensive financial and statistical summary of a historical backtest."""
+    """Comprehensive financial and statistical summary of a historical backtest.
+
+    Args:
+        symbol: Trading pair identifier evaluated.
+        interval: Kline timeframe interval.
+        candles_evaluated: Total number of historical candles processed.
+        period_start: UTC opening timestamp of the first candle.
+        period_end: UTC closing timestamp of the final candle.
+        initial_capital_cop: Starting capital in Colombian Pesos.
+        final_equity_cop: Final portfolio equity in Colombian Pesos.
+        initial_capital_usdt: Starting capital in USDT.
+        final_equity_usdt: Final portfolio equity in USDT.
+        net_pnl_usdt: Net profit or loss in USDT after all fees.
+        net_pnl_cop: Net profit or loss in Colombian Pesos after all fees.
+        net_return_pct: Percentage return on initial capital.
+        total_closed_trades: Count of completed buy-to-sell round-trip trades.
+        winning_trades: Count of closed trades with positive net PnL.
+        losing_trades: Count of closed trades with negative or zero net PnL.
+        win_rate_pct: Percentage of closed trades that were profitable.
+        profit_factor: Ratio of gross winning PnL to absolute gross losing PnL.
+        max_drawdown_pct: Maximum peak-to-trough equity decline percentage.
+        total_fees_paid_usdt: Cumulative Binance spot fees paid in USDT.
+        total_fees_paid_cop: Cumulative Binance spot fees paid in COP.
+        executions: Chronological tuple of all simulated TradeExecution records.
+    """
 
     symbol: str
     interval: str
@@ -57,7 +81,14 @@ class BacktestPerformanceReport:
 
 
 def compute_max_drawdown_pct(equity_curve: Sequence[float]) -> float:
-    """Calculate the maximum peak-to-trough percentage drawdown of an equity series."""
+    """Calculate the maximum peak-to-trough percentage drawdown of an equity series.
+
+    Args:
+        equity_curve: Chronological sequence of total portfolio equity values.
+
+    Returns:
+        Maximum drawdown expressed as a positive percentage between 0 and 100.
+    """
     if not equity_curve:
         return 0.0
 
@@ -74,7 +105,16 @@ def generate_vectorized_signals(
     symbol: str,
     config: StrategyConfig,
 ) -> list[tuple[Candle, MarketSignal]]:
-    """Compute indicators and trading signals across a historical candle series."""
+    """Compute indicators and trading signals across a historical candle series.
+
+    Args:
+        candles: Chronological sequence of historical OHLCV candles.
+        symbol: Trading pair symbol.
+        config: Strategy indicator hyperparameters.
+
+    Returns:
+        List of pairs matching each post-warmup Candle with its MarketSignal.
+    """
     warmup_rows = (
         max(
             config.slow_ema_period,
@@ -109,7 +149,15 @@ def _execute_simulation_loop(
     paired_signals: Sequence[tuple[Candle, MarketSignal]],
     engine: PaperTradingEngine,
 ) -> list[float]:
-    """Run bar-by-bar order execution and protective exit checks over signals."""
+    """Run bar-by-bar order execution and protective exit checks over signals.
+
+    Args:
+        paired_signals: Sequence of historical candles paired with signals.
+        engine: Initialized PaperTradingEngine instance.
+
+    Returns:
+        Chronological list of total portfolio equity in USDT after each candle.
+    """
     equity_curve: list[float] = []
     for candle, signal in paired_signals:
         active_pos = engine.active_position
@@ -143,7 +191,16 @@ def run_historical_backtest(
     config: TradingSystemConfig,
     ledger_db_path: Path | None = None,
 ) -> BacktestPerformanceReport:
-    """Execute a deterministic historical backtest using the paper trading engine."""
+    """Execute a deterministic historical backtest using the paper trading engine.
+
+    Args:
+        candles: Historical OHLCV candles in chronological order.
+        config: Full trading system configuration including capital and fees.
+        ledger_db_path: Optional SQLite path to persist backtest executions.
+
+    Returns:
+        BacktestPerformanceReport detailing net returns, win rate, and fees.
+    """
     paired_signals = generate_vectorized_signals(
         candles=candles,
         symbol=config.exchange.symbol,
@@ -170,6 +227,7 @@ def run_historical_backtest(
             timestamp=final_candle.close_time,
         )
         executions = ledger.fetch_all_executions()
+        ledger.close()
 
     sell_executions = [item for item in executions if item.side == OrderSide.SELL]
     winning_pnls = [
