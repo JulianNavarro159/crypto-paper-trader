@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -23,10 +24,24 @@ from crypto_paper_trader.domain import (
 from crypto_paper_trader.execution import LedgerRepository, PaperTradingEngine
 from crypto_paper_trader.ingestion import BinanceMarketDataClient
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class AssetProjectionScore:
-    """Quantitative ranking metrics for a single cryptocurrency in the universe."""
+    """Quantitative ranking metrics for a single cryptocurrency in the universe.
+
+    Args:
+        symbol: Trading pair identifier.
+        category: Basket classification (STABLE_CORE or HIGH_VOLATILITY).
+        current_price: Latest closing price in USDT.
+        atr_volatility_pct: Average True Range expressed as percentage of price.
+        historical_return_pct: Net percentage return in backtest evaluation.
+        win_rate_pct: Percentage of profitable closed trades.
+        profit_factor: Ratio of gross profit to gross loss.
+        closed_trades: Count of completed round-trip trades.
+        composite_score: Combined ranking score for future trading selection.
+    """
 
     symbol: str
     category: str
@@ -43,15 +58,30 @@ async def fetch_universe_candles(
     config: TradingSystemConfig,
     candle_count: int = 720,
 ) -> dict[str, list[Candle]]:
-    """Concurrently fetch historical candles for all symbols in the universe."""
+    """Concurrently fetch historical candles for all symbols in the universe.
+
+    Args:
+        config: Trading system configuration containing universe symbols.
+        candle_count: Number of historical candles to retrieve per symbol.
+
+    Returns:
+        Dictionary mapping each symbol to its chronological list of Candles.
+    """
+    semaphore = asyncio.Semaphore(2)
 
     async def _fetch_single(symbol: str) -> tuple[str, list[Candle]]:
-        symbol_exchange_cfg = replace(config.exchange, symbol=symbol)
-        client = BinanceMarketDataClient(config=symbol_exchange_cfg)
-        candles = await client.fetch_paginated_historical_candles(
-            total_candles=candle_count
-        )
-        return symbol, candles
+        async with semaphore:
+            symbol_exchange_cfg = replace(config.exchange, symbol=symbol)
+            client = BinanceMarketDataClient(config=symbol_exchange_cfg)
+            try:
+                candles = await client.fetch_paginated_historical_candles(
+                    total_candles=candle_count
+                )
+            except Exception as exc:
+                logger.warning("Failed to fetch klines for %s: %s", symbol, exc)
+                candles = []
+            await asyncio.sleep(0.25)
+            return symbol, candles
 
     tasks = [_fetch_single(sym) for sym in config.universe.all_symbols]
     pairs = await asyncio.gather(*tasks)
@@ -62,7 +92,15 @@ def evaluate_universe_projection(
     candles_by_symbol: dict[str, Sequence[Candle]],
     config: TradingSystemConfig,
 ) -> list[AssetProjectionScore]:
-    """Evaluate and rank all symbols in the universe by quantitative projection."""
+    """Evaluate and rank all symbols in the universe by quantitative projection.
+
+    Args:
+        candles_by_symbol: Mapping of symbol names to historical candle sequences.
+        config: Full trading system configuration.
+
+    Returns:
+        List of AssetProjectionScore sorted descending by composite_score.
+    """
     core_set = set(config.universe.core_symbols)
     scores: list[AssetProjectionScore] = []
 
@@ -111,7 +149,15 @@ def run_multi_asset_rotation_backtest(
     candles_by_symbol: dict[str, Sequence[Candle]],
     config: TradingSystemConfig,
 ) -> BacktestPerformanceReport:
-    """Simulate dynamic capital rotation across all 10 universe coins."""
+    """Simulate dynamic capital rotation across all 10 universe coins.
+
+    Args:
+        candles_by_symbol: Mapping of symbol names to historical candle sequences.
+        config: Full trading system configuration.
+
+    Returns:
+        BacktestPerformanceReport summarizing combined multi-asset performance.
+    """
     signals_by_symbol: dict[str, dict[datetime, tuple[Candle, MarketSignal]]] = {}
     all_timestamps: set[datetime] = set()
 

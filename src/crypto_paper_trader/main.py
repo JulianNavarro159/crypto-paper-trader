@@ -38,7 +38,11 @@ logger = logging.getLogger(__name__)
 
 
 def configure_structured_logging(level: int = logging.INFO) -> None:
-    """Configure application-wide structured logging format."""
+    """Configure application-wide structured logging format.
+
+    Args:
+        level: Standard Python logging level constant.
+    """
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -47,7 +51,14 @@ def configure_structured_logging(level: int = logging.INFO) -> None:
 
 
 def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Parse command-line options for the trading, scanning, and backtest runner."""
+    """Parse command-line options for the trading, scanning, and backtest runner.
+
+    Args:
+        argv: Optional list of CLI argument strings.
+
+    Returns:
+        Parsed Namespace containing runtime flags.
+    """
     parser = argparse.ArgumentParser(
         description="Binance Spot Multi-Asset Scanner, Backtester, and Live Trader"
     )
@@ -115,7 +126,11 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
 
 
 def log_backtest_summary(report: BacktestPerformanceReport) -> None:
-    """Emit structured log summary of historical backtest metrics."""
+    """Emit structured log summary of historical backtest metrics.
+
+    Args:
+        report: Completed BacktestPerformanceReport instance.
+    """
     logger.info(
         "BACKTEST SUMMARY | symbol=%s interval=%s candles=%d period=%s..%s",
         report.symbol,
@@ -150,7 +165,11 @@ def log_backtest_summary(report: BacktestPerformanceReport) -> None:
 
 
 def log_universe_ranking(rankings: Sequence[AssetProjectionScore]) -> None:
-    """Emit structured log table ranking the 10-coin universe by projection."""
+    """Emit structured log table ranking the 10-coin universe by projection.
+
+    Args:
+        rankings: Sorted sequence of AssetProjectionScore records.
+    """
     for rank_idx, item in enumerate(rankings, start=1):
         logger.info(
             "UNIVERSE RANK #%d | symbol=%s category=%s score=%.2f "
@@ -221,7 +240,11 @@ async def start_cloud_health_server() -> None:
 
 
 async def run_application(args: argparse.Namespace) -> None:
-    """Build and run the selected trading pipeline mode from CLI arguments."""
+    """Build and run the selected trading pipeline mode from CLI arguments.
+
+    Args:
+        args: Parsed command-line arguments.
+    """
     load_dotenv()
     await start_cloud_health_server()
     notifier = build_notifier_from_env()
@@ -342,20 +365,27 @@ async def run_application(args: argparse.Namespace) -> None:
             exchange=replace(config.exchange, symbol=existing_open_pos.symbol),
         )
     elif args.auto_select:
-        universe_candles = await fetch_universe_candles(
-            config=config,
-            candle_count=args.backtest_candles,
-        )
-        rankings = evaluate_universe_projection(
-            candles_by_symbol=universe_candles,
-            config=config,
-        )
-        log_universe_ranking(rankings)
-        if rankings:
-            best_symbol = rankings[0].symbol
-            config = replace(
-                config,
-                exchange=replace(config.exchange, symbol=best_symbol),
+        try:
+            universe_candles = await fetch_universe_candles(
+                config=config,
+                candle_count=args.backtest_candles,
+            )
+            rankings = evaluate_universe_projection(
+                candles_by_symbol=universe_candles,
+                config=config,
+            )
+            log_universe_ranking(rankings)
+            if rankings:
+                best_symbol = rankings[0].symbol
+                config = replace(
+                    config,
+                    exchange=replace(config.exchange, symbol=best_symbol),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Initial universe scan failed (%s); defaulting to %s.",
+                exc,
+                config.exchange.symbol,
             )
 
     provider = BinanceMarketDataClient(config=config.exchange)
@@ -410,31 +440,42 @@ async def run_application(args: argparse.Namespace) -> None:
                 "Running scheduled %.1fh universe projection rescan...",
                 args.rescan_hours,
             )
-            universe_candles = await fetch_universe_candles(
-                config=config,
-                candle_count=args.backtest_candles,
-            )
-            rankings = evaluate_universe_projection(
-                candles_by_symbol=universe_candles,
-                config=config,
-            )
-            log_universe_ranking(rankings)
-            if rankings and rankings[0].symbol != config.exchange.symbol:
-                new_symbol = rankings[0].symbol
-                config = replace(
-                    config,
-                    exchange=replace(config.exchange, symbol=new_symbol),
+            try:
+                universe_candles = await fetch_universe_candles(
+                    config=config,
+                    candle_count=args.backtest_candles,
                 )
-                provider = BinanceMarketDataClient(config=config.exchange)
-                notifier.send_alert(
-                    f"ROTACION AUTOMATICA DE MONEDA\n"
-                    f"Nueva moneda con mayor proyeccion: {new_symbol} "
-                    f"({config.exchange.interval})"
+                rankings = evaluate_universe_projection(
+                    candles_by_symbol=universe_candles,
+                    config=config,
+                )
+                log_universe_ranking(rankings)
+                if rankings and rankings[0].symbol != config.exchange.symbol:
+                    new_symbol = rankings[0].symbol
+                    config = replace(
+                        config,
+                        exchange=replace(config.exchange, symbol=new_symbol),
+                    )
+                    provider = BinanceMarketDataClient(config=config.exchange)
+                    notifier.send_alert(
+                        f"ROTACION AUTOMATICA DE MONEDA\n"
+                        f"Nueva moneda con mayor proyeccion: {new_symbol} "
+                        f"({config.exchange.interval})"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Periodic universe rescan failed (%s); keeping current symbol %s.",
+                    exc,
+                    config.exchange.symbol,
                 )
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Entrypoint for starting the paper trading, scanning, or live runner."""
+    """Entrypoint for starting the paper trading, scanning, or live runner.
+
+    Args:
+        argv: Optional list of CLI argument strings.
+    """
     configure_structured_logging()
     parsed_args = parse_cli_arguments(argv)
     try:

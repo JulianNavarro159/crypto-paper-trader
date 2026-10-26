@@ -77,6 +77,7 @@ class ExchangeConfig:
     symbol: str = "SOLUSDT"
     interval: str = "1h"
     rest_base_url: str = "https://api.binance.com"
+    market_data_url: str = "https://data-api.binance.vision"
     ws_base_url: str = "wss://stream.binance.com:9443/ws"
     bootstrap_candle_limit: int = 120
     taker_fee_rate: float = 0.001

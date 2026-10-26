@@ -21,7 +21,15 @@ class LiveExchangeExecutionError(RuntimeError):
 
 
 def quantize_step_size(quantity: float, step_size: str) -> str:
-    """Round a base asset quantity down to the exact Binance LOT_SIZE step."""
+    """Round a base asset quantity down to the exact Binance LOT_SIZE step.
+
+    Args:
+        quantity: Raw floating-point asset quantity.
+        step_size: Decimal step string returned by Binance exchangeInfo.
+
+    Returns:
+        Formatted quantity string compliant with Binance LOT_SIZE filter.
+    """
     qty_dec = Decimal(str(quantity))
     step_dec = Decimal(step_size)
     if step_dec <= Decimal("0"):
@@ -31,7 +39,14 @@ def quantize_step_size(quantity: float, step_size: str) -> str:
 
 
 class BinanceSpotAuthenticatedClient:
-    """Authenticated Binance Spot REST client for real-money autonomous trading."""
+    """Authenticated Binance Spot REST client for real-money autonomous trading.
+
+    Args:
+        config: Exchange connectivity configuration.
+        api_key: Binance Spot API key with Spot Trading permission enabled.
+        api_secret: Binance Spot API secret key for HMAC-SHA256 signing.
+        timeout_seconds: HTTP request timeout in seconds.
+    """
 
     def __init__(
         self,
@@ -48,7 +63,17 @@ class BinanceSpotAuthenticatedClient:
 
     @classmethod
     def from_env(cls, config: ExchangeConfig) -> BinanceSpotAuthenticatedClient:
-        """Instantiate an authenticated Binance client using environment variables."""
+        """Instantiate an authenticated Binance client using environment variables.
+
+        Args:
+            config: Exchange connectivity configuration.
+
+        Returns:
+            Configured BinanceSpotAuthenticatedClient instance.
+
+        Raises:
+            LiveExchangeExecutionError: If BINANCE_API_KEY or SECRET is missing.
+        """
         api_key = os.getenv("BINANCE_API_KEY", "").strip()
         api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
         if not api_key or not api_secret:
@@ -58,7 +83,14 @@ class BinanceSpotAuthenticatedClient:
         return cls(config=config, api_key=api_key, api_secret=api_secret)
 
     def _sign_params(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Append timestamp and HMAC-SHA256 signature to request parameters."""
+        """Append timestamp and HMAC-SHA256 signature to request parameters.
+
+        Args:
+            params: Unsigned parameter dictionary.
+
+        Returns:
+            Signed parameter dictionary ready for Binance REST transmission.
+        """
         signed = dict(params)
         signed["timestamp"] = int(time.time() * 1000)
         signed["recvWindow"] = 5000
@@ -75,45 +107,113 @@ class BinanceSpotAuthenticatedClient:
         """Return HTTP headers containing the Binance API key."""
         return {"X-MBX-APIKEY": self._api_key}
 
-    def fetch_available_asset_balance(self, asset: str) -> float:
-        """Query the user real Binance Spot account for free balance of an asset."""
-        endpoint = f"{self._config.rest_base_url}/api/v3/account"
-        params = self._sign_params({})
-        upper_asset = asset.upper()
-        try:
-            with httpx.Client(timeout=self._timeout_seconds) as client:
-                response = client.get(endpoint, params=params, headers=self._headers())
-                response.raise_for_status()
-                payload = response.json()
-        except httpx.HTTPError as exc:
-            raise LiveExchangeExecutionError(
-                f"Failed to fetch Binance Spot account balance: {exc}"
-            ) from exc
+    def _request_with_failover(
+        self, method: str, path: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Execute an authenticated request with cluster failover on 418 or 429.
 
+        Args:
+            method: HTTP method (GET or POST).
+            path: Relative API endpoint path such as /api/v3/account.
+            params: Unsigned parameter dictionary.
+
+        Returns:
+            Decoded JSON dictionary response from the successful cluster.
+
+        Raises:
+            LiveExchangeExecutionError: If all cluster endpoints fail.
+        """
+        urls = [
+            self._config.rest_base_url,
+            "https://api1.binance.com",
+            "https://api2.binance.com",
+            "https://api3.binance.com",
+        ]
+        last_error: Exception | None = None
+        for base_url in urls:
+            endpoint = f"{base_url.rstrip('/')}{path}"
+            signed = self._sign_params(params)
+            headers = dict(self._headers())
+            headers["User-Agent"] = "CryptoPaperTrader/1.0"
+            try:
+                with httpx.Client(timeout=self._timeout_seconds) as client:
+                    if method.upper() == "GET":
+                        response = client.get(endpoint, params=signed, headers=headers)
+                    else:
+                        response = client.post(endpoint, params=signed, headers=headers)
+                    if response.status_code in (418, 429):
+                        logger.warning(
+                            "Binance rate limit %d on %s; trying fallback cluster...",
+                            response.status_code,
+                            base_url,
+                        )
+                        time.sleep(1.0)
+                        continue
+                    response.raise_for_status()
+                    data = response.json()
+                    if isinstance(data, dict):
+                        return data
+                    if isinstance(data, list):
+                        return {"result": data}
+            except httpx.HTTPError as exc:
+                last_error = exc
+                logger.warning(
+                    "Authenticated request failed on %s (%s); retrying...",
+                    base_url,
+                    exc,
+                )
+                time.sleep(0.5)
+
+        raise LiveExchangeExecutionError(
+            f"All Binance authenticated clusters failed for {path}: {last_error}"
+        )
+
+    def fetch_available_asset_balance(self, asset: str) -> float:
+        """Query the user real Binance Spot account for free balance of an asset.
+
+        Args:
+            asset: Asset ticker symbol in uppercase such as 'USDT' or 'SUI'.
+
+        Returns:
+            Available unencumbered balance of the requested asset in Spot wallet.
+
+        Raises:
+            LiveExchangeExecutionError: If the authenticated account query fails.
+        """
+        payload = self._request_with_failover("GET", "/api/v3/account", {})
+        upper_asset = asset.upper()
         for asset_entry in payload.get("balances", []):
             if asset_entry.get("asset") == upper_asset:
                 return float(asset_entry.get("free", 0.0))
         return 0.0
 
     def fetch_available_usdt_balance(self) -> float:
-        """Query the user real Binance Spot account for free USDT balance."""
+        """Query the user real Binance Spot account for free USDT balance.
+
+        Returns:
+            Available unencumbered USDT balance in Spot wallet.
+
+        Raises:
+            LiveExchangeExecutionError: If the authenticated account query fails.
+        """
         return self.fetch_available_asset_balance("USDT")
 
     def fetch_active_spot_holding(
         self,
         universe_symbols: Sequence[str],
     ) -> tuple[str, float, float] | None:
-        """Detect an existing non-USDT holding in the user Spot account."""
-        account_endpoint = f"{self._config.rest_base_url}/api/v3/account"
-        params = self._sign_params({})
+        """Detect an existing non-USDT holding in the user Spot account.
+
+        Args:
+            universe_symbols: Trading pair symbols to inspect such as SUIUSDT.
+
+        Returns:
+            Tuple of (symbol, quantity, entry_price) if a holding >= 5 USDT exists,
+            otherwise None.
+        """
         try:
-            with httpx.Client(timeout=self._timeout_seconds) as client:
-                response = client.get(
-                    account_endpoint, params=params, headers=self._headers()
-                )
-                response.raise_for_status()
-                payload = response.json()
-        except httpx.HTTPError:
+            payload = self._request_with_failover("GET", "/api/v3/account", {})
+        except LiveExchangeExecutionError:
             return None
 
         balances_by_asset = {
@@ -130,18 +230,12 @@ class BinanceSpotAuthenticatedClient:
             if qty <= 0.0:
                 continue
 
-            trades_endpoint = f"{self._config.rest_base_url}/api/v3/myTrades"
-            trade_params = self._sign_params({"symbol": upper_sym, "limit": 5})
             try:
-                with httpx.Client(timeout=self._timeout_seconds) as client:
-                    trade_resp = client.get(
-                        trades_endpoint,
-                        params=trade_params,
-                        headers=self._headers(),
-                    )
-                    trade_resp.raise_for_status()
-                    trades = trade_resp.json()
-            except httpx.HTTPError:
+                trades_resp = self._request_with_failover(
+                    "GET", "/api/v3/myTrades", {"symbol": upper_sym, "limit": 5}
+                )
+                trades = trades_resp.get("result", trades_resp)
+            except LiveExchangeExecutionError:
                 continue
 
             if isinstance(trades, list) and trades:
@@ -155,29 +249,42 @@ class BinanceSpotAuthenticatedClient:
         return None
 
     def fetch_symbol_step_size(self, symbol: str) -> str:
-        """Fetch LOT_SIZE stepSize for a symbol from Binance exchangeInfo."""
+        """Fetch LOT_SIZE stepSize for a symbol from Binance exchangeInfo.
+
+        Args:
+            symbol: Trading pair symbol such as SUIUSDT.
+
+        Returns:
+            Step size string such as '0.10000000' or '0.00001000'.
+        """
         upper_sym = symbol.upper()
         if upper_sym in self._step_size_cache:
             return self._step_size_cache[upper_sym]
 
-        endpoint = f"{self._config.rest_base_url}/api/v3/exchangeInfo"
-        try:
-            with httpx.Client(timeout=self._timeout_seconds) as client:
-                response = client.get(endpoint, params={"symbol": upper_sym})
-                response.raise_for_status()
-                data = response.json()
-        except httpx.HTTPError as exc:
-            raise LiveExchangeExecutionError(
-                f"Failed to fetch exchangeInfo for {upper_sym}: {exc}"
-            ) from exc
-
-        for sym_info in data.get("symbols", []):
-            if sym_info.get("symbol") == upper_sym:
-                for flt in sym_info.get("filters", []):
-                    if flt.get("filterType") == "LOT_SIZE":
-                        step = str(flt.get("stepSize", "0.00000100"))
-                        self._step_size_cache[upper_sym] = step
-                        return step
+        urls = [
+            "https://data-api.binance.vision",
+            "https://api1.binance.com",
+            "https://api2.binance.com",
+            self._config.rest_base_url,
+        ]
+        for base_url in urls:
+            endpoint = f"{base_url.rstrip('/')}/api/v3/exchangeInfo"
+            try:
+                with httpx.Client(timeout=self._timeout_seconds) as client:
+                    response = client.get(endpoint, params={"symbol": upper_sym})
+                    if response.status_code in (418, 429):
+                        continue
+                    response.raise_for_status()
+                    data = response.json()
+                    for sym_info in data.get("symbols", []):
+                        if sym_info.get("symbol") == upper_sym:
+                            for flt in sym_info.get("filters", []):
+                                if flt.get("filterType") == "LOT_SIZE":
+                                    step = str(flt.get("stepSize", "0.00000100"))
+                                    self._step_size_cache[upper_sym] = step
+                                    return step
+            except httpx.HTTPError:
+                continue
 
         return "0.00000100"
 
@@ -187,26 +294,24 @@ class BinanceSpotAuthenticatedClient:
         quote_amount_usdt: float,
         client_order_id: str,
     ) -> dict[str, Any]:
-        """Execute a live Spot MARKET BUY order spending a specific USDT amount."""
-        endpoint = f"{self._config.rest_base_url}/api/v3/order"
-        params = self._sign_params(
-            {
-                "symbol": symbol.upper(),
-                "side": "BUY",
-                "type": "MARKET",
-                "quoteOrderQty": f"{quote_amount_usdt:.2f}",
-                "newClientOrderId": client_order_id[:36],
-            }
-        )
-        try:
-            with httpx.Client(timeout=self._timeout_seconds) as client:
-                response = client.post(endpoint, params=params, headers=self._headers())
-                response.raise_for_status()
-                return dict(response.json())
-        except httpx.HTTPError as exc:
-            raise LiveExchangeExecutionError(
-                f"Live Binance MARKET BUY failed for {symbol}: {exc}"
-            ) from exc
+        """Execute a live Spot MARKET BUY order spending a specific USDT amount.
+
+        Args:
+            symbol: Trading pair symbol.
+            quote_amount_usdt: USDT amount to spend on the purchase.
+            client_order_id: Deterministic idempotency key for the order.
+
+        Returns:
+            Raw JSON execution response from Binance Spot API.
+        """
+        params = {
+            "symbol": symbol.upper(),
+            "side": "BUY",
+            "type": "MARKET",
+            "quoteOrderQty": f"{quote_amount_usdt:.2f}",
+            "newClientOrderId": client_order_id[:36],
+        }
+        return self._request_with_failover("POST", "/api/v3/order", params)
 
     def place_market_sell_by_quantity(
         self,
@@ -214,7 +319,16 @@ class BinanceSpotAuthenticatedClient:
         quantity: float,
         client_order_id: str,
     ) -> dict[str, Any]:
-        """Execute a live Spot MARKET SELL order for a specific base asset quantity."""
+        """Execute a live Spot MARKET SELL order for a specific base asset quantity.
+
+        Args:
+            symbol: Trading pair symbol.
+            quantity: Base asset quantity to sell.
+            client_order_id: Deterministic idempotency key for the order.
+
+        Returns:
+            Raw JSON execution response from Binance Spot API.
+        """
         upper_sym = symbol.upper()
         effective_qty = quantity
         if upper_sym.endswith("USDT"):
@@ -225,22 +339,11 @@ class BinanceSpotAuthenticatedClient:
 
         step_size = self.fetch_symbol_step_size(upper_sym)
         formatted_qty = quantize_step_size(effective_qty, step_size)
-        endpoint = f"{self._config.rest_base_url}/api/v3/order"
-        params = self._sign_params(
-            {
-                "symbol": upper_sym,
-                "side": "SELL",
-                "type": "MARKET",
-                "quantity": formatted_qty,
-                "newClientOrderId": client_order_id[:36],
-            }
-        )
-        try:
-            with httpx.Client(timeout=self._timeout_seconds) as client:
-                response = client.post(endpoint, params=params, headers=self._headers())
-                response.raise_for_status()
-                return dict(response.json())
-        except httpx.HTTPError as exc:
-            raise LiveExchangeExecutionError(
-                f"Live Binance MARKET SELL failed for {symbol}: {exc}"
-            ) from exc
+        params = {
+            "symbol": upper_sym,
+            "side": "SELL",
+            "type": "MARKET",
+            "quantity": formatted_qty,
+            "newClientOrderId": client_order_id[:36],
+        }
+        return self._request_with_failover("POST", "/api/v3/order", params)
