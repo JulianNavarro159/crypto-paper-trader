@@ -394,7 +394,19 @@ class PaperTradingEngine:
         self._live_client = live_client
 
         if self._live_client is not None:
-            self._available_cash_usdt = self._live_client.fetch_available_usdt_balance()
+            try:
+                self._available_cash_usdt = (
+                    self._live_client.fetch_available_usdt_balance()
+                )
+            except Exception as exc:
+                fallback_cash = capital_config.initial_capital_usdt
+                logger.warning(
+                    "Could not refresh live Binance USDT balance (%s); "
+                    "using fallback %.4f USDT",
+                    exc,
+                    fallback_cash,
+                )
+                self._available_cash_usdt = fallback_cash
         else:
             self._available_cash_usdt = capital_config.initial_capital_usdt
         self._active_position: Position | None = self._ledger.fetch_open_position()

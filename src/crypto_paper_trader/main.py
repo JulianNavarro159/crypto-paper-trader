@@ -408,66 +408,74 @@ async def run_application(args: argparse.Namespace) -> None:
     )
 
     while True:
-        orchestrator = build_default_orchestrator(
-            config=config,
-            provider=provider,
-            notifier=notifier,
-            live_client=live_client,
-        )
-        if not args.auto_select or args.max_events is not None:
-            await orchestrator.run_realtime_session(max_ws_events=args.max_events)
-            return
-
-        rescan_seconds = max(args.rescan_hours * 3600.0, 300.0)
         try:
-            await asyncio.wait_for(
-                orchestrator.run_realtime_session(max_ws_events=None),
-                timeout=rescan_seconds,
+            orchestrator = build_default_orchestrator(
+                config=config,
+                provider=provider,
+                notifier=notifier,
+                live_client=live_client,
             )
-            return
-        except TimeoutError:
-            open_pos = LedgerRepository(
-                db_path=config.ledger_db_path
-            ).fetch_open_position()
-            if open_pos is not None:
-                logger.info(
-                    "Skipping universe rescan while position in %s remains open.",
-                    open_pos.symbol,
-                )
-                continue
+            if not args.auto_select or args.max_events is not None:
+                await orchestrator.run_realtime_session(max_ws_events=args.max_events)
+                return
 
-            logger.info(
-                "Running scheduled %.1fh universe projection rescan...",
-                args.rescan_hours,
-            )
+            rescan_seconds = max(args.rescan_hours * 3600.0, 300.0)
             try:
-                universe_candles = await fetch_universe_candles(
-                    config=config,
-                    candle_count=args.backtest_candles,
+                await asyncio.wait_for(
+                    orchestrator.run_realtime_session(max_ws_events=None),
+                    timeout=rescan_seconds,
                 )
-                rankings = evaluate_universe_projection(
-                    candles_by_symbol=universe_candles,
-                    config=config,
-                )
-                log_universe_ranking(rankings)
-                if rankings and rankings[0].symbol != config.exchange.symbol:
-                    new_symbol = rankings[0].symbol
-                    config = replace(
-                        config,
-                        exchange=replace(config.exchange, symbol=new_symbol),
+                return
+            except TimeoutError:
+                open_pos = LedgerRepository(
+                    db_path=config.ledger_db_path
+                ).fetch_open_position()
+                if open_pos is not None:
+                    logger.info(
+                        "Skipping universe rescan while position in %s remains open.",
+                        open_pos.symbol,
                     )
-                    provider = BinanceMarketDataClient(config=config.exchange)
-                    notifier.send_alert(
-                        f"ROTACION AUTOMATICA DE MONEDA\n"
-                        f"Nueva moneda con mayor proyeccion: {new_symbol} "
-                        f"({config.exchange.interval})"
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "Periodic universe rescan failed (%s); keeping current symbol %s.",
-                    exc,
-                    config.exchange.symbol,
+                    continue
+
+                logger.info(
+                    "Running scheduled %.1fh universe projection rescan...",
+                    args.rescan_hours,
                 )
+                try:
+                    universe_candles = await fetch_universe_candles(
+                        config=config,
+                        candle_count=args.backtest_candles,
+                    )
+                    rankings = evaluate_universe_projection(
+                        candles_by_symbol=universe_candles,
+                        config=config,
+                    )
+                    log_universe_ranking(rankings)
+                    if rankings and rankings[0].symbol != config.exchange.symbol:
+                        new_symbol = rankings[0].symbol
+                        config = replace(
+                            config,
+                            exchange=replace(config.exchange, symbol=new_symbol),
+                        )
+                        provider = BinanceMarketDataClient(config=config.exchange)
+                        notifier.send_alert(
+                            f"ROTACION AUTOMATICA DE MONEDA\n"
+                            f"Nueva moneda con mayor proyeccion: {new_symbol} "
+                            f"({config.exchange.interval})"
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Periodic universe rescan failed (%s); "
+                        "keeping current symbol %s.",
+                        exc,
+                        config.exchange.symbol,
+                    )
+        except Exception as session_exc:
+            logger.error(
+                "Trading session encountered error (%s); resuming in 10s...",
+                session_exc,
+            )
+            await asyncio.sleep(10.0)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

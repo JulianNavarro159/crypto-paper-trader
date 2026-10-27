@@ -130,39 +130,62 @@ class BinanceSpotAuthenticatedClient:
             "https://api3.binance.com",
         ]
         last_error: Exception | None = None
-        for base_url in urls:
-            endpoint = f"{base_url.rstrip('/')}{path}"
-            signed = self._sign_params(params)
-            headers = dict(self._headers())
-            headers["User-Agent"] = "CryptoPaperTrader/1.0"
-            try:
-                with httpx.Client(timeout=self._timeout_seconds) as client:
-                    if method.upper() == "GET":
-                        response = client.get(endpoint, params=signed, headers=headers)
-                    else:
-                        response = client.post(endpoint, params=signed, headers=headers)
-                    if response.status_code in (418, 429):
-                        logger.warning(
-                            "Binance rate limit %d on %s; trying fallback cluster...",
-                            response.status_code,
-                            base_url,
-                        )
-                        time.sleep(1.0)
-                        continue
-                    response.raise_for_status()
-                    data = response.json()
-                    if isinstance(data, dict):
-                        return data
-                    if isinstance(data, list):
-                        return {"result": data}
-            except httpx.HTTPError as exc:
-                last_error = exc
-                logger.warning(
-                    "Authenticated request failed on %s (%s); retrying...",
-                    base_url,
-                    exc,
+        max_cycles = 3
+        for cycle in range(max_cycles):
+            for base_url in urls:
+                endpoint = f"{base_url.rstrip('/')}{path}"
+                signed = self._sign_params(params)
+                headers = dict(self._headers())
+                headers["User-Agent"] = "CryptoPaperTrader/1.0"
+                try:
+                    with httpx.Client(timeout=self._timeout_seconds) as client:
+                        if method.upper() == "GET":
+                            response = client.get(
+                                endpoint, params=signed, headers=headers
+                            )
+                        else:
+                            response = client.post(
+                                endpoint, params=signed, headers=headers
+                            )
+                        if response.status_code in (418, 429):
+                            last_error = httpx.HTTPStatusError(
+                                f"Rate limited: HTTP {response.status_code}",
+                                request=response.request,
+                                response=response,
+                            )
+                            logger.warning(
+                                "Binance rate limit %d on %s; "
+                                "trying fallback cluster...",
+                                response.status_code,
+                                base_url,
+                            )
+                            time.sleep(1.0)
+                            continue
+                        response.raise_for_status()
+                        data = response.json()
+                        if isinstance(data, dict):
+                            return data
+                        if isinstance(data, list):
+                            return {"result": data}
+                except httpx.HTTPError as exc:
+                    last_error = exc
+                    logger.warning(
+                        "Authenticated request failed on %s (%s); retrying...",
+                        base_url,
+                        exc,
+                    )
+                    time.sleep(0.5)
+
+            if cycle < max_cycles - 1:
+                backoff_seconds = (cycle + 1) * 3.0
+                logger.info(
+                    "All Binance clusters busy for %s; waiting %.1fs before "
+                    "cycle %d...",
+                    path,
+                    backoff_seconds,
+                    cycle + 2,
                 )
-                time.sleep(0.5)
+                time.sleep(backoff_seconds)
 
         raise LiveExchangeExecutionError(
             f"All Binance authenticated clusters failed for {path}: {last_error}"
