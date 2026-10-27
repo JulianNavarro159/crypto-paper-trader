@@ -33,100 +33,6 @@ class NullNotificationService:
         return False
 
 
-def discover_telegram_chat_id(
-    bot_token: str,
-    timeout_seconds: float = 15.0,
-) -> str:
-    """Auto-discover the recipient chat_id from recent Telegram Bot getUpdates.
-
-    Args:
-        bot_token: Telegram Bot HTTP API token provided by BotFather.
-        timeout_seconds: HTTP request timeout in seconds.
-
-    Returns:
-        Discovered numeric chat_id string if available, otherwise empty string.
-    """
-    endpoint = f"https://api.telegram.org/bot{bot_token.strip()}/getUpdates"
-    try:
-        with httpx.Client(timeout=timeout_seconds) as client:
-            response = client.get(endpoint, params={"timeout": 8})
-            response.raise_for_status()
-            payload = response.json()
-    except httpx.HTTPError as exc:
-        logger.warning("Failed to query Telegram getUpdates for chat_id: %s", exc)
-        return ""
-
-    results = payload.get("result", [])
-    for item in reversed(results):
-        message = item.get("message") or item.get("edited_message") or {}
-        chat = message.get("chat", {})
-        chat_id = chat.get("id")
-        if chat_id is not None:
-            return str(chat_id)
-    return ""
-
-
-class TelegramNotificationService:
-    """Telegram Bot API client for pushing instant mobile trading notifications.
-
-    Args:
-        bot_token: Telegram Bot HTTP API token provided by BotFather.
-        chat_id: Target Telegram user or channel numeric chat identifier.
-        timeout_seconds: HTTP request timeout in seconds.
-    """
-
-    def __init__(
-        self,
-        bot_token: str,
-        chat_id: str = "",
-        timeout_seconds: float = 8.0,
-    ) -> None:
-        self._bot_token = bot_token.strip()
-        self._chat_id = chat_id.strip()
-        self._timeout_seconds = timeout_seconds
-
-    def send_alert(self, message: str) -> bool:
-        """Send a trading alert message to the user mobile Telegram app.
-
-        Args:
-            message: Plain-text message content to deliver.
-
-        Returns:
-            True if Telegram accepted the message, False on network failure.
-        """
-        if not self._bot_token:
-            return False
-
-        if not self._chat_id or self._chat_id.startswith("your_"):
-            discovered = discover_telegram_chat_id(
-                bot_token=self._bot_token,
-                timeout_seconds=self._timeout_seconds,
-            )
-            if discovered:
-                self._chat_id = discovered
-                logger.info("Auto-discovered Telegram chat_id=%s", self._chat_id)
-            else:
-                logger.warning(
-                    "Telegram chat_id not yet available. Open your bot in Telegram "
-                    "and press Start (/start) so it can message you."
-                )
-                return False
-
-        endpoint = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
-        payload = {
-            "chat_id": self._chat_id,
-            "text": message,
-        }
-        try:
-            with httpx.Client(timeout=self._timeout_seconds) as client:
-                response = client.post(endpoint, json=payload)
-                response.raise_for_status()
-            return True
-        except httpx.HTTPError as exc:
-            logger.warning("Failed to deliver Telegram mobile alert: %s", exc)
-            return False
-
-
 class NtfyNotificationService:
     """Free registration-less mobile push notifier powered by ntfy.sh.
 
@@ -262,20 +168,6 @@ def build_notifier_from_env() -> NotificationService:
     if discord_webhook and not discord_webhook.startswith("your_"):
         logger.info("Mobile Discord webhook notifications enabled")
         channels.append(DiscordNotificationService(webhook_url=discord_webhook))
-
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    is_valid_token = bool(bot_token) and not bot_token.startswith("your_")
-    if is_valid_token:
-        if not chat_id or chat_id.startswith("your_"):
-            chat_id = discover_telegram_chat_id(bot_token=bot_token)
-        logger.info(
-            "Mobile Telegram notifications enabled (chat_id=%s)",
-            chat_id if chat_id else "auto-discover on first message",
-        )
-        channels.append(
-            TelegramNotificationService(bot_token=bot_token, chat_id=chat_id)
-        )
 
     if not channels:
         return NullNotificationService()
