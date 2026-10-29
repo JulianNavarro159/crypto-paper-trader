@@ -60,6 +60,7 @@ class BinanceSpotAuthenticatedClient:
         self._api_secret = api_secret.strip()
         self._timeout_seconds = timeout_seconds
         self._step_size_cache: dict[str, str] = {}
+        self._balance_cache: dict[str, tuple[float, float]] = {}
 
     @classmethod
     def from_env(cls, config: ExchangeConfig) -> BinanceSpotAuthenticatedClient:
@@ -147,19 +148,30 @@ class BinanceSpotAuthenticatedClient:
                             response = client.post(
                                 endpoint, params=signed, headers=headers
                             )
-                        if response.status_code in (418, 429):
+                        if response.status_code == 418:
                             last_error = httpx.HTTPStatusError(
                                 f"Rate limited: HTTP {response.status_code}",
                                 request=response.request,
                                 response=response,
                             )
                             logger.warning(
-                                "Binance rate limit %d on %s; "
-                                "trying fallback cluster...",
-                                response.status_code,
+                                "Binance IP ban 418 on %s; cooling down 15.0s...",
                                 base_url,
                             )
-                            time.sleep(1.0)
+                            time.sleep(15.0)
+                            break
+                        if response.status_code == 429:
+                            last_error = httpx.HTTPStatusError(
+                                f"Rate limited: HTTP {response.status_code}",
+                                request=response.request,
+                                response=response,
+                            )
+                            logger.warning(
+                                "Binance rate limit 429 on %s; "
+                                "trying fallback cluster...",
+                                base_url,
+                            )
+                            time.sleep(2.0)
                             continue
                         response.raise_for_status()
                         data = response.json()
@@ -177,7 +189,7 @@ class BinanceSpotAuthenticatedClient:
                     time.sleep(0.5)
 
             if cycle < max_cycles - 1:
-                backoff_seconds = (cycle + 1) * 3.0
+                backoff_seconds = (cycle + 1) * 5.0
                 logger.info(
                     "All Binance clusters busy for %s; waiting %.1fs before "
                     "cycle %d...",
@@ -203,11 +215,22 @@ class BinanceSpotAuthenticatedClient:
         Raises:
             LiveExchangeExecutionError: If the authenticated account query fails.
         """
-        payload = self._request_with_failover("GET", "/api/v3/account", {})
         upper_asset = asset.upper()
+        now = time.time()
+        if upper_asset in self._balance_cache:
+            cached_time, cached_val = self._balance_cache[upper_asset]
+            if now - cached_time < 180.0:
+                return cached_val
+
+        payload = self._request_with_failover("GET", "/api/v3/account", {})
         for asset_entry in payload.get("balances", []):
-            if asset_entry.get("asset") == upper_asset:
-                return float(asset_entry.get("free", 0.0))
+            cur_asset = str(asset_entry.get("asset", "")).upper()
+            cur_free = float(asset_entry.get("free", 0.0))
+            self._balance_cache[cur_asset] = (now, cur_free)
+            if cur_asset == upper_asset:
+                return cur_free
+
+        self._balance_cache[upper_asset] = (now, 0.0)
         return 0.0
 
     def fetch_available_usdt_balance(self) -> float:
@@ -334,7 +357,9 @@ class BinanceSpotAuthenticatedClient:
             "quoteOrderQty": f"{quote_amount_usdt:.2f}",
             "newClientOrderId": client_order_id[:36],
         }
-        return self._request_with_failover("POST", "/api/v3/order", params)
+        res = self._request_with_failover("POST", "/api/v3/order", params)
+        self._balance_cache.clear()
+        return res
 
     def place_market_sell_by_quantity(
         self,
@@ -369,4 +394,6 @@ class BinanceSpotAuthenticatedClient:
             "quantity": formatted_qty,
             "newClientOrderId": client_order_id[:36],
         }
-        return self._request_with_failover("POST", "/api/v3/order", params)
+        res = self._request_with_failover("POST", "/api/v3/order", params)
+        self._balance_cache.clear()
+        return res

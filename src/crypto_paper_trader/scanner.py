@@ -56,7 +56,7 @@ class AssetProjectionScore:
 
 async def fetch_universe_candles(
     config: TradingSystemConfig,
-    candle_count: int = 720,
+    candle_count: int = 180,
 ) -> dict[str, list[Candle]]:
     """Concurrently fetch historical candles for all symbols in the universe.
 

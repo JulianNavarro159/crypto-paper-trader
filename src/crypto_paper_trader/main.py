@@ -111,8 +111,8 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     parser.add_argument(
         "--backtest-candles",
         type=int,
-        default=720,
-        help="Historical candles to evaluate in backtest/scan mode (default: 720)",
+        default=180,
+        help="Historical candles to evaluate in backtest/scan mode (default: 180)",
     )
     parser.add_argument(
         "--rescan-hours",
@@ -551,7 +551,7 @@ async def run_application(args: argparse.Namespace) -> None:
                     )
         except Exception as session_exc:
             logger.error(
-                "Trading session encountered error (%s); resuming in 10s...",
+                "Trading session encountered error (%s); resuming in 25s...",
                 session_exc,
             )
             exc_name = type(session_exc).__name__
@@ -560,7 +560,7 @@ async def run_application(args: argparse.Namespace) -> None:
                 f"Aviso: Excepcion temporal ({exc_name}): {session_exc}\n"
                 f"Accion: El sistema se reanudo de forma segura."
             )
-            await asyncio.sleep(10.0)
+            await asyncio.sleep(25.0)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
