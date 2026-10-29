@@ -22,8 +22,9 @@ from crypto_paper_trader.config import (
     ExchangeConfig,
     TradingSystemConfig,
 )
-from crypto_paper_trader.domain import MacroMarketRegime, Position
+from crypto_paper_trader.domain import MacroMarketRegime, OrderSide, Position
 from crypto_paper_trader.execution import LedgerRepository
+from crypto_paper_trader.formatting import format_price, format_quantity
 from crypto_paper_trader.ingestion import BinanceMarketDataClient
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
 from crypto_paper_trader.notifications import (
@@ -264,7 +265,7 @@ async def start_periodic_health_heartbeat(
             ).fetch_open_position()
             pos_desc = (
                 f"Posicion abierta: {open_pos.symbol} "
-                f"(Entrada: {open_pos.entry_price:.4f})"
+                f"(Entrada: {format_price(open_pos.entry_price)})"
                 if open_pos is not None
                 else "Posicion abierta: Ninguna (100% en liquidez USDT)"
             )
@@ -278,12 +279,37 @@ async def start_periodic_health_heartbeat(
                     )
                 except Exception:
                     pass
+
+            executions = LedgerRepository(
+                db_path=config.ledger_db_path
+            ).fetch_all_executions()
+            total_realized_pnl = sum(
+                e.realized_pnl_usdt for e in executions if e.side == OrderSide.SELL
+            )
+            closed_trades = sum(1 for e in executions if e.side == OrderSide.SELL)
+            winning_trades = sum(
+                1
+                for e in executions
+                if e.side == OrderSide.SELL and e.realized_pnl_usdt > 0.0
+            )
+            win_rate = (
+                (winning_trades / closed_trades * 100.0) if closed_trades > 0 else 0.0
+            )
+            perf_desc = ""
+            if closed_trades > 0:
+                pnl_cop = total_realized_pnl * config.capital.cop_per_usdt_rate
+                perf_desc = (
+                    f"\nRentabilidad acumulada: {total_realized_pnl:+.4f} USDT "
+                    f"({pnl_cop:+,.0f} COP) | Acierto: {win_rate:.0f}%"
+                )
+
             delivered = notifier.send_alert(
                 f"REPORTE PERIODICO DE SALUD 24/7\n"
                 f"Estado: Bot activo y saludable en Render\n"
                 f"Moneda: {config.exchange.symbol} ({config.exchange.interval})\n"
                 f"{pos_desc}"
                 f"{balance_desc}"
+                f"{perf_desc}"
             )
             interval_seconds = 7200.0 if delivered else 60.0
         except Exception as heartbeat_exc:
@@ -335,10 +361,10 @@ async def run_application(args: argparse.Namespace) -> None:
             coin_cop = coin_usdt * cop_rate
             total_usdt = usdt_balance + coin_usdt
             coin_line = (
-                f"En {base_coin}: {coin_qty:.4f} {base_coin} "
+                f"En {base_coin}: {format_quantity(coin_qty)} {base_coin} "
                 f"(~{coin_usdt:.2f} USDT / {coin_cop:,.0f} COP)\n"
-                f"Precio compra: {open_pos.entry_price:.4f} USDT | "
-                f"Meta ganancia: {open_pos.take_profit_price:.4f} USDT"
+                f"Precio compra: {format_price(open_pos.entry_price)} USDT | "
+                f"Meta ganancia: {format_price(open_pos.take_profit_price)} USDT"
             )
         total_cop = total_usdt * cop_rate
         logger.info(

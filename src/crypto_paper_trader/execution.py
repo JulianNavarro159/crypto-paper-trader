@@ -18,6 +18,7 @@ from crypto_paper_trader.domain import (
     SignalType,
     TradeExecution,
 )
+from crypto_paper_trader.formatting import format_price, format_quantity
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
 from crypto_paper_trader.notifications import (
     NotificationService,
@@ -420,13 +421,13 @@ class PaperTradingEngine:
                     6,
                 )
             logger.info(
-                "Resumed open position from ledger | symbol=%s entry=%.4f "
-                "qty=%.6f sl=%.4f tp=%.4f",
+                "Resumed open position from ledger | symbol=%s entry=%s "
+                "qty=%s sl=%s tp=%s",
                 self._active_position.symbol,
-                self._active_position.entry_price,
-                self._active_position.quantity,
-                self._active_position.stop_loss_price,
-                self._active_position.take_profit_price,
+                format_price(self._active_position.entry_price),
+                format_quantity(self._active_position.quantity),
+                format_price(self._active_position.stop_loss_price),
+                format_price(self._active_position.take_profit_price),
             )
         self._realized_pnl_usdt: float = 0.0
         self._total_fees_paid_usdt: float = 0.0
@@ -561,18 +562,31 @@ class PaperTradingEngine:
             logger.warning("Skipped BUY signal due to risk validation: %s", exc)
             return None
 
-        if self._live_client is not None:
-            self._live_client.place_market_buy_by_quote(
-                symbol=signal.symbol,
-                quote_amount_usdt=proposed_notional_usdt,
-                client_order_id=client_order_id,
-            )
-
+        entry_price = signal.reference_price
+        stop_loss_price = signal.stop_loss_price
+        take_profit_price = signal.take_profit_price
         entry_fee_usdt = round(
             proposed_notional_usdt * self._exchange_config.taker_fee_rate, 6
         )
         net_notional_usdt = proposed_notional_usdt - entry_fee_usdt
-        quantity = round(net_notional_usdt / signal.reference_price, 8)
+        quantity = round(net_notional_usdt / entry_price, 8)
+
+        if self._live_client is not None:
+            live_res = self._live_client.place_market_buy_by_quote(
+                symbol=signal.symbol,
+                quote_amount_usdt=proposed_notional_usdt,
+                client_order_id=client_order_id,
+            )
+            live_qty = float(live_res.get("executedQty", 0.0))
+            live_quote = float(live_res.get("cummulativeQuoteQty", 0.0))
+            if live_qty > 0.0 and live_quote > 0.0:
+                quantity = live_qty
+                entry_price = live_quote / live_qty
+                proposed_notional_usdt = round(live_quote, 6)
+                price_delta = entry_price - signal.reference_price
+                stop_loss_price = round(signal.stop_loss_price + price_delta, 8)
+                take_profit_price = round(signal.take_profit_price + price_delta, 8)
+
         position_id = f"pos-{client_order_id[-12:]}"
 
         self._available_cash_usdt = round(
@@ -588,13 +602,13 @@ class PaperTradingEngine:
             position_id=position_id,
             symbol=signal.symbol,
             opened_at=signal.evaluated_at,
-            entry_price=signal.reference_price,
+            entry_price=entry_price,
             quantity=quantity,
             notional_usdt=proposed_notional_usdt,
             entry_fee_usdt=entry_fee_usdt,
-            stop_loss_price=signal.stop_loss_price,
-            take_profit_price=signal.take_profit_price,
-            peak_price=signal.reference_price,
+            stop_loss_price=stop_loss_price,
+            take_profit_price=take_profit_price,
+            peak_price=entry_price,
         )
         self._ledger.save_open_position(self._active_position)
 
@@ -604,7 +618,7 @@ class PaperTradingEngine:
             symbol=signal.symbol,
             side=OrderSide.BUY,
             executed_at=signal.evaluated_at,
-            execution_price=signal.reference_price,
+            execution_price=entry_price,
             quantity=quantity,
             gross_notional_usdt=proposed_notional_usdt,
             fee_usdt=entry_fee_usdt,
@@ -614,15 +628,15 @@ class PaperTradingEngine:
         self._ledger.record_execution(execution)
         mode_tag = "LIVE" if self._live_client is not None else "PAPER"
         logger.info(
-            "Executed %s BUY | symbol=%s price=%.4f qty=%.6f notional=%.4f USDT "
-            "sl=%.4f tp=%.4f",
+            "Executed %s BUY | symbol=%s price=%s qty=%s notional=%.4f USDT "
+            "sl=%s tp=%s",
             mode_tag,
             execution.symbol,
-            execution.execution_price,
-            execution.quantity,
+            format_price(execution.execution_price),
+            format_quantity(execution.quantity),
             execution.gross_notional_usdt,
-            signal.stop_loss_price,
-            signal.take_profit_price,
+            format_price(stop_loss_price),
+            format_price(take_profit_price),
         )
         self._notifier.send_alert(
             format_execution_alert(
@@ -630,8 +644,8 @@ class PaperTradingEngine:
                 available_cash_usdt=self._available_cash_usdt,
                 cop_per_usdt_rate=self._capital_config.cop_per_usdt_rate,
                 is_live_order=self._live_client is not None,
-                stop_loss_price=signal.stop_loss_price,
-                take_profit_price=signal.take_profit_price,
+                stop_loss_price=stop_loss_price,
+                take_profit_price=take_profit_price,
             )
         )
         return execution
@@ -665,14 +679,23 @@ class PaperTradingEngine:
         if client_order_id in self._executed_order_ids:
             return None
 
+        actual_exit_price = exit_price
+        gross_exit_notional_usdt = round(position.quantity * exit_price, 6)
+        sell_quantity = position.quantity
+
         if self._live_client is not None:
-            self._live_client.place_market_sell_by_quantity(
+            live_res = self._live_client.place_market_sell_by_quantity(
                 symbol=position.symbol,
                 quantity=position.quantity,
                 client_order_id=client_order_id,
             )
+            live_qty = float(live_res.get("executedQty", 0.0))
+            live_quote = float(live_res.get("cummulativeQuoteQty", 0.0))
+            if live_qty > 0.0 and live_quote > 0.0:
+                actual_exit_price = live_quote / live_qty
+                gross_exit_notional_usdt = round(live_quote, 6)
+                sell_quantity = live_qty
 
-        gross_exit_notional_usdt = round(position.quantity * exit_price, 6)
         exit_fee_usdt = round(
             gross_exit_notional_usdt * self._exchange_config.taker_fee_rate, 6
         )
@@ -697,8 +720,8 @@ class PaperTradingEngine:
             symbol=position.symbol,
             side=OrderSide.SELL,
             executed_at=timestamp,
-            execution_price=exit_price,
-            quantity=position.quantity,
+            execution_price=actual_exit_price,
+            quantity=sell_quantity,
             gross_notional_usdt=gross_exit_notional_usdt,
             fee_usdt=exit_fee_usdt,
             realized_pnl_usdt=realized_pnl_usdt,
@@ -707,12 +730,12 @@ class PaperTradingEngine:
         self._ledger.record_execution(execution)
         mode_tag = "LIVE" if self._live_client is not None else "PAPER"
         logger.info(
-            "Executed %s SELL | symbol=%s reason=%s price=%.4f "
+            "Executed %s SELL | symbol=%s reason=%s price=%s "
             "net_pnl=%.4f USDT cash=%.4f USDT",
             mode_tag,
             execution.symbol,
             execution.reason,
-            execution.execution_price,
+            format_price(execution.execution_price),
             execution.realized_pnl_usdt,
             self._available_cash_usdt,
         )

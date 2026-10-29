@@ -22,6 +22,7 @@ from crypto_paper_trader.domain import (
     SignalType,
     TradeExecution,
 )
+from crypto_paper_trader.formatting import format_price, format_quantity
 from crypto_paper_trader.scanner import (
     AssetProjectionScore,
     evaluate_universe_projection,
@@ -46,6 +47,8 @@ __all__ = [
     "TradingSystemConfig",
     "UniverseConfig",
     "evaluate_universe_projection",
+    "format_price",
+    "format_quantity",
     "run_historical_backtest",
     "run_multi_asset_rotation_backtest",
 ]

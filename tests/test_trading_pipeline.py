@@ -26,6 +26,7 @@ from crypto_paper_trader.domain import (
     SignalType,
 )
 from crypto_paper_trader.execution import LedgerRepository, PaperTradingEngine
+from crypto_paper_trader.formatting import format_price, format_quantity
 from crypto_paper_trader.live_exchange import quantize_step_size
 from crypto_paper_trader.notifications import format_execution_alert
 from crypto_paper_trader.orchestration import RealTimeTradingOrchestrator
@@ -438,3 +439,50 @@ def test_ntfy_retry_on_rate_limit_and_recover(
     success = service.send_alert("Test Alert")
     assert success is True
     assert calls == 2
+
+
+def test_adaptive_price_and_quantity_formatting() -> None:
+    """Validate dynamic formatting for crypto prices and trade quantities."""
+    assert format_price(0.00000945) == "0.00000945"
+    assert format_price(0.184521) == "0.184521"
+    assert format_price(2.3456) == "2.3456"
+    assert format_price(749.78) == "749.7800"
+    assert format_price(94500.5) == "94500.50"
+    assert format_price(0.0) == "0.00"
+
+    assert format_quantity(3200000.0) == "3,200,000"
+    assert format_quantity(3200000.45) == "3,200,000.45"
+    assert format_quantity(0.0357) == "0.035700"
+    assert format_quantity(12.5) == "12.5000"
+
+
+def test_format_execution_alert_with_micro_prices() -> None:
+    """Ensure trade alerts for micro-value coins avoid truncating to zero."""
+    from crypto_paper_trader.domain import OrderSide, TradeExecution
+
+    execution = TradeExecution(
+        client_order_id="test-buy-pepe",
+        position_id="pos-pepe-1",
+        symbol="PEPEUSDT",
+        side=OrderSide.BUY,
+        executed_at=datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc),
+        execution_price=0.00000950,
+        quantity=3000000.0,
+        gross_notional_usdt=28.50,
+        fee_usdt=0.0285,
+        realized_pnl_usdt=0.0,
+        reason="SIGNAL_ENTRY",
+    )
+    alert = format_execution_alert(
+        execution=execution,
+        available_cash_usdt=4.36,
+        cop_per_usdt_rate=3194.0,
+        is_live_order=True,
+        stop_loss_price=0.00000925,
+        take_profit_price=0.00001010,
+    )
+    assert "0.00000950 USDT" in alert
+    assert "3,000,000 PEPE" in alert
+    assert "0.00000925 USDT" in alert
+    assert "0.00001010 USDT" in alert
+    assert "0.0000 USDT" not in alert

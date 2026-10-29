@@ -8,6 +8,7 @@ from typing import Protocol
 import httpx
 
 from crypto_paper_trader.domain import OrderSide, TradeExecution
+from crypto_paper_trader.formatting import format_price, format_quantity
 
 logger = logging.getLogger(__name__)
 
@@ -248,14 +249,16 @@ def format_execution_alert(
         total_cop = total_usdt * cop_per_usdt_rate
         targets_block = ""
         if take_profit_price is not None and stop_loss_price is not None:
+            tp_str = format_price(take_profit_price)
+            sl_str = format_price(stop_loss_price)
             targets_block = (
-                f"\nMeta de venta (Ganancia): {take_profit_price:.4f} USDT"
-                f"\nPrecio de proteccion (Stop Loss): {stop_loss_price:.4f} USDT"
+                f"\nMeta de venta (Ganancia): {tp_str} USDT"
+                f"\nPrecio de proteccion (Stop Loss): {sl_str} USDT"
             )
         return (
             f"[{mode_label}] COMPRA DE {base_asset} REALIZADA\n"
-            f"Precio de compra: {execution.execution_price:.4f} USDT\n"
-            f"Moneda comprada: {execution.quantity:.4f} {base_asset}\n"
+            f"Precio de compra: {format_price(execution.execution_price)} USDT\n"
+            f"Moneda comprada: {format_quantity(execution.quantity)} {base_asset}\n"
             f"--- TU BALANCE ACTUAL ---\n"
             f"En moneda ({base_asset}): {coin_usdt:.2f} USDT ({coin_cop:,.0f} COP)\n"
             f"En efectivo (USDT): {available_cash_usdt:.2f} USDT "
@@ -269,7 +272,7 @@ def format_execution_alert(
     return (
         f"[{mode_label}] VENTA DE {base_asset} REALIZADA\n"
         f"Motivo: {reason_label}\n"
-        f"Precio de venta: {execution.execution_price:.4f} USDT\n"
+        f"Precio de venta: {format_price(execution.execution_price)} USDT\n"
         f"Resultado de esta operacion: {execution.realized_pnl_usdt:+.4f} USDT "
         f"({pnl_cop:+,.0f} COP)\n"
         f"--- TU BALANCE ACTUAL ---\n"

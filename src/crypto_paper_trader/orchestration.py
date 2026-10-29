@@ -12,6 +12,7 @@ from crypto_paper_trader.domain import (
     SignalType,
 )
 from crypto_paper_trader.execution import LedgerRepository, PaperTradingEngine
+from crypto_paper_trader.formatting import format_price
 from crypto_paper_trader.ingestion import MarketDataProvider
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
 from crypto_paper_trader.notifications import NotificationService
@@ -170,7 +171,7 @@ class RealTimeTradingOrchestrator:
 
         now_ts = candle.close_time.timestamp()
         should_log = (
-            (now_ts - self._last_log_time >= 25.0)
+            (now_ts - self._last_log_time >= 45.0)
             or (signal.signal_type != self._last_logged_signal)
             or (candle.is_closed)
         )
@@ -178,15 +179,15 @@ class RealTimeTradingOrchestrator:
             self._last_log_time = now_ts
             self._last_logged_signal = signal.signal_type
             logger.info(
-                "Tick processed | symbol=%s price=%.4f signal=%s rsi=%.2f "
-                "fast_ema=%.4f slow_ema=%.4f atr=%.4f equity=%.4f USDT (%.0f COP)",
+                "Tick processed | symbol=%s price=%s signal=%s rsi=%.2f "
+                "fast_ema=%s slow_ema=%s atr=%s equity=%.4f USDT (%.0f COP)",
                 signal.symbol,
-                signal.reference_price,
+                format_price(signal.reference_price),
                 signal.signal_type.value,
                 signal.rsi_value,
-                signal.fast_ema,
-                signal.slow_ema,
-                signal.atr_value,
+                format_price(signal.fast_ema),
+                format_price(signal.slow_ema),
+                format_price(signal.atr_value),
                 snapshot.total_equity_usdt,
                 snapshot.total_equity_cop,
             )
