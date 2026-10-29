@@ -142,13 +142,29 @@ class BinanceMarketDataClient:
                     headers={"User-Agent": "CryptoPaperTrader/1.0"},
                 ) as http_client:
                     response = await http_client.get(endpoint, params=params)
-                    if response.status_code in (418, 429):
+                    if response.status_code == 418:
+                        last_error = httpx.HTTPStatusError(
+                            f"Rate limited: HTTP {response.status_code}",
+                            request=response.request,
+                            response=response,
+                        )
                         logger.warning(
-                            "Binance rate limit %d on %s; trying next cluster...",
-                            response.status_code,
+                            "Binance IP limit 418 on %s; cooling down 60.0s...",
                             url,
                         )
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(60.0)
+                        break
+                    if response.status_code == 429:
+                        last_error = httpx.HTTPStatusError(
+                            f"Rate limited: HTTP {response.status_code}",
+                            request=response.request,
+                            response=response,
+                        )
+                        logger.warning(
+                            "Binance rate limit 429 on %s; trying next cluster...",
+                            url,
+                        )
+                        await asyncio.sleep(2.0)
                         continue
                     response.raise_for_status()
                     payload = response.json()

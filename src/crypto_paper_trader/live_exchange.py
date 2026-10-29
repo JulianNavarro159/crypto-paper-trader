@@ -155,10 +155,10 @@ class BinanceSpotAuthenticatedClient:
                                 response=response,
                             )
                             logger.warning(
-                                "Binance IP ban 418 on %s; cooling down 15.0s...",
+                                "Binance IP ban 418 on %s; cooling down 60.0s...",
                                 base_url,
                             )
-                            time.sleep(15.0)
+                            time.sleep(60.0)
                             break
                         if response.status_code == 429:
                             last_error = httpx.HTTPStatusError(

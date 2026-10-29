@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -477,6 +478,8 @@ async def run_application(args: argparse.Namespace) -> None:
         )
     )
 
+    last_recovery_alert_time: float = 0.0
+
     while True:
         try:
             orchestrator = build_default_orchestrator(
@@ -550,17 +553,28 @@ async def run_application(args: argparse.Namespace) -> None:
                         config.exchange.symbol,
                     )
         except Exception as session_exc:
+            now_ts = time.time()
+            sleep_duration = (
+                120.0
+                if "418" in str(session_exc)
+                or "MarketDataIngestionError" in type(session_exc).__name__
+                else 30.0
+            )
             logger.error(
-                "Trading session encountered error (%s); resuming in 25s...",
+                "Trading session encountered error (%s); resuming in %.0fs...",
                 session_exc,
+                sleep_duration,
             )
-            exc_name = type(session_exc).__name__
-            notifier.send_alert(
-                f"SISTEMA DE AUTO-RECUPERACION\n"
-                f"Aviso: Excepcion temporal ({exc_name}): {session_exc}\n"
-                f"Accion: El sistema se reanudo de forma segura."
-            )
-            await asyncio.sleep(25.0)
+            if now_ts - last_recovery_alert_time >= 900.0:
+                last_recovery_alert_time = now_ts
+                exc_name = type(session_exc).__name__
+                notifier.send_alert(
+                    f"SISTEMA DE AUTO-RECUPERACION\n"
+                    f"Aviso: Excepcion temporal ({exc_name}): {session_exc}\n"
+                    f"Accion: Enfriamiento de {sleep_duration:.0f}s "
+                    f"y auto-recuperacion en curso."
+                )
+            await asyncio.sleep(sleep_duration)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

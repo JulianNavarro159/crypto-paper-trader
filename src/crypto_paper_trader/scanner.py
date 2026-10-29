@@ -67,7 +67,7 @@ async def fetch_universe_candles(
     Returns:
         Dictionary mapping each symbol to its chronological list of Candles.
     """
-    semaphore = asyncio.Semaphore(2)
+    semaphore = asyncio.Semaphore(1)
 
     async def _fetch_single(symbol: str) -> tuple[str, list[Candle]]:
         async with semaphore:
@@ -80,7 +80,7 @@ async def fetch_universe_candles(
             except Exception as exc:
                 logger.warning("Failed to fetch klines for %s: %s", symbol, exc)
                 candles = []
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.75)
             return symbol, candles
 
     tasks = [_fetch_single(sym) for sym in config.universe.all_symbols]
