@@ -248,15 +248,15 @@ async def start_periodic_health_heartbeat(
     config: TradingSystemConfig,
     live_client: BinanceSpotAuthenticatedClient | None,
 ) -> None:
-    """Send periodic health confirmation alerts to ntfy every six hours.
+    """Send periodic health confirmation alerts to ntfy every two hours.
 
     Args:
         notifier: Notification service configured for mobile push.
         config: System trading and ledger configuration.
         live_client: Optional authenticated Binance Spot client.
     """
+    await asyncio.sleep(45.0)
     while True:
-        await asyncio.sleep(21600.0)
         try:
             open_pos = LedgerRepository(
                 db_path=config.ledger_db_path
@@ -277,15 +277,18 @@ async def start_periodic_health_heartbeat(
                     )
                 except Exception:
                     pass
-            notifier.send_alert(
-                f"REPORTE DE SALUD 24/7 EN RENDER\n"
-                f"Estado: Bot activo y saludable\n"
+            delivered = notifier.send_alert(
+                f"REPORTE PERIODICO DE SALUD 24/7\n"
+                f"Estado: Bot activo y saludable en Render\n"
                 f"Moneda: {config.exchange.symbol} ({config.exchange.interval})\n"
                 f"{pos_desc}"
                 f"{balance_desc}"
             )
+            interval_seconds = 7200.0 if delivered else 60.0
         except Exception as heartbeat_exc:
             logger.warning("Heartbeat health alert failed: %s", heartbeat_exc)
+            interval_seconds = 60.0
+        await asyncio.sleep(interval_seconds)
 
 
 async def run_application(args: argparse.Namespace) -> None:

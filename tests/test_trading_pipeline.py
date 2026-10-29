@@ -408,3 +408,33 @@ def test_macro_market_regime_classification_and_orchestrator_filtering(
             assert trading_engine.active_position is not None
         finally:
             ledger.close()
+
+
+def test_ntfy_retry_on_rate_limit_and_recover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify NtfyNotificationService retries on HTTP 429 and delivers alert."""
+    import httpx
+
+    from crypto_paper_trader.notifications import NtfyNotificationService
+
+    calls = 0
+
+    def mock_post(self: object, url: str, **kwargs: object) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            req = httpx.Request("POST", url)
+            return httpx.Response(
+                status_code=429,
+                headers={"Retry-After": "0"},
+                request=req,
+            )
+        req = httpx.Request("POST", url)
+        return httpx.Response(status_code=200, request=req)
+
+    monkeypatch.setattr(httpx.Client, "post", mock_post)
+    service = NtfyNotificationService(topic="test_topic")
+    success = service.send_alert("Test Alert")
+    assert success is True
+    assert calls == 2

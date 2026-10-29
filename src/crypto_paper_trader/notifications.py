@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Protocol
 
 import httpx
@@ -53,7 +54,7 @@ class NtfyNotificationService:
         self._timeout_seconds = timeout_seconds
 
     def send_alert(self, message: str) -> bool:
-        """Push a real-time alert to the ntfy mobile application.
+        """Push a real-time alert to the ntfy mobile application with 429 retries.
 
         Args:
             message: Plain-text message content to deliver.
@@ -70,18 +71,37 @@ class NtfyNotificationService:
             "Priority": "high",
             "Tags": "chart_with_upwards_trend",
         }
-        try:
-            with httpx.Client(timeout=self._timeout_seconds) as client:
-                response = client.post(
-                    endpoint,
-                    content=message.encode("utf-8"),
-                    headers=headers,
-                )
-                response.raise_for_status()
-            return True
-        except httpx.HTTPError as exc:
-            logger.warning("Failed to deliver ntfy mobile alert: %s", exc)
-            return False
+        for attempt in range(1, 4):
+            try:
+                with httpx.Client(timeout=self._timeout_seconds) as client:
+                    response = client.post(
+                        endpoint,
+                        content=message.encode("utf-8"),
+                        headers=headers,
+                    )
+                    if response.status_code == 429 and attempt < 3:
+                        retry_after_str = response.headers.get("Retry-After", "")
+                        wait_sec = (
+                            float(retry_after_str)
+                            if retry_after_str.isdigit()
+                            else float(attempt * 3.0)
+                        )
+                        logger.warning(
+                            "ntfy 429 rate limit; retrying in %.1fs (try %d/3)",
+                            wait_sec,
+                            attempt,
+                        )
+                        time.sleep(wait_sec)
+                        continue
+                    response.raise_for_status()
+                return True
+            except httpx.HTTPError as exc:
+                if attempt < 3:
+                    time.sleep(attempt * 2.0)
+                    continue
+                logger.warning("Failed to deliver ntfy mobile alert: %s", exc)
+                return False
+        return False
 
 
 class DiscordNotificationService:
