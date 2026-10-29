@@ -6,7 +6,12 @@ import numpy as np
 import pandas as pd
 
 from crypto_paper_trader.config import StrategyConfig
-from crypto_paper_trader.domain import Candle, MarketSignal, SignalType
+from crypto_paper_trader.domain import (
+    Candle,
+    MacroMarketRegime,
+    MarketSignal,
+    SignalType,
+)
 from crypto_paper_trader.validation import (
     candles_to_dataframe,
     validate_candle_dataframe,
@@ -273,3 +278,38 @@ def evaluate_market_signal(
     validate_candle_dataframe(frame, min_rows=min_required_rows)
     enriched = enrich_with_indicators(frame, config)
     return build_market_signal_from_row(enriched.iloc[-1], symbol, config)
+
+
+def evaluate_macro_regime(
+    candles: Sequence[Candle],
+    config: StrategyConfig,
+) -> MacroMarketRegime:
+    """Classify the broad crypto market regime using benchmark price action.
+
+    Args:
+        candles: Sequence of benchmark candles such as BTCUSDT.
+        config: Strategy hyperparameters for EMA and RSI calculation.
+
+    Returns:
+        MacroMarketRegime indicating BULLISH, NEUTRAL, or BEARISH condition.
+    """
+    min_required_rows = max(config.slow_ema_period, config.rsi_period) + 2
+    if len(candles) < min_required_rows:
+        return MacroMarketRegime.NEUTRAL
+
+    frame = candles_to_dataframe(candles)
+    fast_ema = compute_ema(frame["close_price"], config.fast_ema_period)
+    slow_ema = compute_ema(frame["close_price"], config.slow_ema_period)
+    rsi = compute_rsi(frame["close_price"], config.rsi_period)
+
+    last_fast = float(fast_ema.iloc[-1])
+    last_slow = float(slow_ema.iloc[-1])
+    last_rsi = float(rsi.iloc[-1])
+
+    if last_fast < last_slow and last_rsi < 48.0:
+        return MacroMarketRegime.BEARISH
+
+    if last_fast > last_slow and last_rsi >= 50.0:
+        return MacroMarketRegime.BULLISH
+
+    return MacroMarketRegime.NEUTRAL

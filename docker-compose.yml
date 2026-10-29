@@ -1,0 +1,9 @@
+services:
+  crypto-bot:
+    build: .
+    container_name: crypto_paper_trader_live
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data

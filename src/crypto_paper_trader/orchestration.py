@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from crypto_paper_trader.config import TradingSystemConfig
 from crypto_paper_trader.domain import (
     Candle,
+    MacroMarketRegime,
     MarketSignal,
     PortfolioSnapshot,
     SignalType,
@@ -55,6 +56,15 @@ class RealTimeTradingOrchestrator:
         self._candle_buffer: dict[int, Candle] = {}
         self._last_log_time: float = 0.0
         self._last_logged_signal: SignalType | None = None
+        self._macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
+
+    def set_macro_regime(self, regime: MacroMarketRegime) -> None:
+        """Update the active macro market regime classification.
+
+        Args:
+            regime: MacroMarketRegime indicating overall market bias.
+        """
+        self._macro_regime = regime
 
     def _upsert_candle(self, candle: Candle) -> list[Candle]:
         """Insert or update a candle in the rolling window by open_time epoch.
@@ -111,11 +121,45 @@ class RealTimeTradingOrchestrator:
             timestamp=candle.close_time,
         )
 
-        signal = evaluate_market_signal(
-            candles=rolling_candles,
-            symbol=self._config.exchange.symbol,
-            config=self._config.strategy,
+        min_required_rows = (
+            max(
+                self._config.strategy.slow_ema_period,
+                self._config.strategy.rsi_period,
+                self._config.strategy.atr_period,
+                self._config.strategy.bollinger_period,
+            )
+            + 2
         )
+        if len(rolling_candles) < min_required_rows:
+            signal = MarketSignal(
+                symbol=self._config.exchange.symbol,
+                evaluated_at=candle.close_time,
+                signal_type=SignalType.HOLD,
+                reference_price=candle.close_price,
+                stop_loss_price=candle.close_price * 0.98,
+                take_profit_price=candle.close_price * 1.04,
+                atr_value=candle.close_price * 0.01,
+                rsi_value=50.0,
+                fast_ema=candle.close_price,
+                slow_ema=candle.close_price,
+            )
+        else:
+            signal = evaluate_market_signal(
+                candles=rolling_candles,
+                symbol=self._config.exchange.symbol,
+                config=self._config.strategy,
+            )
+
+        if (
+            signal.signal_type == SignalType.BUY
+            and self._macro_regime == MacroMarketRegime.BEARISH
+            and self._config.exchange.symbol != "BTCUSDT"
+        ):
+            logger.info(
+                "Suppressed BUY signal on %s: Bitcoin macro market regime is BEARISH.",
+                signal.symbol,
+            )
+            signal = replace(signal, signal_type=SignalType.HOLD)
 
         self._engine.process_signal(signal)
 

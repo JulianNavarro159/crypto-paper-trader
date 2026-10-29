@@ -21,11 +21,14 @@ from crypto_paper_trader.config import (
     ExchangeConfig,
     TradingSystemConfig,
 )
-from crypto_paper_trader.domain import Position
+from crypto_paper_trader.domain import MacroMarketRegime, Position
 from crypto_paper_trader.execution import LedgerRepository
 from crypto_paper_trader.ingestion import BinanceMarketDataClient
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
-from crypto_paper_trader.notifications import build_notifier_from_env
+from crypto_paper_trader.notifications import (
+    NotificationService,
+    build_notifier_from_env,
+)
 from crypto_paper_trader.orchestration import build_default_orchestrator
 from crypto_paper_trader.scanner import (
     AssetProjectionScore,
@@ -33,6 +36,7 @@ from crypto_paper_trader.scanner import (
     fetch_universe_candles,
     run_multi_asset_rotation_backtest,
 )
+from crypto_paper_trader.strategy import evaluate_macro_regime
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +243,51 @@ async def start_cloud_health_server() -> None:
         asyncio.create_task(keep_alive_ping())
 
 
+async def start_periodic_health_heartbeat(
+    notifier: NotificationService,
+    config: TradingSystemConfig,
+    live_client: BinanceSpotAuthenticatedClient | None,
+) -> None:
+    """Send periodic health confirmation alerts to ntfy every six hours.
+
+    Args:
+        notifier: Notification service configured for mobile push.
+        config: System trading and ledger configuration.
+        live_client: Optional authenticated Binance Spot client.
+    """
+    while True:
+        await asyncio.sleep(21600.0)
+        try:
+            open_pos = LedgerRepository(
+                db_path=config.ledger_db_path
+            ).fetch_open_position()
+            pos_desc = (
+                f"Posicion abierta: {open_pos.symbol} "
+                f"(Entrada: {open_pos.entry_price:.4f})"
+                if open_pos is not None
+                else "Posicion abierta: Ninguna (100% en liquidez USDT)"
+            )
+            balance_desc = ""
+            if live_client is not None:
+                try:
+                    usdt = live_client.fetch_available_usdt_balance()
+                    cop = usdt * config.capital.cop_per_usdt_rate
+                    balance_desc = (
+                        f"\nEfectivo disponible: {usdt:.2f} USDT ({cop:,.0f} COP)"
+                    )
+                except Exception:
+                    pass
+            notifier.send_alert(
+                f"REPORTE DE SALUD 24/7 EN RENDER\n"
+                f"Estado: Bot activo y saludable\n"
+                f"Moneda: {config.exchange.symbol} ({config.exchange.interval})\n"
+                f"{pos_desc}"
+                f"{balance_desc}"
+            )
+        except Exception as heartbeat_exc:
+            logger.warning("Heartbeat health alert failed: %s", heartbeat_exc)
+
+
 async def run_application(args: argparse.Namespace) -> None:
     """Build and run the selected trading pipeline mode from CLI arguments.
 
@@ -359,6 +408,8 @@ async def run_application(args: argparse.Namespace) -> None:
                 existing_open_pos
             )
 
+    active_macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
+
     if existing_open_pos is not None:
         config = replace(
             config,
@@ -370,6 +421,14 @@ async def run_application(args: argparse.Namespace) -> None:
                 config=config,
                 candle_count=args.backtest_candles,
             )
+            if "BTCUSDT" in universe_candles:
+                active_macro_regime = evaluate_macro_regime(
+                    universe_candles["BTCUSDT"], config.strategy
+                )
+                logger.info(
+                    "Macro Bitcoin market regime evaluated: %s",
+                    active_macro_regime.value,
+                )
             rankings = evaluate_universe_projection(
                 candles_by_symbol=universe_candles,
                 config=config,
@@ -407,6 +466,14 @@ async def run_application(args: argparse.Namespace) -> None:
         f"Moneda vigilada: {config.exchange.symbol} ({config.exchange.interval})"
     )
 
+    asyncio.create_task(
+        start_periodic_health_heartbeat(
+            notifier=notifier,
+            config=config,
+            live_client=live_client,
+        )
+    )
+
     while True:
         try:
             orchestrator = build_default_orchestrator(
@@ -415,6 +482,7 @@ async def run_application(args: argparse.Namespace) -> None:
                 notifier=notifier,
                 live_client=live_client,
             )
+            orchestrator.set_macro_regime(active_macro_regime)
             if not args.auto_select or args.max_events is not None:
                 await orchestrator.run_realtime_session(max_ws_events=args.max_events)
                 return
@@ -446,6 +514,14 @@ async def run_application(args: argparse.Namespace) -> None:
                         config=config,
                         candle_count=args.backtest_candles,
                     )
+                    if "BTCUSDT" in universe_candles:
+                        active_macro_regime = evaluate_macro_regime(
+                            universe_candles["BTCUSDT"], config.strategy
+                        )
+                        logger.info(
+                            "Updated Macro Bitcoin regime: %s",
+                            active_macro_regime.value,
+                        )
                     rankings = evaluate_universe_projection(
                         candles_by_symbol=universe_candles,
                         config=config,
@@ -474,6 +550,12 @@ async def run_application(args: argparse.Namespace) -> None:
             logger.error(
                 "Trading session encountered error (%s); resuming in 10s...",
                 session_exc,
+            )
+            exc_name = type(session_exc).__name__
+            notifier.send_alert(
+                f"SISTEMA DE AUTO-RECUPERACION\n"
+                f"Aviso: Excepcion temporal ({exc_name}): {session_exc}\n"
+                f"Accion: El sistema se reanudo de forma segura."
             )
             await asyncio.sleep(10.0)
 

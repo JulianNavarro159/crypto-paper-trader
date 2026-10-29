@@ -29,6 +29,14 @@ class ExitReason(str, Enum):
     TRAILING_STOP = "TRAILING_STOP"
 
 
+class MacroMarketRegime(str, Enum):
+    """Broad cryptocurrency market trend condition derived from Bitcoin."""
+
+    BULLISH = "BULLISH"
+    NEUTRAL = "NEUTRAL"
+    BEARISH = "BEARISH"
+
+
 @dataclass(frozen=True)
 class Candle:
     """Immutable OHLCV market candle representation.
