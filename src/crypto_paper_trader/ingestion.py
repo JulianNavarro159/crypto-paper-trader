@@ -276,13 +276,12 @@ class BinanceMarketDataClient:
                         yield candle
                         if max_events is not None and events_received >= max_events:
                             return
-            except (
-                websockets.WebSocketException,
-                OSError,
-                json.JSONDecodeError,
-            ) as exc:
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
                 logger.warning(
-                    "WebSocket disconnected (%s); reconnecting in 3 seconds...",
+                    "WebSocket disconnected or encounter error (%s); "
+                    "reconnecting in 3 seconds...",
                     exc,
                 )
                 await asyncio.sleep(3.0)

@@ -230,17 +230,29 @@ async def start_cloud_health_server() -> None:
     await asyncio.start_server(handle_client, host="0.0.0.0", port=port)
     logger.info("Cloud HTTP health server listening on 0.0.0.0:%d", port)
 
-    external_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    external_url = (
+        os.getenv("RENDER_EXTERNAL_URL", "").strip()
+        or (
+            f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME').strip()}"
+            if os.getenv("RENDER_EXTERNAL_HOSTNAME")
+            else ""
+        )
+        or "https://crypto-paper-trader-vdxv.onrender.com"
+    )
     if external_url:
 
         async def keep_alive_ping() -> None:
             while True:
-                await asyncio.sleep(540.0)
+                await asyncio.sleep(180.0)
                 try:
-                    async with httpx.AsyncClient(timeout=10.0) as client:
-                        await client.get(external_url)
-                except httpx.HTTPError:
-                    pass
+                    async with httpx.AsyncClient(timeout=20.0) as client:
+                        response = await client.get(external_url)
+                        logger.debug(
+                            "Keep-alive self-ping dispatched (status=%d)",
+                            response.status_code,
+                        )
+                except Exception as ping_exc:
+                    logger.debug("Keep-alive self-ping warning: %s", ping_exc)
 
         asyncio.create_task(keep_alive_ping())
 
@@ -525,7 +537,11 @@ async def run_application(args: argparse.Namespace) -> None:
                     orchestrator.run_realtime_session(max_ws_events=None),
                     timeout=rescan_seconds,
                 )
-                return
+                logger.warning(
+                    "Realtime trading session completed unexpectedly; "
+                    "restarting trading cycle."
+                )
+                continue
             except TimeoutError:
                 open_pos = LedgerRepository(
                     db_path=config.ledger_db_path
