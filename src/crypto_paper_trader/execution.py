@@ -19,7 +19,10 @@ from crypto_paper_trader.domain import (
     TradeExecution,
 )
 from crypto_paper_trader.formatting import format_price, format_quantity
-from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
+from crypto_paper_trader.live_exchange import (
+    BinanceSpotAuthenticatedClient,
+    quantize_step_size,
+)
 from crypto_paper_trader.notifications import (
     NotificationService,
     NullNotificationService,
@@ -148,7 +151,8 @@ class LedgerRepository:
                 entry_fee_usdt REAL NOT NULL,
                 stop_loss_price REAL NOT NULL,
                 take_profit_price REAL NOT NULL,
-                peak_price REAL NOT NULL DEFAULT 0.0
+                peak_price REAL NOT NULL DEFAULT 0.0,
+                is_partially_closed INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -156,6 +160,13 @@ class LedgerRepository:
             connection.execute(
                 "ALTER TABLE open_positions "
                 "ADD COLUMN peak_price REAL NOT NULL DEFAULT 0.0"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            connection.execute(
+                "ALTER TABLE open_positions "
+                "ADD COLUMN is_partially_closed INTEGER NOT NULL DEFAULT 0"
             )
         except sqlite3.OperationalError:
             pass
@@ -181,8 +192,9 @@ class LedgerRepository:
                 entry_fee_usdt,
                 stop_loss_price,
                 take_profit_price,
-                peak_price
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                peak_price,
+                is_partially_closed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 position.position_id,
@@ -195,6 +207,7 @@ class LedgerRepository:
                 position.stop_loss_price,
                 position.take_profit_price,
                 position.peak_price,
+                1 if position.is_partially_closed else 0,
             ),
         )
         connection.commit()
@@ -224,7 +237,8 @@ class LedgerRepository:
                 entry_fee_usdt,
                 stop_loss_price,
                 take_profit_price,
-                peak_price
+                peak_price,
+                is_partially_closed
             FROM open_positions
             LIMIT 1
             """
@@ -233,6 +247,8 @@ class LedgerRepository:
 
         if row is None:
             return None
+
+        is_partially_closed = bool(row[10]) if len(row) > 10 else False
 
         return Position(
             position_id=str(row[0]),
@@ -245,6 +261,7 @@ class LedgerRepository:
             stop_loss_price=float(row[7]),
             take_profit_price=float(row[8]),
             peak_price=float(row[9]),
+            is_partially_closed=is_partially_closed,
         )
 
     def record_execution(self, execution: TradeExecution) -> bool:
@@ -464,10 +481,21 @@ class PaperTradingEngine:
         pos = self._active_position
         new_peak = max(pos.peak_price, current_price, pos.entry_price)
         gain_ratio = (new_peak - pos.entry_price) / pos.entry_price
+        current_gain = (current_price - pos.entry_price) / pos.entry_price
+
+        if (
+            self._risk_config.enable_partial_take_profit
+            and not pos.is_partially_closed
+            and current_gain >= self._risk_config.tp1_profit_ratio
+        ):
+            partial_exec = self._execute_partial_take_profit(current_price, timestamp)
+            if partial_exec is not None:
+                return partial_exec
 
         if gain_ratio >= 0.012:
             breakeven_floor = round(pos.entry_price * 1.004, 8)
-            trailing_distance = round(pos.entry_price * 0.010, 8)
+            trail_pct = 0.016 if pos.is_partially_closed else 0.010
+            trailing_distance = round(pos.entry_price * trail_pct, 8)
             trailing_candidate = round(new_peak - trailing_distance, 8)
             new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
             if new_sl > pos.stop_loss_price or new_peak > pos.peak_price:
@@ -500,6 +528,133 @@ class PaperTradingEngine:
             )
 
         return None
+
+    def _execute_partial_take_profit(
+        self,
+        current_price: float,
+        timestamp: datetime,
+    ) -> TradeExecution | None:
+        """Execute a partial take-profit order locking in profit on half the position.
+
+        Args:
+            current_price: Market fill price per unit of base asset.
+            timestamp: UTC timestamp of partial exit execution.
+
+        Returns:
+            TradeExecution representing the partial SELL order, or None.
+        """
+        if self._active_position is None or self._active_position.is_partially_closed:
+            return None
+
+        pos = self._active_position
+        raw_qty_to_sell = pos.quantity * self._risk_config.tp1_close_fraction
+        if self._live_client is not None:
+            step_size = self._live_client.fetch_symbol_step_size(pos.symbol)
+            formatted_qty = quantize_step_size(raw_qty_to_sell, step_size)
+            sell_quantity = float(formatted_qty)
+        else:
+            sell_quantity = round(raw_qty_to_sell, 8)
+
+        min_notional = self._exchange_config.min_notional_usdt
+        if (sell_quantity * current_price) < min_notional:
+            return None
+
+        client_order_id = generate_client_order_id(
+            symbol=pos.symbol,
+            side=OrderSide.SELL,
+            timestamp=timestamp,
+            reason=ExitReason.PARTIAL_TAKE_PROFIT.value,
+        )
+        if client_order_id in self._executed_order_ids:
+            return None
+
+        actual_exit_price = current_price
+        gross_exit_notional_usdt = round(sell_quantity * current_price, 6)
+
+        if self._live_client is not None:
+            live_res = self._live_client.place_market_sell_by_quantity(
+                symbol=pos.symbol,
+                quantity=sell_quantity,
+                client_order_id=client_order_id,
+            )
+            live_qty = float(live_res.get("executedQty", 0.0))
+            live_quote = float(live_res.get("cummulativeQuoteQty", 0.0))
+            if live_qty > 0.0 and live_quote > 0.0:
+                actual_exit_price = live_quote / live_qty
+                gross_exit_notional_usdt = round(live_quote, 6)
+                sell_quantity = live_qty
+
+        exit_fee_usdt = round(
+            gross_exit_notional_usdt * self._exchange_config.taker_fee_rate, 6
+        )
+        net_exit_proceeds_usdt = gross_exit_notional_usdt - exit_fee_usdt
+        fraction_closed = sell_quantity / pos.quantity
+        closed_notional = round(pos.notional_usdt * fraction_closed, 6)
+        realized_pnl_usdt = round(net_exit_proceeds_usdt - closed_notional, 6)
+
+        self._available_cash_usdt = round(
+            self._available_cash_usdt + net_exit_proceeds_usdt, 6
+        )
+        self._realized_pnl_usdt = round(self._realized_pnl_usdt + realized_pnl_usdt, 6)
+        self._total_fees_paid_usdt = round(
+            self._total_fees_paid_usdt + exit_fee_usdt, 6
+        )
+        self._total_trades += 1
+        self._executed_order_ids.add(client_order_id)
+
+        remaining_quantity = round(pos.quantity - sell_quantity, 8)
+        remaining_notional = round(pos.notional_usdt - closed_notional, 6)
+        breakeven_floor = round(pos.entry_price * 1.004, 8)
+        tp2_price = round(
+            pos.entry_price * (1.0 + self._risk_config.tp2_take_profit_ratio), 8
+        )
+        new_sl = max(pos.stop_loss_price, breakeven_floor)
+
+        self._active_position = replace(
+            pos,
+            quantity=remaining_quantity,
+            notional_usdt=remaining_notional,
+            stop_loss_price=new_sl,
+            take_profit_price=tp2_price,
+            is_partially_closed=True,
+            peak_price=max(pos.peak_price, current_price),
+        )
+        self._ledger.save_open_position(self._active_position)
+
+        execution = TradeExecution(
+            client_order_id=client_order_id,
+            position_id=pos.position_id,
+            symbol=pos.symbol,
+            side=OrderSide.SELL,
+            executed_at=timestamp,
+            execution_price=actual_exit_price,
+            quantity=sell_quantity,
+            gross_notional_usdt=gross_exit_notional_usdt,
+            fee_usdt=exit_fee_usdt,
+            realized_pnl_usdt=realized_pnl_usdt,
+            reason=ExitReason.PARTIAL_TAKE_PROFIT.value,
+        )
+        self._ledger.record_execution(execution)
+        mode_tag = "LIVE" if self._live_client is not None else "PAPER"
+        logger.info(
+            "Executed %s PARTIAL TAKE PROFIT (TP1) | symbol=%s price=%s qty=%s "
+            "pnl=%.4f USDT remaining_qty=%s",
+            mode_tag,
+            execution.symbol,
+            format_price(execution.execution_price),
+            format_quantity(execution.quantity),
+            realized_pnl_usdt,
+            format_quantity(remaining_quantity),
+        )
+        self._notifier.send_alert(
+            format_execution_alert(
+                execution=execution,
+                available_cash_usdt=self._available_cash_usdt,
+                cop_per_usdt_rate=self._capital_config.cop_per_usdt_rate,
+                is_live_order=self._live_client is not None,
+            )
+        )
+        return execution
 
     def process_signal(self, signal: MarketSignal) -> TradeExecution | None:
         """Process a strategy MarketSignal and execute paper orders if valid.

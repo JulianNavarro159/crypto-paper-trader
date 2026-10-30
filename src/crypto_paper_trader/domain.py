@@ -25,6 +25,7 @@ class ExitReason(str, Enum):
 
     STOP_LOSS = "STOP_LOSS"
     TAKE_PROFIT = "TAKE_PROFIT"
+    PARTIAL_TAKE_PROFIT = "PARTIAL_TAKE_PROFIT"
     SIGNAL_REVERSAL = "SIGNAL_REVERSAL"
     TRAILING_STOP = "TRAILING_STOP"
 
@@ -119,6 +120,7 @@ class Position:
     stop_loss_price: float
     take_profit_price: float
     peak_price: float = 0.0
+    is_partially_closed: bool = False
 
 
 @dataclass(frozen=True)

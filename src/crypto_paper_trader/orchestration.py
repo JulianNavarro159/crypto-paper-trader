@@ -156,11 +156,25 @@ class RealTimeTradingOrchestrator:
             and self._macro_regime == MacroMarketRegime.BEARISH
             and self._config.exchange.symbol != "BTCUSDT"
         ):
-            logger.info(
-                "Suppressed BUY signal on %s: Bitcoin macro market regime is BEARISH.",
-                signal.symbol,
-            )
-            signal = replace(signal, signal_type=SignalType.HOLD)
+            strat_cfg = self._config.strategy
+            if (
+                strat_cfg.enable_decoupled_momentum
+                and signal.rsi_value >= strat_cfg.decoupled_rsi_min
+                and signal.fast_ema > signal.slow_ema
+            ):
+                logger.info(
+                    "Permitted decoupled relative-strength BUY signal on %s "
+                    "despite BEARISH Bitcoin macro regime (RSI=%.1f).",
+                    signal.symbol,
+                    signal.rsi_value,
+                )
+            else:
+                logger.info(
+                    "Suppressed BUY signal on %s: "
+                    "Bitcoin macro market regime is BEARISH.",
+                    signal.symbol,
+                )
+                signal = replace(signal, signal_type=SignalType.HOLD)
 
         self._engine.process_signal(signal)
 

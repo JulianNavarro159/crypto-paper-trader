@@ -206,6 +206,7 @@ def translate_exit_reason(reason: str) -> str:
     """
     translations = {
         "TAKE_PROFIT": "META DE GANANCIA ALCANZADA (TAKE PROFIT)",
+        "PARTIAL_TAKE_PROFIT": "TOMA DE GANANCIA PARCIAL (TP1 - 50% ASEGURADO)",
         "STOP_LOSS": "LIMITE DE PROTECCION ACTIVADO (STOP LOSS)",
         "SIGNAL_REVERSAL": "TOMA DE GANANCIA POR SOBRECOMPRA",
         "TRAILING_STOP": "GANANCIA PROTEGIDA (TRAILING STOP)",
@@ -269,6 +270,20 @@ def format_execution_alert(
 
     pnl_cop = execution.realized_pnl_usdt * cop_per_usdt_rate
     reason_label = translate_exit_reason(execution.reason)
+    if "PARTIAL" in execution.reason:
+        return (
+            f"[{mode_label}] VENTA PARCIAL DE {base_asset} REALIZADA\n"
+            f"Motivo: {reason_label}\n"
+            f"Precio de venta: {format_price(execution.execution_price)} USDT\n"
+            f"Cantidad vendida: {format_quantity(execution.quantity)} {base_asset}\n"
+            f"Ganancia asegurada: {execution.realized_pnl_usdt:+.4f} USDT "
+            f"({pnl_cop:+,.0f} COP)\n"
+            f"--- TU BALANCE ACTUAL ---\n"
+            f"En efectivo (USDT): {available_cash_usdt:.2f} USDT "
+            f"({cash_cop:,.0f} COP)\n"
+            f"Accion: Stop Loss fijado en Break-Even. El 50% restante sigue en curso."
+        )
+
     return (
         f"[{mode_label}] VENTA DE {base_asset} REALIZADA\n"
         f"Motivo: {reason_label}\n"

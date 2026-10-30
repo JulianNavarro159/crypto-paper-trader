@@ -119,6 +119,8 @@ class StrategyConfig:
     rsi_overbought_exit: float = 64.0
     atr_stop_loss_multiplier: float = 2.2
     atr_take_profit_multiplier: float = 3.6
+    enable_decoupled_momentum: bool = True
+    decoupled_rsi_min: float = 58.0
 
 
 @dataclass(frozen=True)
@@ -134,6 +136,11 @@ class RiskConfig:
     position_allocation_fraction: float = 0.90
     min_net_profit_ratio: float = 0.004
     min_signal_exit_profit_ratio: float = 0.005
+    enable_partial_take_profit: bool = True
+    tp1_profit_ratio: float = 0.048
+    tp1_close_fraction: float = 0.50
+    tp2_take_profit_ratio: float = 0.090
+    trailing_atr_multiplier: float = 1.6
 
 
 @dataclass(frozen=True)

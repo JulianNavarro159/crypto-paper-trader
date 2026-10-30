@@ -27,6 +27,7 @@ from crypto_paper_trader.domain import (
 )
 from crypto_paper_trader.execution import LedgerRepository, PaperTradingEngine
 from crypto_paper_trader.formatting import format_price, format_quantity
+from crypto_paper_trader.ingestion import BinanceMarketDataClient
 from crypto_paper_trader.live_exchange import quantize_step_size
 from crypto_paper_trader.notifications import format_execution_alert
 from crypto_paper_trader.orchestration import RealTimeTradingOrchestrator
@@ -166,6 +167,7 @@ def test_paper_trading_engine_executes_idempotent_buy_and_take_profit(
     risk_config = RiskConfig(
         position_allocation_fraction=0.80,
         min_net_profit_ratio=0.003,
+        enable_partial_take_profit=False,
     )
 
     engine = PaperTradingEngine(
@@ -486,3 +488,126 @@ def test_format_execution_alert_with_micro_prices() -> None:
     assert "0.00000925 USDT" in alert
     assert "0.00001010 USDT" in alert
     assert "0.0000 USDT" not in alert
+
+
+def test_partial_take_profit_and_adaptive_trailing() -> None:
+    """Validate two-stage take-profit execution and breakeven adjustment."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_ledger.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            capital_cfg = CapitalConfig(
+                initial_capital_cop=100000.0,
+                cop_per_usdt_rate=3194.0,
+            )
+            exchange_cfg = ExchangeConfig(symbol="LINKUSDT", taker_fee_rate=0.001)
+            risk_cfg = RiskConfig(
+                enable_partial_take_profit=True,
+                tp1_profit_ratio=0.048,
+                tp1_close_fraction=0.50,
+                tp2_take_profit_ratio=0.090,
+            )
+            engine = PaperTradingEngine(
+                capital_config=capital_cfg,
+                exchange_config=exchange_cfg,
+                risk_config=risk_cfg,
+                ledger=ledger,
+            )
+
+            entry_time = datetime(2026, 10, 30, 10, 0, tzinfo=timezone.utc)
+            buy_signal = MarketSignal(
+                symbol="LINKUSDT",
+                evaluated_at=entry_time,
+                signal_type=SignalType.BUY,
+                reference_price=10.0,
+                stop_loss_price=9.70,
+                take_profit_price=10.48,
+                atr_value=0.20,
+                rsi_value=55.0,
+                fast_ema=10.1,
+                slow_ema=9.9,
+            )
+            buy_execution = engine.process_signal(buy_signal)
+            assert buy_execution is not None
+            assert engine.active_position is not None
+            initial_qty = engine.active_position.quantity
+
+            tp1_time = datetime(2026, 10, 30, 11, 0, tzinfo=timezone.utc)
+            tp1_execution = engine.evaluate_protective_exits(
+                current_price=10.50,
+                timestamp=tp1_time,
+            )
+            assert tp1_execution is not None
+            assert tp1_execution.reason == ExitReason.PARTIAL_TAKE_PROFIT.value
+            assert tp1_execution.realized_pnl_usdt > 0.0
+
+            pos = engine.active_position
+            assert pos is not None
+            assert pos.is_partially_closed is True
+            assert pos.quantity < initial_qty
+            assert pos.stop_loss_price >= 10.004
+
+            tp2_time = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+            final_execution = engine.evaluate_protective_exits(
+                current_price=10.95,
+                timestamp=tp2_time,
+            )
+            assert final_execution is not None
+            assert final_execution.reason == ExitReason.TAKE_PROFIT.value
+            assert engine.active_position is None
+        finally:
+            ledger.close()
+
+
+def test_decoupled_momentum_under_bearish_regime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify strong decoupled momentum signals are permitted in bearish regime."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_ledger.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            candles = build_synthetic_candles(count=35, start_price=10.0, step=0.1)
+            config = TradingSystemConfig(
+                exchange=ExchangeConfig(symbol="LINKUSDT"),
+                ledger_db_path=db_path,
+            )
+            trading_engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            provider = BinanceMarketDataClient(config=config.exchange)
+            orchestrator = RealTimeTradingOrchestrator(
+                config=config,
+                market_data_provider=provider,
+                trading_engine=trading_engine,
+            )
+            orchestrator.set_macro_regime(MacroMarketRegime.BEARISH)
+
+            for candle in candles[:-1]:
+                orchestrator._upsert_candle(candle)
+
+            decoupled_signal = MarketSignal(
+                symbol="LINKUSDT",
+                evaluated_at=candles[-1].close_time,
+                signal_type=SignalType.BUY,
+                reference_price=11.0,
+                stop_loss_price=10.6,
+                take_profit_price=11.6,
+                atr_value=0.25,
+                rsi_value=61.0,
+                fast_ema=11.2,
+                slow_ema=10.8,
+            )
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda **kwargs: decoupled_signal,
+            )
+
+            result = orchestrator.process_candle_event(candles[-1])
+            assert result.signal.signal_type == SignalType.BUY
+            assert trading_engine.active_position is not None
+        finally:
+            ledger.close()
