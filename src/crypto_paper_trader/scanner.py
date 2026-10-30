@@ -58,7 +58,7 @@ async def fetch_universe_candles(
     config: TradingSystemConfig,
     candle_count: int = 180,
 ) -> dict[str, list[Candle]]:
-    """Concurrently fetch historical candles for all symbols in the universe.
+    """Fetch historical candles for universe symbols with early abort on IP ban.
 
     Args:
         config: Trading system configuration containing universe symbols.
@@ -67,25 +67,27 @@ async def fetch_universe_candles(
     Returns:
         Dictionary mapping each symbol to its chronological list of Candles.
     """
-    semaphore = asyncio.Semaphore(1)
-
-    async def _fetch_single(symbol: str) -> tuple[str, list[Candle]]:
-        async with semaphore:
-            symbol_exchange_cfg = replace(config.exchange, symbol=symbol)
-            client = BinanceMarketDataClient(config=symbol_exchange_cfg)
-            try:
-                candles = await client.fetch_paginated_historical_candles(
-                    total_candles=candle_count
+    results: dict[str, list[Candle]] = {}
+    for sym in config.universe.all_symbols:
+        symbol_exchange_cfg = replace(config.exchange, symbol=sym)
+        client = BinanceMarketDataClient(config=symbol_exchange_cfg)
+        try:
+            candles = await client.fetch_paginated_historical_candles(
+                total_candles=candle_count
+            )
+            if candles:
+                results[sym] = candles
+        except Exception as exc:
+            logger.warning("Failed to fetch klines for %s: %s", sym, exc)
+            if "418" in str(exc):
+                logger.warning(
+                    "Binance IP limit 418 encountered on %s; aborting universe scan "
+                    "to prevent resetting firewall penalty timer.",
+                    sym,
                 )
-            except Exception as exc:
-                logger.warning("Failed to fetch klines for %s: %s", symbol, exc)
-                candles = []
-            await asyncio.sleep(0.75)
-            return symbol, candles
-
-    tasks = [_fetch_single(sym) for sym in config.universe.all_symbols]
-    pairs = await asyncio.gather(*tasks)
-    return {symbol: candles for symbol, candles in pairs if candles}
+                break
+        await asyncio.sleep(1.0)
+    return results
 
 
 def evaluate_universe_projection(
