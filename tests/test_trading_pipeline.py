@@ -24,12 +24,21 @@ from crypto_paper_trader.domain import (
     MarketSignal,
     OrderSide,
     SignalType,
+    TradeExecution,
 )
 from crypto_paper_trader.execution import LedgerRepository, PaperTradingEngine
 from crypto_paper_trader.formatting import format_price, format_quantity
 from crypto_paper_trader.ingestion import BinanceMarketDataClient
 from crypto_paper_trader.live_exchange import quantize_step_size
-from crypto_paper_trader.notifications import format_execution_alert
+from crypto_paper_trader.notifications import (
+    format_balance_summary_alert,
+    format_execution_alert,
+    format_heartbeat_alert,
+    format_recovery_alert,
+    format_rotation_alert,
+    format_startup_alert,
+    translate_exit_reason,
+)
 from crypto_paper_trader.orchestration import RealTimeTradingOrchestrator
 from crypto_paper_trader.scanner import (
     evaluate_universe_projection,
@@ -611,3 +620,100 @@ def test_decoupled_momentum_under_bearish_regime(
             assert trading_engine.active_position is not None
         finally:
             ledger.close()
+
+
+def test_friendly_spanish_recovery_alert_reassures_user() -> None:
+    """Verify error recovery alerts omit raw HTTP codes and reassure in Spanish."""
+    binance_err = RuntimeError(
+        "All Binance market data clusters failed: Rate limited: HTTP 418"
+    )
+    alert_418 = format_recovery_alert(error=binance_err, sleep_seconds=120.0)
+    assert "PAUSA PREVENTIVA POR ALTO TRAFICO EN BINANCE" in alert_418
+    assert "100% seguro" in alert_418
+    assert "HTTP 418" not in alert_418
+    assert "RuntimeError" not in alert_418
+
+    net_err = ConnectionError("Connection refused by peer")
+    alert_net = format_recovery_alert(error=net_err, sleep_seconds=30.0)
+    assert "PAUSA PREVENTIVA POR INTERMITENCIA DE RED" in alert_net
+    assert "100% seguro" in alert_net
+
+
+def test_friendly_spanish_heartbeat_and_startup_alerts() -> None:
+    """Ensure periodic health and startup messages are fully clear in Spanish."""
+    heartbeat_active = format_heartbeat_alert(
+        symbol="LINKUSDT",
+        interval="1h",
+        open_position_symbol="LINKUSDT",
+        open_position_entry_price=10.5220,
+        available_cash_usdt=3.21,
+        cop_per_usdt_rate=3194.0,
+        total_realized_pnl_usdt=1.25,
+        closed_trades_count=2,
+        win_rate_pct=100.0,
+    )
+    assert "REPORTE PERIODICO DE ESTADO 24/7" in heartbeat_active
+    assert "Comprado en LINK a 10.5220 USDT" in heartbeat_active
+    assert "3.21 USDT" in heartbeat_active
+    assert "10,253 COP" in heartbeat_active
+
+    startup_alert = format_startup_alert(
+        mode="live",
+        symbol="SOLUSDT",
+        interval="1h",
+    )
+    assert "BOT DE TRADING INICIADO CON EXITO" in startup_alert
+    assert "Operaciones reales con dinero real en Binance" in startup_alert
+    assert "SOL" in startup_alert
+
+
+def test_friendly_spanish_execution_alerts() -> None:
+    """Verify trade executions produce clear, jargon-free explanations in Spanish."""
+    exec_record = TradeExecution(
+        client_order_id="test-sell-link",
+        position_id="pos-link-1",
+        symbol="LINKUSDT",
+        side=OrderSide.SELL,
+        executed_at=datetime(2026, 10, 30, 13, 0, tzinfo=timezone.utc),
+        execution_price=11.3000,
+        quantity=2.6700,
+        gross_notional_usdt=30.1710,
+        fee_usdt=0.0302,
+        realized_pnl_usdt=2.0470,
+        reason="PARTIAL_TAKE_PROFIT",
+    )
+    partial_alert = format_execution_alert(
+        execution=exec_record,
+        available_cash_usdt=17.50,
+        cop_per_usdt_rate=3194.0,
+        is_live_order=True,
+    )
+    assert "PRIMERA META ALCANZADA: GANANCIA ASEGURADA" in partial_alert
+    assert "Vendio la mitad (50%) de tus LINK" in partial_alert
+    assert "+2.0470 USDT" in partial_alert
+
+
+def test_friendly_spanish_balance_summary_and_rotation_alerts() -> None:
+    """Verify account balance summaries and currency rotations format cleanly."""
+    summary = format_balance_summary_alert(
+        available_usdt=25.0,
+        cop_per_usdt_rate=3200.0,
+        open_position_coin="LINK",
+        open_position_qty=2.67,
+        open_position_usdt=28.10,
+        open_entry_price=10.522,
+        open_take_profit=11.300,
+    )
+    assert "RESUMEN DE TU CUENTA EN BINANCE" in summary
+    assert "BALANCE TOTAL: 53.10 USDT" in summary
+
+    rotation = format_rotation_alert(
+        old_symbol="SOLUSDT",
+        new_symbol="PEPEUSDT",
+        interval="1h",
+    )
+    assert "CAMBIO AUTOMATICO DE MONEDA VIGILADA" in rotation
+    assert "PEPE" in rotation
+
+    reason = translate_exit_reason("TAKE_PROFIT")
+    assert "Meta de ganancia" in reason

@@ -24,12 +24,16 @@ from crypto_paper_trader.config import (
 )
 from crypto_paper_trader.domain import MacroMarketRegime, OrderSide, Position
 from crypto_paper_trader.execution import LedgerRepository
-from crypto_paper_trader.formatting import format_price, format_quantity
 from crypto_paper_trader.ingestion import BinanceMarketDataClient
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
 from crypto_paper_trader.notifications import (
     NotificationService,
     build_notifier_from_env,
+    format_balance_summary_alert,
+    format_heartbeat_alert,
+    format_recovery_alert,
+    format_rotation_alert,
+    format_startup_alert,
 )
 from crypto_paper_trader.orchestration import build_default_orchestrator
 from crypto_paper_trader.scanner import (
@@ -275,23 +279,6 @@ async def start_periodic_health_heartbeat(
             open_pos = LedgerRepository(
                 db_path=config.ledger_db_path
             ).fetch_open_position()
-            pos_desc = (
-                f"Posicion abierta: {open_pos.symbol} "
-                f"(Entrada: {format_price(open_pos.entry_price)})"
-                if open_pos is not None
-                else "Posicion abierta: Ninguna (100% en liquidez USDT)"
-            )
-            balance_desc = ""
-            if live_client is not None:
-                try:
-                    usdt = live_client.fetch_available_usdt_balance()
-                    cop = usdt * config.capital.cop_per_usdt_rate
-                    balance_desc = (
-                        f"\nEfectivo disponible: {usdt:.2f} USDT ({cop:,.0f} COP)"
-                    )
-                except Exception:
-                    pass
-
             executions = LedgerRepository(
                 db_path=config.ledger_db_path
             ).fetch_all_executions()
@@ -307,22 +294,25 @@ async def start_periodic_health_heartbeat(
             win_rate = (
                 (winning_trades / closed_trades * 100.0) if closed_trades > 0 else 0.0
             )
-            perf_desc = ""
-            if closed_trades > 0:
-                pnl_cop = total_realized_pnl * config.capital.cop_per_usdt_rate
-                perf_desc = (
-                    f"\nRentabilidad acumulada: {total_realized_pnl:+.4f} USDT "
-                    f"({pnl_cop:+,.0f} COP) | Acierto: {win_rate:.0f}%"
-                )
+            usdt_balance = None
+            if live_client is not None:
+                try:
+                    usdt_balance = live_client.fetch_available_usdt_balance()
+                except Exception:
+                    pass
 
-            delivered = notifier.send_alert(
-                f"REPORTE PERIODICO DE SALUD 24/7\n"
-                f"Estado: Bot activo y saludable en Render\n"
-                f"Moneda: {config.exchange.symbol} ({config.exchange.interval})\n"
-                f"{pos_desc}"
-                f"{balance_desc}"
-                f"{perf_desc}"
+            heartbeat_msg = format_heartbeat_alert(
+                symbol=config.exchange.symbol,
+                interval=config.exchange.interval,
+                open_position_symbol=open_pos.symbol if open_pos else None,
+                open_position_entry_price=open_pos.entry_price if open_pos else None,
+                available_cash_usdt=usdt_balance,
+                cop_per_usdt_rate=config.capital.cop_per_usdt_rate,
+                total_realized_pnl_usdt=total_realized_pnl,
+                closed_trades_count=closed_trades,
+                win_rate_pct=win_rate,
             )
+            delivered = notifier.send_alert(heartbeat_msg)
             interval_seconds = 7200.0 if delivered else 60.0
         except Exception as heartbeat_exc:
             logger.warning("Heartbeat health alert failed: %s", heartbeat_exc)
@@ -356,10 +346,14 @@ async def run_application(args: argparse.Namespace) -> None:
         live_client = BinanceSpotAuthenticatedClient.from_env(config.exchange)
         usdt_balance = live_client.fetch_available_usdt_balance()
         cop_rate = config.capital.cop_per_usdt_rate
-        cash_cop = usdt_balance * cop_rate
-        open_pos = LedgerRepository(db_path=config.ledger_db_path).fetch_open_position()
-        coin_line = "En moneda virtual: 0.00 USDT (0 COP)"
-        total_usdt = usdt_balance
+        open_pos = LedgerRepository(
+            db_path=config.ledger_db_path
+        ).fetch_open_position()
+        coin_qty = 0.0
+        coin_usdt = 0.0
+        base_coin = None
+        open_entry = 0.0
+        open_tp = 0.0
         if open_pos is not None:
             base_coin = (
                 open_pos.symbol[:-4]
@@ -370,26 +364,25 @@ async def run_application(args: argparse.Namespace) -> None:
             if coin_qty <= 0.0:
                 coin_qty = open_pos.quantity
             coin_usdt = coin_qty * open_pos.entry_price
-            coin_cop = coin_usdt * cop_rate
-            total_usdt = usdt_balance + coin_usdt
-            coin_line = (
-                f"En {base_coin}: {format_quantity(coin_qty)} {base_coin} "
-                f"(~{coin_usdt:.2f} USDT / {coin_cop:,.0f} COP)\n"
-                f"Precio compra: {format_price(open_pos.entry_price)} USDT | "
-                f"Meta ganancia: {format_price(open_pos.take_profit_price)} USDT"
-            )
-        total_cop = total_usdt * cop_rate
+            open_entry = open_pos.entry_price
+            open_tp = open_pos.take_profit_price
+        total_usdt = usdt_balance + coin_usdt
         logger.info(
             "LIVE BINANCE VERIFIED | cash=%.4f USDT total=%.4f USDT (~%.0f COP)",
             usdt_balance,
             total_usdt,
-            total_cop,
+            total_usdt * cop_rate,
         )
         notifier.send_alert(
-            f"RESUMEN DE TU CUENTA EN BINANCE\n"
-            f"En efectivo (USDT): {usdt_balance:.2f} USDT ({cash_cop:,.0f} COP)\n"
-            f"{coin_line}\n"
-            f"BALANCE TOTAL: {total_usdt:.2f} USDT ({total_cop:,.0f} COP)"
+            format_balance_summary_alert(
+                available_usdt=usdt_balance,
+                cop_per_usdt_rate=cop_rate,
+                open_position_coin=base_coin,
+                open_position_qty=coin_qty,
+                open_position_usdt=coin_usdt,
+                open_entry_price=open_entry,
+                open_take_profit=open_tp,
+            )
         )
         return
 
@@ -503,9 +496,11 @@ async def run_application(args: argparse.Namespace) -> None:
         return
 
     notifier.send_alert(
-        f"BOT DE TRADING ACTIVO\n"
-        f"Modo: {args.mode.upper()}\n"
-        f"Moneda vigilada: {config.exchange.symbol} ({config.exchange.interval})"
+        format_startup_alert(
+            mode=args.mode,
+            symbol=config.exchange.symbol,
+            interval=config.exchange.interval,
+        )
     )
 
     asyncio.create_task(
@@ -576,6 +571,7 @@ async def run_application(args: argparse.Namespace) -> None:
                     )
                     log_universe_ranking(rankings)
                     if rankings and rankings[0].symbol != config.exchange.symbol:
+                        old_symbol = config.exchange.symbol
                         new_symbol = rankings[0].symbol
                         config = replace(
                             config,
@@ -583,9 +579,11 @@ async def run_application(args: argparse.Namespace) -> None:
                         )
                         provider = BinanceMarketDataClient(config=config.exchange)
                         notifier.send_alert(
-                            f"ROTACION AUTOMATICA DE MONEDA\n"
-                            f"Nueva moneda con mayor proyeccion: {new_symbol} "
-                            f"({config.exchange.interval})"
+                            format_rotation_alert(
+                                old_symbol=old_symbol,
+                                new_symbol=new_symbol,
+                                interval=config.exchange.interval,
+                            )
                         )
                 except Exception as exc:
                     logger.warning(
@@ -609,12 +607,11 @@ async def run_application(args: argparse.Namespace) -> None:
             )
             if now_ts - last_recovery_alert_time >= 900.0:
                 last_recovery_alert_time = now_ts
-                exc_name = type(session_exc).__name__
                 notifier.send_alert(
-                    f"SISTEMA DE AUTO-RECUPERACION\n"
-                    f"Aviso: Excepcion temporal ({exc_name}): {session_exc}\n"
-                    f"Accion: Enfriamiento de {sleep_duration:.0f}s "
-                    f"y auto-recuperacion en curso."
+                    format_recovery_alert(
+                        error=session_exc,
+                        sleep_seconds=sleep_duration,
+                    )
                 )
             await asyncio.sleep(sleep_duration)
 
