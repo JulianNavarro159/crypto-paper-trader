@@ -67,6 +67,13 @@ async def fetch_universe_candles(
     Returns:
         Dictionary mapping each symbol to its chronological list of Candles.
     """
+    if BinanceMarketDataClient.is_cooldown_active():
+        logger.warning(
+            "Binance market data IP 418 cooldown active; skipping universe scan "
+            "to allow firewall ban to expire."
+        )
+        return {}
+
     results: dict[str, list[Candle]] = {}
     for sym in config.universe.all_symbols:
         symbol_exchange_cfg = replace(config.exchange, symbol=sym)

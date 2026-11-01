@@ -50,6 +50,11 @@ class BinanceSpotAuthenticatedClient:
 
     _ip_cooldown_until: float = 0.0
 
+    @classmethod
+    def is_cooldown_active(cls) -> bool:
+        """Return True if Binance authenticated account REST is in 418 cooldown."""
+        return time.time() < cls._ip_cooldown_until
+
     def __init__(
         self,
         config: ExchangeConfig,
@@ -161,14 +166,14 @@ class BinanceSpotAuthenticatedClient:
                             )
                         if response.status_code == 418:
                             BinanceSpotAuthenticatedClient._ip_cooldown_until = (
-                                time.time() + 180.0
+                                time.time() + 600.0
                             )
                             logger.warning(
-                                "Binance IP ban 418 on %s; initiating 180s cooldown...",
+                                "Binance IP ban 418 on %s; initiating 600s cooldown...",
                                 base_url,
                             )
                             raise LiveExchangeExecutionError(
-                                "Binance IP ban 418 encountered; cooldown for 180s"
+                                "Binance IP ban 418 encountered; cooldown for 600s"
                             )
                         if response.status_code == 429:
                             last_error = httpx.HTTPStatusError(

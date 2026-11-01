@@ -93,7 +93,17 @@ class RealTimeTradingOrchestrator:
         Returns:
             Chronological list of bootstrapped candles.
         """
-        historical_candles = await self._provider.fetch_historical_candles()
+        try:
+            historical_candles = await self._provider.fetch_historical_candles()
+        except Exception as exc:
+            logger.warning(
+                "Historical candle bootstrap skipped for %s (%s); "
+                "proceeding directly to live WebSocket stream.",
+                self._config.exchange.symbol,
+                exc,
+            )
+            return []
+
         ordered_candles: list[Candle] = []
         for candle in historical_candles:
             ordered_candles = self._upsert_candle(candle)

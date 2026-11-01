@@ -411,7 +411,7 @@ class PaperTradingEngine:
         self._notifier = notifier if notifier is not None else NullNotificationService()
         self._live_client = live_client
 
-        if self._live_client is not None:
+        if self._live_client is not None and not self._live_client.is_cooldown_active():
             try:
                 self._available_cash_usdt = (
                     self._live_client.fetch_available_usdt_balance()

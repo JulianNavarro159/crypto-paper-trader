@@ -107,6 +107,11 @@ class BinanceMarketDataClient:
 
     _market_cooldown_until: float = 0.0
 
+    @classmethod
+    def is_cooldown_active(cls) -> bool:
+        """Return True if the Binance public REST market data is in 418 cooldown."""
+        return time.time() < cls._market_cooldown_until
+
     def __init__(
         self,
         config: ExchangeConfig,
@@ -156,14 +161,14 @@ class BinanceMarketDataClient:
                     response = await http_client.get(endpoint, params=params)
                     if response.status_code == 418:
                         BinanceMarketDataClient._market_cooldown_until = (
-                            time.time() + 180.0
+                            time.time() + 600.0
                         )
                         logger.warning(
-                            "Binance IP limit 418 on %s; cooling down for 180s...",
+                            "Binance IP limit 418 on %s; cooling down for 600s...",
                             url,
                         )
                         raise MarketDataIngestionError(
-                            "Binance IP limit 418 on market data; cooldown for 180s"
+                            "Binance IP limit 418 on market data; cooldown for 600s"
                         )
                     if response.status_code == 429:
                         last_error = httpx.HTTPStatusError(

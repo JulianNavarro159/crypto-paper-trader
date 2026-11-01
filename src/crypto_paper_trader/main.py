@@ -123,8 +123,8 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     parser.add_argument(
         "--rescan-hours",
         type=float,
-        default=0.5,
-        help="Hours between universe rescans in auto-select mode (default: 0.5)",
+        default=2.0,
+        help="Hours between universe rescans in auto-select mode (default: 2.0)",
     )
     parser.add_argument(
         "--db-path",
@@ -548,6 +548,14 @@ async def run_application(args: argparse.Namespace) -> None:
                     )
                     continue
 
+                if BinanceMarketDataClient.is_cooldown_active():
+                    logger.info(
+                        "Skipping universe rescan: Binance 418 cooldown active; "
+                        "continuing with current symbol %s.",
+                        config.exchange.symbol,
+                    )
+                    continue
+
                 logger.info(
                     "Running scheduled %.1fh universe projection rescan...",
                     args.rescan_hours,
@@ -557,6 +565,12 @@ async def run_application(args: argparse.Namespace) -> None:
                         config=config,
                         candle_count=args.backtest_candles,
                     )
+                    if not universe_candles:
+                        logger.info(
+                            "Universe candles unavailable; keeping current symbol %s.",
+                            config.exchange.symbol,
+                        )
+                        continue
                     if "BTCUSDT" in universe_candles:
                         active_macro_regime = evaluate_macro_regime(
                             universe_candles["BTCUSDT"], config.strategy
@@ -595,7 +609,7 @@ async def run_application(args: argparse.Namespace) -> None:
         except Exception as session_exc:
             now_ts = time.time()
             sleep_duration = (
-                180.0
+                600.0
                 if "418" in str(session_exc)
                 or "MarketDataIngestionError" in type(session_exc).__name__
                 else 30.0

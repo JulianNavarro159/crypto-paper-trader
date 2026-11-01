@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,7 +29,10 @@ from crypto_paper_trader.domain import (
 )
 from crypto_paper_trader.execution import LedgerRepository, PaperTradingEngine
 from crypto_paper_trader.formatting import format_price, format_quantity
-from crypto_paper_trader.ingestion import BinanceMarketDataClient
+from crypto_paper_trader.ingestion import (
+    BinanceMarketDataClient,
+    MarketDataIngestionError,
+)
 from crypto_paper_trader.live_exchange import quantize_step_size
 from crypto_paper_trader.notifications import (
     format_balance_summary_alert,
@@ -781,3 +785,47 @@ def test_micro_candle_15m_scalping_and_profit_lock() -> None:
             assert net_cop > 100.0
         finally:
             ledger.close()
+
+
+def test_orchestrator_handles_bootstrap_failure_gracefully() -> None:
+    """Verify orchestrator recovers gracefully when REST bootstrap encounters 418."""
+
+    async def _runner() -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "test_ledger.db"
+            ledger = LedgerRepository(db_path=db_path)
+            try:
+                config = TradingSystemConfig(
+                    exchange=ExchangeConfig(symbol="SOLUSDT"),
+                    ledger_db_path=db_path,
+                )
+                trading_engine = PaperTradingEngine(
+                    capital_config=config.capital,
+                    exchange_config=config.exchange,
+                    risk_config=config.risk,
+                    ledger=ledger,
+                )
+
+                class FailingBootstrapProvider:
+                    async def fetch_historical_candles(self) -> list[Candle]:
+                        raise MarketDataIngestionError("Simulated 418 IP ban on REST")
+
+                    async def stream_realtime_candles(
+                        self, max_events: int | None = None
+                    ):
+                        candle = build_synthetic_candles(count=1)[0]
+                        yield candle
+
+                orchestrator = RealTimeTradingOrchestrator(
+                    config=config,
+                    market_data_provider=FailingBootstrapProvider(),
+                    trading_engine=trading_engine,
+                )
+                results = await orchestrator.run_realtime_session(max_ws_events=1)
+                assert len(results) == 1
+                assert results[0].latest_candle.symbol == "SOLUSDT"
+                assert results[0].signal.signal_type == SignalType.HOLD
+            finally:
+                ledger.close()
+
+    asyncio.run(_runner())
