@@ -48,6 +48,8 @@ class BinanceSpotAuthenticatedClient:
         timeout_seconds: HTTP request timeout in seconds.
     """
 
+    _ip_cooldown_until: float = 0.0
+
     def __init__(
         self,
         config: ExchangeConfig,
@@ -124,6 +126,15 @@ class BinanceSpotAuthenticatedClient:
         Raises:
             LiveExchangeExecutionError: If all cluster endpoints fail.
         """
+        now_ts = time.time()
+        if now_ts < BinanceSpotAuthenticatedClient._ip_cooldown_until:
+            wait_rem = int(
+                BinanceSpotAuthenticatedClient._ip_cooldown_until - now_ts
+            )
+            raise LiveExchangeExecutionError(
+                f"Binance IP 418 cooldown active; skipping request for {wait_rem}s"
+            )
+
         urls = [
             self._config.rest_base_url,
             "https://api1.binance.com",
@@ -149,17 +160,16 @@ class BinanceSpotAuthenticatedClient:
                                 endpoint, params=signed, headers=headers
                             )
                         if response.status_code == 418:
-                            last_error = httpx.HTTPStatusError(
-                                f"Rate limited: HTTP {response.status_code}",
-                                request=response.request,
-                                response=response,
+                            BinanceSpotAuthenticatedClient._ip_cooldown_until = (
+                                time.time() + 180.0
                             )
                             logger.warning(
-                                "Binance IP ban 418 on %s; cooling down 60.0s...",
+                                "Binance IP ban 418 on %s; initiating 180s cooldown...",
                                 base_url,
                             )
-                            time.sleep(60.0)
-                            break
+                            raise LiveExchangeExecutionError(
+                                "Binance IP ban 418 encountered; cooldown for 180s"
+                            )
                         if response.status_code == 429:
                             last_error = httpx.HTTPStatusError(
                                 f"Rate limited: HTTP {response.status_code}",

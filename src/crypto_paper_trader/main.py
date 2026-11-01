@@ -595,7 +595,7 @@ async def run_application(args: argparse.Namespace) -> None:
         except Exception as session_exc:
             now_ts = time.time()
             sleep_duration = (
-                120.0
+                180.0
                 if "418" in str(session_exc)
                 or "MarketDataIngestionError" in type(session_exc).__name__
                 else 30.0

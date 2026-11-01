@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any, Protocol, Sequence
@@ -104,6 +105,8 @@ class BinanceMarketDataClient:
         http_timeout_seconds: Timeout in seconds for REST requests.
     """
 
+    _market_cooldown_until: float = 0.0
+
     def __init__(
         self,
         config: ExchangeConfig,
@@ -126,6 +129,15 @@ class BinanceMarketDataClient:
         Raises:
             MarketDataIngestionError: If all cluster endpoints fail.
         """
+        now_ts = time.time()
+        if now_ts < BinanceMarketDataClient._market_cooldown_until:
+            wait_rem = int(
+                BinanceMarketDataClient._market_cooldown_until - now_ts
+            )
+            raise MarketDataIngestionError(
+                f"Binance market data IP 418 cooldown active; skipping for {wait_rem}s"
+            )
+
         urls = [
             self._config.market_data_url,
             "https://api1.binance.com",
@@ -143,17 +155,16 @@ class BinanceMarketDataClient:
                 ) as http_client:
                     response = await http_client.get(endpoint, params=params)
                     if response.status_code == 418:
-                        last_error = httpx.HTTPStatusError(
-                            f"Rate limited: HTTP {response.status_code}",
-                            request=response.request,
-                            response=response,
+                        BinanceMarketDataClient._market_cooldown_until = (
+                            time.time() + 180.0
                         )
                         logger.warning(
-                            "Binance IP limit 418 on %s; cooling down 60.0s...",
+                            "Binance IP limit 418 on %s; cooling down for 180s...",
                             url,
                         )
-                        await asyncio.sleep(60.0)
-                        break
+                        raise MarketDataIngestionError(
+                            "Binance IP limit 418 on market data; cooldown for 180s"
+                        )
                     if response.status_code == 429:
                         last_error = httpx.HTTPStatusError(
                             f"Rate limited: HTTP {response.status_code}",
