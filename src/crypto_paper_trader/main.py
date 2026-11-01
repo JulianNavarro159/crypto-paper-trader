@@ -93,8 +93,8 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     parser.add_argument(
         "--interval",
         type=str,
-        default="1h",
-        help="Kline interval timeframe (default: 1h)",
+        default="15m",
+        help="Kline interval timeframe (default: 15m)",
     )
     parser.add_argument(
         "--capital-cop",
@@ -123,8 +123,8 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     parser.add_argument(
         "--rescan-hours",
         type=float,
-        default=1.0,
-        help="Hours between universe rescans in auto-select mode (default: 1.0)",
+        default=0.5,
+        help="Hours between universe rescans in auto-select mode (default: 0.5)",
     )
     parser.add_argument(
         "--db-path",

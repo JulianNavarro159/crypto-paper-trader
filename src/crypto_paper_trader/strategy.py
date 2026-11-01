@@ -186,9 +186,31 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         & (enriched["rsi"] <= 68.0)
     )
 
-    buy_mask = climax_dip_rebound | uptrend_pullback | trend_momentum_breakout
+    micro_dip_rebound = (
+        (prev_low <= enriched["bb_lower"].shift(1) * 1.002)
+        & (prev_rsi <= config.rsi_entry_min)
+        & (enriched["rsi"] > prev_rsi)
+        & (enriched["close_price"] > enriched["open_price"])
+    )
+
+    ema_recovery = (
+        (enriched["fast_ema"] > enriched["slow_ema"])
+        & (enriched["fast_ema"].shift(1) <= enriched["slow_ema"].shift(1))
+        & (enriched["close_price"] > enriched["bb_lower"])
+        & (enriched["close_price"] <= enriched["bb_mid"] * 1.008)
+        & (enriched["rsi"] >= config.rsi_entry_min)
+        & (enriched["rsi"] <= 54.0)
+    )
+
+    buy_mask = (
+        climax_dip_rebound
+        | uptrend_pullback
+        | trend_momentum_breakout
+        | micro_dip_rebound
+        | ema_recovery
+    )
     sell_mask = (enriched["rsi"] >= config.rsi_overbought_exit) | (
-        enriched["high_price"] >= enriched["bb_upper"]
+        enriched["high_price"] >= enriched["bb_upper"] * 0.998
     )
 
     signals = np.where(
@@ -217,7 +239,7 @@ def build_market_signal_from_row(
     """
     reference_price = float(row["close_price"])
     raw_atr = float(row["atr"])
-    effective_atr = max(raw_atr, reference_price * 0.0025)
+    effective_atr = max(raw_atr, reference_price * 0.0015)
 
     stop_loss_price = round(
         reference_price - (effective_atr * config.atr_stop_loss_multiplier), 8

@@ -717,3 +717,67 @@ def test_friendly_spanish_balance_summary_and_rotation_alerts() -> None:
 
     reason = translate_exit_reason("TAKE_PROFIT")
     assert "Meta de ganancia" in reason
+
+
+def test_micro_candle_15m_scalping_and_profit_lock() -> None:
+    """Verify 15m scalping locks in profit above 100 COP when gain reaches 0.35%."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ledger = LedgerRepository(db_path=Path(temp_dir) / "test_micro.db")
+        try:
+            capital_cfg = CapitalConfig(
+                initial_capital_cop=112_000.0,
+                cop_per_usdt_rate=3_200.0,
+            )
+            exchange_cfg = ExchangeConfig(
+                symbol="LINKUSDT",
+                interval="15m",
+                taker_fee_rate=0.001,
+            )
+            risk_cfg = RiskConfig(
+                tp1_profit_ratio=0.0075,
+                tp1_close_fraction=0.50,
+                tp2_take_profit_ratio=0.0180,
+                min_net_profit_ratio=0.0015,
+            )
+            engine = PaperTradingEngine(
+                capital_config=capital_cfg,
+                exchange_config=exchange_cfg,
+                risk_config=risk_cfg,
+                ledger=ledger,
+            )
+
+            entry_time = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+            buy_signal = MarketSignal(
+                symbol="LINKUSDT",
+                evaluated_at=entry_time,
+                signal_type=SignalType.BUY,
+                reference_price=10.0000,
+                stop_loss_price=9.8700,
+                take_profit_price=10.1800,
+                atr_value=0.0800,
+                rsi_value=34.0,
+                fast_ema=10.0100,
+                slow_ema=9.9900,
+            )
+            buy_exec = engine.process_signal(buy_signal)
+            assert buy_exec is not None
+            assert engine.active_position is not None
+
+            tick_time = datetime(2026, 11, 1, 12, 5, tzinfo=timezone.utc)
+            engine.evaluate_protective_exits(
+                current_price=10.0400, timestamp=tick_time
+            )
+            pos = engine.active_position
+            assert pos is not None
+            assert pos.stop_loss_price >= 10.0200
+
+            tp1_time = datetime(2026, 11, 1, 12, 10, tzinfo=timezone.utc)
+            tp1_exec = engine.evaluate_protective_exits(
+                current_price=10.0800, timestamp=tp1_time
+            )
+            assert tp1_exec is not None
+            assert tp1_exec.reason == ExitReason.PARTIAL_TAKE_PROFIT.value
+            net_cop = tp1_exec.realized_pnl_usdt * 3_200.0
+            assert net_cop > 100.0
+        finally:
+            ledger.close()

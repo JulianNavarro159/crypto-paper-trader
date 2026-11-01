@@ -75,7 +75,7 @@ class ExchangeConfig:
     """
 
     symbol: str = "SOLUSDT"
-    interval: str = "1h"
+    interval: str = "15m"
     rest_base_url: str = "https://api.binance.com"
     market_data_url: str = "https://data-api.binance.vision"
     ws_base_url: str = "wss://stream.binance.com:9443/ws"
@@ -105,20 +105,20 @@ class StrategyConfig:
         atr_take_profit_multiplier: Multiplier applied to ATR for take profit distance.
     """
 
-    fast_ema_period: int = 12
-    slow_ema_period: int = 26
-    trend_ema_period: int = 100
+    fast_ema_period: int = 8
+    slow_ema_period: int = 21
+    trend_ema_period: int = 50
     bollinger_period: int = 20
-    bollinger_std: float = 1.8
+    bollinger_std: float = 1.6
     rsi_period: int = 14
     atr_period: int = 14
-    volume_climax_multiplier: float = 1.5
-    rsi_entry_min: float = 44.0
-    rsi_entry_max: float = 64.0
-    rsi_oversold_threshold: float = 28.0
-    rsi_overbought_exit: float = 64.0
-    atr_stop_loss_multiplier: float = 2.2
-    atr_take_profit_multiplier: float = 3.6
+    volume_climax_multiplier: float = 1.4
+    rsi_entry_min: float = 32.0
+    rsi_entry_max: float = 60.0
+    rsi_oversold_threshold: float = 30.0
+    rsi_overbought_exit: float = 62.0
+    atr_stop_loss_multiplier: float = 1.3
+    atr_take_profit_multiplier: float = 1.6
     enable_decoupled_momentum: bool = True
     decoupled_rsi_min: float = 58.0
 
@@ -134,13 +134,13 @@ class RiskConfig:
     """
 
     position_allocation_fraction: float = 0.90
-    min_net_profit_ratio: float = 0.004
-    min_signal_exit_profit_ratio: float = 0.005
+    min_net_profit_ratio: float = 0.0015
+    min_signal_exit_profit_ratio: float = 0.0025
     enable_partial_take_profit: bool = True
-    tp1_profit_ratio: float = 0.048
+    tp1_profit_ratio: float = 0.0075
     tp1_close_fraction: float = 0.50
-    tp2_take_profit_ratio: float = 0.090
-    trailing_atr_multiplier: float = 1.6
+    tp2_take_profit_ratio: float = 0.0180
+    trailing_atr_multiplier: float = 0.8
 
 
 @dataclass(frozen=True)

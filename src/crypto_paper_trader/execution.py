@@ -492,9 +492,9 @@ class PaperTradingEngine:
             if partial_exec is not None:
                 return partial_exec
 
-        if gain_ratio >= 0.012:
-            breakeven_floor = round(pos.entry_price * 1.004, 8)
-            trail_pct = 0.016 if pos.is_partially_closed else 0.010
+        if gain_ratio >= 0.0035:
+            breakeven_floor = round(pos.entry_price * 1.0020, 8)
+            trail_pct = 0.012 if pos.is_partially_closed else 0.008
             trailing_distance = round(pos.entry_price * trail_pct, 8)
             trailing_candidate = round(new_peak - trailing_distance, 8)
             new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
@@ -604,11 +604,15 @@ class PaperTradingEngine:
 
         remaining_quantity = round(pos.quantity - sell_quantity, 8)
         remaining_notional = round(pos.notional_usdt - closed_notional, 6)
-        breakeven_floor = round(pos.entry_price * 1.004, 8)
+        breakeven_floor = round(pos.entry_price * 1.0020, 8)
         tp2_price = round(
             pos.entry_price * (1.0 + self._risk_config.tp2_take_profit_ratio), 8
         )
-        new_sl = max(pos.stop_loss_price, breakeven_floor)
+        new_peak = max(pos.peak_price, current_price)
+        trail_pct = 0.012
+        trailing_distance = round(pos.entry_price * trail_pct, 8)
+        trailing_candidate = round(new_peak - trailing_distance, 8)
+        new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
 
         self._active_position = replace(
             pos,
@@ -617,7 +621,7 @@ class PaperTradingEngine:
             stop_loss_price=new_sl,
             take_profit_price=tp2_price,
             is_partially_closed=True,
-            peak_price=max(pos.peak_price, current_price),
+            peak_price=new_peak,
         )
         self._ledger.save_open_position(self._active_position)
 
