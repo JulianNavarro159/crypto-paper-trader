@@ -22,7 +22,12 @@ from crypto_paper_trader.config import (
     ExchangeConfig,
     TradingSystemConfig,
 )
-from crypto_paper_trader.domain import MacroMarketRegime, OrderSide, Position
+from crypto_paper_trader.domain import (
+    Candle,
+    MacroMarketRegime,
+    OrderSide,
+    Position,
+)
 from crypto_paper_trader.execution import LedgerRepository
 from crypto_paper_trader.ingestion import BinanceMarketDataClient
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
@@ -117,8 +122,8 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     parser.add_argument(
         "--backtest-candles",
         type=int,
-        default=180,
-        help="Historical candles to evaluate in backtest/scan mode (default: 180)",
+        default=80,
+        help="Historical candles to evaluate in backtest/scan mode (default: 80)",
     )
     parser.add_argument(
         "--rescan-hours",
@@ -444,6 +449,7 @@ async def run_application(args: argparse.Namespace) -> None:
             )
 
     active_macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
+    initial_universe_candles: dict[str, list[Candle]] = {}
 
     if existing_open_pos is not None:
         config = replace(
@@ -452,20 +458,20 @@ async def run_application(args: argparse.Namespace) -> None:
         )
     elif args.auto_select:
         try:
-            universe_candles = await fetch_universe_candles(
+            initial_universe_candles = await fetch_universe_candles(
                 config=config,
                 candle_count=args.backtest_candles,
             )
-            if "BTCUSDT" in universe_candles:
+            if "BTCUSDT" in initial_universe_candles:
                 active_macro_regime = evaluate_macro_regime(
-                    universe_candles["BTCUSDT"], config.strategy
+                    initial_universe_candles["BTCUSDT"], config.strategy
                 )
                 logger.info(
                     "Macro Bitcoin market regime evaluated: %s",
                     active_macro_regime.value,
                 )
             rankings = evaluate_universe_projection(
-                candles_by_symbol=universe_candles,
+                candles_by_symbol=initial_universe_candles,
                 config=config,
             )
             log_universe_ranking(rankings)
@@ -512,15 +518,18 @@ async def run_application(args: argparse.Namespace) -> None:
     )
 
     last_recovery_alert_time: float = 0.0
+    orchestrator = build_default_orchestrator(
+        config=config,
+        provider=provider,
+        notifier=notifier,
+        live_client=live_client,
+    )
+    if config.exchange.symbol in initial_universe_candles:
+        for seed_candle in initial_universe_candles[config.exchange.symbol]:
+            orchestrator._upsert_candle(seed_candle)
 
     while True:
         try:
-            orchestrator = build_default_orchestrator(
-                config=config,
-                provider=provider,
-                notifier=notifier,
-                live_client=live_client,
-            )
             orchestrator.set_macro_regime(active_macro_regime)
             if not args.auto_select or args.max_events is not None:
                 await orchestrator.run_realtime_session(max_ws_events=args.max_events)
@@ -592,6 +601,15 @@ async def run_application(args: argparse.Namespace) -> None:
                             exchange=replace(config.exchange, symbol=new_symbol),
                         )
                         provider = BinanceMarketDataClient(config=config.exchange)
+                        orchestrator = build_default_orchestrator(
+                            config=config,
+                            provider=provider,
+                            notifier=notifier,
+                            live_client=live_client,
+                        )
+                        if new_symbol in universe_candles:
+                            for seed_candle in universe_candles[new_symbol]:
+                                orchestrator._upsert_candle(seed_candle)
                         notifier.send_alert(
                             format_rotation_alert(
                                 old_symbol=old_symbol,

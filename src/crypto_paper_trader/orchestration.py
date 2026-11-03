@@ -93,6 +93,12 @@ class RealTimeTradingOrchestrator:
         Returns:
             Chronological list of bootstrapped candles.
         """
+        if len(self._candle_buffer) >= 30:
+            return [
+                self._candle_buffer[key]
+                for key in sorted(self._candle_buffer.keys())
+            ]
+
         try:
             historical_candles = await self._provider.fetch_historical_candles()
         except Exception as exc:

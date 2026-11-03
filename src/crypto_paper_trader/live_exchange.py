@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import time
@@ -10,6 +11,7 @@ from typing import Any, Sequence
 from urllib.parse import urlencode
 
 import httpx
+from websockets.sync.client import connect as ws_sync_connect
 
 from crypto_paper_trader.config import ExchangeConfig
 
@@ -115,10 +117,103 @@ class BinanceSpotAuthenticatedClient:
         """Return HTTP headers containing the Binance API key."""
         return {"X-MBX-APIKEY": self._api_key}
 
+    def _sign_ws_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Sign request parameters alphabetically for Binance WebSocket API v3.
+
+        Args:
+            params: Unsigned parameter dictionary.
+
+        Returns:
+            Signed parameter dictionary containing apiKey, timestamp, and signature.
+        """
+        ws_params: dict[str, Any] = dict(params)
+        ws_params["apiKey"] = self._api_key
+        ws_params["recvWindow"] = 5000
+        ws_params["timestamp"] = int(time.time() * 1000)
+        sorted_items = sorted(
+            (
+                key,
+                "true" if val is True else ("false" if val is False else val),
+            )
+            for key, val in ws_params.items()
+        )
+        query_string = urlencode(sorted_items)
+        signature = hmac.new(
+            self._api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        ws_params["signature"] = signature
+        return ws_params
+
+    def _request_via_ws_api(
+        self, method: str, path: str, params: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Execute an authenticated request over Binance WebSocket API v3.
+
+        Args:
+            method: HTTP method (GET or POST).
+            path: REST endpoint path mapped to a WebSocket API v3 method.
+            params: Unsigned request parameters.
+
+        Returns:
+            Decoded response dictionary if successful, otherwise None.
+        """
+        ws_method_map: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {
+            ("GET", "/api/v3/account"): (
+                "account.status",
+                {"omitZeroBalances": True},
+            ),
+            ("GET", "/api/v3/myTrades"): ("myTrades", {}),
+            ("POST", "/api/v3/order"): ("order.place", {}),
+        }
+        key = (method.upper(), path)
+        if key not in ws_method_map:
+            return None
+
+        ws_method, extra_params = ws_method_map[key]
+        merged_params = {**params, **extra_params}
+        signed_ws_params = self._sign_ws_params(merged_params)
+        ws_endpoints = (
+            "wss://ws-api.binance.com:443/ws-api/v3",
+            "wss://ws-api.binance.com:9443/ws-api/v3",
+        )
+        req_payload = json.dumps(
+            {
+                "id": f"auth-{int(time.time() * 1000)}",
+                "method": ws_method,
+                "params": signed_ws_params,
+            }
+        )
+        for ws_url in ws_endpoints:
+            try:
+                with ws_sync_connect(
+                    ws_url,
+                    open_timeout=self._timeout_seconds,
+                    close_timeout=5.0,
+                ) as ws_conn:
+                    ws_conn.send(req_payload)
+                    raw_msg = ws_conn.recv(timeout=self._timeout_seconds)
+                    decoded = json.loads(raw_msg)
+                    if decoded.get("status") == 200 and "result" in decoded:
+                        res_data = decoded["result"]
+                        if isinstance(res_data, dict):
+                            return res_data
+                        if isinstance(res_data, list):
+                            return {"result": res_data}
+            except Exception as exc:
+                logger.debug(
+                    "WebSocket API v3 %s failed on %s: %s",
+                    ws_method,
+                    ws_url,
+                    exc,
+                )
+        return None
+
     def _request_with_failover(
         self, method: str, path: str, params: dict[str, Any]
     ) -> dict[str, Any]:
-        """Execute an authenticated request with cluster failover on 418 or 429.
+        """Execute an authenticated request with WS API v3 and cluster failover.
 
         Args:
             method: HTTP method (GET or POST).
@@ -131,6 +226,10 @@ class BinanceSpotAuthenticatedClient:
         Raises:
             LiveExchangeExecutionError: If all cluster endpoints fail.
         """
+        ws_response = self._request_via_ws_api(method, path, params)
+        if ws_response is not None:
+            return ws_response
+
         now_ts = time.time()
         if now_ts < BinanceSpotAuthenticatedClient._ip_cooldown_until:
             wait_rem = int(
@@ -141,6 +240,8 @@ class BinanceSpotAuthenticatedClient:
             )
 
         urls = [
+            "https://api-gcp.binance.com",
+            "https://api4.binance.com",
             self._config.rest_base_url,
             "https://api1.binance.com",
             "https://api2.binance.com",
@@ -322,7 +423,48 @@ class BinanceSpotAuthenticatedClient:
         if upper_sym in self._step_size_cache:
             return self._step_size_cache[upper_sym]
 
+        ws_endpoints = (
+            "wss://ws-api.binance.com:443/ws-api/v3",
+            "wss://ws-api.binance.com:9443/ws-api/v3",
+        )
+        req_payload = json.dumps(
+            {
+                "id": f"info-{int(time.time() * 1000)}",
+                "method": "exchangeInfo",
+                "params": {"symbol": upper_sym},
+            }
+        )
+        for ws_url in ws_endpoints:
+            try:
+                with ws_sync_connect(
+                    ws_url,
+                    open_timeout=self._timeout_seconds,
+                    close_timeout=5.0,
+                ) as ws_conn:
+                    ws_conn.send(req_payload)
+                    raw_msg = ws_conn.recv(timeout=self._timeout_seconds)
+                    decoded = json.loads(raw_msg)
+                    if decoded.get("status") == 200:
+                        for sym_info in decoded.get("result", {}).get(
+                            "symbols", []
+                        ):
+                            if sym_info.get("symbol") == upper_sym:
+                                for flt in sym_info.get("filters", []):
+                                    if flt.get("filterType") == "LOT_SIZE":
+                                        step = str(
+                                            flt.get("stepSize", "0.00000100")
+                                        )
+                                        self._step_size_cache[upper_sym] = step
+                                        return step
+            except Exception as exc:
+                logger.debug(
+                    "WebSocket exchangeInfo failed on %s: %s", ws_url, exc
+                )
+
         urls = [
+            "https://api.binance.us",
+            "https://api-gcp.binance.com",
+            "https://api4.binance.com",
             "https://data-api.binance.vision",
             "https://api1.binance.com",
             "https://api2.binance.com",

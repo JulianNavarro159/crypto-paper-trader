@@ -120,10 +120,60 @@ class BinanceMarketDataClient:
         self._config = config
         self._http_timeout_seconds = http_timeout_seconds
 
+    async def _fetch_klines_via_ws_api(
+        self, params: dict[str, str | int]
+    ) -> list[Any] | None:
+        """Fetch klines via Binance WebSocket API v3 to bypass HTTP 418 limits.
+
+        Args:
+            params: Query parameters for the klines request.
+
+        Returns:
+            List of raw kline records if successful, otherwise None.
+        """
+        ws_endpoints = (
+            "wss://ws-api.binance.com:443/ws-api/v3",
+            "wss://ws-api.binance.com:9443/ws-api/v3",
+        )
+        ws_params: dict[str, str | int] = {
+            "symbol": str(params["symbol"]),
+            "interval": str(params["interval"]),
+            "limit": int(params.get("limit", 120)),
+        }
+        if "endTime" in params:
+            ws_params["endTime"] = int(params["endTime"])
+
+        request_payload = json.dumps(
+            {
+                "id": f"klines-{int(time.time() * 1000)}",
+                "method": "klines",
+                "params": ws_params,
+            }
+        )
+        for ws_url in ws_endpoints:
+            try:
+                async with websockets.connect(
+                    ws_url,
+                    open_timeout=self._http_timeout_seconds,
+                    close_timeout=5.0,
+                ) as ws_conn:
+                    await ws_conn.send(request_payload)
+                    raw_resp = await asyncio.wait_for(
+                        ws_conn.recv(), timeout=self._http_timeout_seconds
+                    )
+                    decoded = json.loads(raw_resp)
+                    if decoded.get("status") == 200 and isinstance(
+                        decoded.get("result"), list
+                    ):
+                        return decoded["result"]
+            except Exception as exc:
+                logger.debug("WebSocket API kline fetch failed on %s: %s", ws_url, exc)
+        return None
+
     async def _fetch_klines_with_failover(
         self, params: dict[str, str | int]
     ) -> list[Any]:
-        """Fetch klines with automatic multi-cluster failover on HTTP 418 or 429.
+        """Fetch klines with WebSocket API v3 primary and multi-cluster failover.
 
         Args:
             params: Query parameters for the klines endpoint.
@@ -134,6 +184,24 @@ class BinanceMarketDataClient:
         Raises:
             MarketDataIngestionError: If all cluster endpoints fail.
         """
+        ws_rows = await self._fetch_klines_via_ws_api(params)
+        if ws_rows:
+            return ws_rows
+
+        mirror_endpoint = "https://api.binance.us/api/v3/klines"
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._http_timeout_seconds,
+                headers={"User-Agent": "CryptoPaperTrader/1.0"},
+            ) as http_client:
+                mirror_resp = await http_client.get(mirror_endpoint, params=params)
+                if mirror_resp.status_code == 200:
+                    mirror_payload = mirror_resp.json()
+                    if isinstance(mirror_payload, list) and mirror_payload:
+                        return mirror_payload
+        except httpx.HTTPError as exc:
+            logger.debug("Binance US mirror kline fetch failed: %s", exc)
+
         now_ts = time.time()
         if now_ts < BinanceMarketDataClient._market_cooldown_until:
             wait_rem = int(
@@ -144,6 +212,8 @@ class BinanceMarketDataClient:
             )
 
         urls = [
+            "https://api-gcp.binance.com",
+            "https://api4.binance.com",
             self._config.market_data_url,
             "https://api1.binance.com",
             "https://api2.binance.com",
