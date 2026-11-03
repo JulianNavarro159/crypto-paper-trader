@@ -226,12 +226,14 @@ class BinanceSpotAuthenticatedClient:
         Raises:
             LiveExchangeExecutionError: If all cluster endpoints fail.
         """
-        ws_response = self._request_via_ws_api(method, path, params)
-        if ws_response is not None:
-            return ws_response
-
+        is_order_request = (
+            method.upper() == "POST" and path == "/api/v3/order"
+        )
         now_ts = time.time()
-        if now_ts < BinanceSpotAuthenticatedClient._ip_cooldown_until:
+        if (
+            not is_order_request
+            and now_ts < BinanceSpotAuthenticatedClient._ip_cooldown_until
+        ):
             wait_rem = int(
                 BinanceSpotAuthenticatedClient._ip_cooldown_until - now_ts
             )
@@ -239,16 +241,20 @@ class BinanceSpotAuthenticatedClient:
                 f"Binance IP 418 cooldown active; skipping request for {wait_rem}s"
             )
 
+        ws_response = self._request_via_ws_api(method, path, params)
+        if ws_response is not None:
+            return ws_response
+
         urls = [
-            "https://api-gcp.binance.com",
-            "https://api4.binance.com",
-            self._config.rest_base_url,
             "https://api1.binance.com",
             "https://api2.binance.com",
             "https://api3.binance.com",
+            "https://api4.binance.com",
+            "https://api-gcp.binance.com",
+            self._config.rest_base_url,
         ]
         last_error: Exception | None = None
-        max_cycles = 3
+        max_cycles = 2 if is_order_request else 1
         for cycle in range(max_cycles):
             for base_url in urls:
                 endpoint = f"{base_url.rstrip('/')}{path}"
@@ -267,14 +273,14 @@ class BinanceSpotAuthenticatedClient:
                             )
                         if response.status_code == 418:
                             BinanceSpotAuthenticatedClient._ip_cooldown_until = (
-                                time.time() + 600.0
+                                time.time() + 180.0
                             )
                             logger.warning(
-                                "Binance IP ban 418 on %s; initiating 600s cooldown...",
+                                "Binance IP ban 418 on %s; initiating 180s cooldown...",
                                 base_url,
                             )
                             raise LiveExchangeExecutionError(
-                                "Binance IP ban 418 encountered; cooldown for 600s"
+                                "Binance IP ban 418 encountered; cooldown for 180s"
                             )
                         if response.status_code == 429:
                             last_error = httpx.HTTPStatusError(
@@ -423,6 +429,34 @@ class BinanceSpotAuthenticatedClient:
         if upper_sym in self._step_size_cache:
             return self._step_size_cache[upper_sym]
 
+        urls = [
+            "https://api.binance.us",
+            "https://api-gcp.binance.com",
+            "https://api4.binance.com",
+            "https://data-api.binance.vision",
+            "https://api1.binance.com",
+            "https://api2.binance.com",
+            self._config.rest_base_url,
+        ]
+        for base_url in urls:
+            endpoint = f"{base_url.rstrip('/')}/api/v3/exchangeInfo"
+            try:
+                with httpx.Client(timeout=self._timeout_seconds) as client:
+                    response = client.get(endpoint, params={"symbol": upper_sym})
+                    if response.status_code in (418, 429):
+                        continue
+                    response.raise_for_status()
+                    data = response.json()
+                    for sym_info in data.get("symbols", []):
+                        if sym_info.get("symbol") == upper_sym:
+                            for flt in sym_info.get("filters", []):
+                                if flt.get("filterType") == "LOT_SIZE":
+                                    step = str(flt.get("stepSize", "0.00000100"))
+                                    self._step_size_cache[upper_sym] = step
+                                    return step
+            except httpx.HTTPError:
+                continue
+
         ws_endpoints = (
             "wss://ws-api.binance.com:443/ws-api/v3",
             "wss://ws-api.binance.com:9443/ws-api/v3",
@@ -460,34 +494,6 @@ class BinanceSpotAuthenticatedClient:
                 logger.debug(
                     "WebSocket exchangeInfo failed on %s: %s", ws_url, exc
                 )
-
-        urls = [
-            "https://api.binance.us",
-            "https://api-gcp.binance.com",
-            "https://api4.binance.com",
-            "https://data-api.binance.vision",
-            "https://api1.binance.com",
-            "https://api2.binance.com",
-            self._config.rest_base_url,
-        ]
-        for base_url in urls:
-            endpoint = f"{base_url.rstrip('/')}/api/v3/exchangeInfo"
-            try:
-                with httpx.Client(timeout=self._timeout_seconds) as client:
-                    response = client.get(endpoint, params={"symbol": upper_sym})
-                    if response.status_code in (418, 429):
-                        continue
-                    response.raise_for_status()
-                    data = response.json()
-                    for sym_info in data.get("symbols", []):
-                        if sym_info.get("symbol") == upper_sym:
-                            for flt in sym_info.get("filters", []):
-                                if flt.get("filterType") == "LOT_SIZE":
-                                    step = str(flt.get("stepSize", "0.00000100"))
-                                    self._step_size_cache[upper_sym] = step
-                                    return step
-            except httpx.HTTPError:
-                continue
 
         return "0.00000100"
 
@@ -538,9 +544,12 @@ class BinanceSpotAuthenticatedClient:
         effective_qty = quantity
         if upper_sym.endswith("USDT"):
             base_asset = upper_sym[:-4]
-            available_base = self.fetch_available_asset_balance(base_asset)
-            if 0.0 < available_base < effective_qty:
-                effective_qty = available_base
+            try:
+                available_base = self.fetch_available_asset_balance(base_asset)
+                if 0.0 < available_base < effective_qty:
+                    effective_qty = available_base
+            except LiveExchangeExecutionError:
+                pass
 
         step_size = self.fetch_symbol_step_size(upper_sym)
         formatted_qty = quantize_step_size(effective_qty, step_size)

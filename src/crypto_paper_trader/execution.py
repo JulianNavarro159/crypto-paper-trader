@@ -410,23 +410,7 @@ class PaperTradingEngine:
         self._ledger = ledger
         self._notifier = notifier if notifier is not None else NullNotificationService()
         self._live_client = live_client
-
-        if self._live_client is not None and not self._live_client.is_cooldown_active():
-            try:
-                self._available_cash_usdt = (
-                    self._live_client.fetch_available_usdt_balance()
-                )
-            except Exception as exc:
-                fallback_cash = capital_config.initial_capital_usdt
-                logger.warning(
-                    "Could not refresh live Binance USDT balance (%s); "
-                    "using fallback %.4f USDT",
-                    exc,
-                    fallback_cash,
-                )
-                self._available_cash_usdt = fallback_cash
-        else:
-            self._available_cash_usdt = capital_config.initial_capital_usdt
+        self._available_cash_usdt = capital_config.initial_capital_usdt
         self._active_position: Position | None = self._ledger.fetch_open_position()
         if self._active_position is not None:
             if self._live_client is None:
@@ -572,11 +556,19 @@ class PaperTradingEngine:
         gross_exit_notional_usdt = round(sell_quantity * current_price, 6)
 
         if self._live_client is not None:
-            live_res = self._live_client.place_market_sell_by_quantity(
-                symbol=pos.symbol,
-                quantity=sell_quantity,
-                client_order_id=client_order_id,
-            )
+            try:
+                live_res = self._live_client.place_market_sell_by_quantity(
+                    symbol=pos.symbol,
+                    quantity=sell_quantity,
+                    client_order_id=client_order_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Live partial SELL order deferred due to exchange error (%s); "
+                    "will retry on next tick.",
+                    exc,
+                )
+                return None
             live_qty = float(live_res.get("executedQty", 0.0))
             live_quote = float(live_res.get("cummulativeQuoteQty", 0.0))
             if live_qty > 0.0 and live_quote > 0.0:
@@ -731,11 +723,19 @@ class PaperTradingEngine:
         quantity = round(net_notional_usdt / entry_price, 8)
 
         if self._live_client is not None:
-            live_res = self._live_client.place_market_buy_by_quote(
-                symbol=signal.symbol,
-                quote_amount_usdt=proposed_notional_usdt,
-                client_order_id=client_order_id,
-            )
+            try:
+                live_res = self._live_client.place_market_buy_by_quote(
+                    symbol=signal.symbol,
+                    quote_amount_usdt=proposed_notional_usdt,
+                    client_order_id=client_order_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Live BUY order deferred due to exchange error (%s); "
+                    "will retry on next signal.",
+                    exc,
+                )
+                return None
             live_qty = float(live_res.get("executedQty", 0.0))
             live_quote = float(live_res.get("cummulativeQuoteQty", 0.0))
             if live_qty > 0.0 and live_quote > 0.0:
@@ -843,11 +843,19 @@ class PaperTradingEngine:
         sell_quantity = position.quantity
 
         if self._live_client is not None:
-            live_res = self._live_client.place_market_sell_by_quantity(
-                symbol=position.symbol,
-                quantity=position.quantity,
-                client_order_id=client_order_id,
-            )
+            try:
+                live_res = self._live_client.place_market_sell_by_quantity(
+                    symbol=position.symbol,
+                    quantity=position.quantity,
+                    client_order_id=client_order_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Live SELL order deferred due to exchange error (%s); "
+                    "will retry on next tick.",
+                    exc,
+                )
+                return None
             live_qty = float(live_res.get("executedQty", 0.0))
             live_quote = float(live_res.get("cummulativeQuoteQty", 0.0))
             if live_qty > 0.0 and live_quote > 0.0:

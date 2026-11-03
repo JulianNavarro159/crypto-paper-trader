@@ -173,7 +173,7 @@ class BinanceMarketDataClient:
     async def _fetch_klines_with_failover(
         self, params: dict[str, str | int]
     ) -> list[Any]:
-        """Fetch klines with WebSocket API v3 primary and multi-cluster failover.
+        """Fetch klines with Binance US mirror primary and multi-cluster failover.
 
         Args:
             params: Query parameters for the klines endpoint.
@@ -184,10 +184,6 @@ class BinanceMarketDataClient:
         Raises:
             MarketDataIngestionError: If all cluster endpoints fail.
         """
-        ws_rows = await self._fetch_klines_via_ws_api(params)
-        if ws_rows:
-            return ws_rows
-
         mirror_endpoint = "https://api.binance.us/api/v3/klines"
         try:
             async with httpx.AsyncClient(
@@ -210,6 +206,10 @@ class BinanceMarketDataClient:
             raise MarketDataIngestionError(
                 f"Binance market data IP 418 cooldown active; skipping for {wait_rem}s"
             )
+
+        ws_rows = await self._fetch_klines_via_ws_api(params)
+        if ws_rows:
+            return ws_rows
 
         urls = [
             "https://api-gcp.binance.com",
@@ -347,10 +347,17 @@ class BinanceMarketDataClient:
             Candle instances updated in real time.
         """
         stream_name = f"{self._config.symbol.lower()}@kline_{self._config.interval}"
-        ws_url = f"{self._config.ws_base_url}/{stream_name}"
+        ws_bases = (
+            self._config.ws_base_url,
+            "wss://stream.binance.us:9443/ws",
+        )
         events_received = 0
+        attempt_idx = 0
 
         while True:
+            base_url = ws_bases[attempt_idx % len(ws_bases)]
+            ws_url = f"{base_url.rstrip('/')}/{stream_name}"
+            attempt_idx += 1
             try:
                 async with websockets.connect(
                     ws_url, ping_interval=20, ping_timeout=20
@@ -366,8 +373,9 @@ class BinanceMarketDataClient:
                 raise
             except Exception as exc:
                 logger.warning(
-                    "WebSocket disconnected or encounter error (%s); "
+                    "WebSocket disconnected or encounter error on %s (%s); "
                     "reconnecting in 3 seconds...",
+                    base_url,
                     exc,
                 )
                 await asyncio.sleep(3.0)

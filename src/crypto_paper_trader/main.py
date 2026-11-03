@@ -6,7 +6,6 @@ import logging
 import os
 import time
 from dataclasses import replace
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -26,7 +25,6 @@ from crypto_paper_trader.domain import (
     Candle,
     MacroMarketRegime,
     OrderSide,
-    Position,
 )
 from crypto_paper_trader.execution import LedgerRepository
 from crypto_paper_trader.ingestion import BinanceMarketDataClient
@@ -300,11 +298,10 @@ async def start_periodic_health_heartbeat(
                 (winning_trades / closed_trades * 100.0) if closed_trades > 0 else 0.0
             )
             usdt_balance = None
-            if live_client is not None:
-                try:
-                    usdt_balance = live_client.fetch_available_usdt_balance()
-                except Exception:
-                    pass
+            if open_pos is None:
+                usdt_balance = round(
+                    config.capital.initial_capital_usdt + total_realized_pnl, 4
+                )
 
             heartbeat_msg = format_heartbeat_alert(
                 symbol=config.exchange.symbol,
@@ -426,27 +423,6 @@ async def run_application(args: argparse.Namespace) -> None:
         if args.mode in ("realtime", "live")
         else None
     )
-    if existing_open_pos is None and live_client is not None:
-        spot_holding = live_client.fetch_active_spot_holding(
-            config.universe.all_symbols
-        )
-        if spot_holding is not None:
-            held_sym, held_qty, held_entry = spot_holding
-            notional_usdt = round(held_qty * held_entry, 4)
-            existing_open_pos = Position(
-                position_id=f"pos-spot-{held_sym.lower()}",
-                symbol=held_sym,
-                opened_at=datetime.now(tz=timezone.utc),
-                entry_price=held_entry,
-                quantity=held_qty,
-                notional_usdt=notional_usdt,
-                entry_fee_usdt=round(notional_usdt * 0.001, 6),
-                stop_loss_price=round(held_entry * 0.976, 6),
-                take_profit_price=round(held_entry * 1.038, 6),
-            )
-            LedgerRepository(db_path=config.ledger_db_path).save_open_position(
-                existing_open_pos
-            )
 
     active_macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
     initial_universe_candles: dict[str, list[Candle]] = {}
