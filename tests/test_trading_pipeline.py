@@ -829,3 +829,95 @@ def test_orchestrator_handles_bootstrap_failure_gracefully() -> None:
                 ledger.close()
 
     asyncio.run(_runner())
+
+
+def test_oversold_dip_rebound_permitted_under_bearish_regime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify oversold dip rebound BUY signals are permitted in bearish regime."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_ledger.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            candles = build_synthetic_candles(count=35, start_price=10.0, step=-0.1)
+            config = TradingSystemConfig(
+                exchange=ExchangeConfig(symbol="SUIUSDT"),
+                ledger_db_path=db_path,
+            )
+            trading_engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            provider = BinanceMarketDataClient(config=config.exchange)
+            orchestrator = RealTimeTradingOrchestrator(
+                config=config,
+                market_data_provider=provider,
+                trading_engine=trading_engine,
+            )
+            orchestrator.set_macro_regime(MacroMarketRegime.BEARISH)
+
+            for candle in candles[:-1]:
+                orchestrator._upsert_candle(candle)
+
+            oversold_signal = MarketSignal(
+                symbol="SUIUSDT",
+                evaluated_at=candles[-1].close_time,
+                signal_type=SignalType.BUY,
+                reference_price=2.0000,
+                stop_loss_price=1.9800,
+                take_profit_price=2.0400,
+                atr_value=0.0300,
+                rsi_value=32.0,
+                fast_ema=1.9900,
+                slow_ema=2.0200,
+            )
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda **kwargs: oversold_signal,
+            )
+
+            result = orchestrator.process_candle_event(candles[-1])
+            assert result.signal.signal_type == SignalType.BUY
+            assert trading_engine.active_position is not None
+        finally:
+            ledger.close()
+
+
+def test_signal_generation_enforces_minimum_fee_protective_spread() -> None:
+    """Verify market signal generation ensures take profit covers round-trip fees."""
+    import pandas as pd
+
+    from crypto_paper_trader.strategy import build_market_signal_from_row
+
+    row_data = {
+        "close_price": 100.0,
+        "atr": 0.0001,
+        "rsi": 35.0,
+        "fast_ema": 99.8,
+        "slow_ema": 100.2,
+        "signal_type": "BUY",
+        "close_time": datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc),
+    }
+    series_row = pd.Series(row_data)
+    cfg = StrategyConfig()
+    signal = build_market_signal_from_row(series_row, "SOLUSDT", cfg)
+    gross_return = (
+        signal.take_profit_price - signal.reference_price
+    ) / signal.reference_price
+    assert gross_return >= 0.0074
+    sl_ratio = (
+        signal.reference_price - signal.stop_loss_price
+    ) / signal.reference_price
+    assert sl_ratio >= 0.0059
+
+    risk_cfg = RiskConfig()
+    exchange_cfg = ExchangeConfig()
+    validate_entry_order_viability(
+        signal=signal,
+        proposed_notional_usdt=25.0,
+        available_cash_usdt=30.0,
+        exchange_config=exchange_cfg,
+        risk_config=risk_cfg,
+    )

@@ -56,7 +56,7 @@ class AssetProjectionScore:
 
 async def fetch_universe_candles(
     config: TradingSystemConfig,
-    candle_count: int = 180,
+    candle_count: int = 80,
 ) -> dict[str, list[Candle]]:
     """Fetch historical candles for universe symbols with early abort on IP ban.
 
@@ -93,7 +93,7 @@ async def fetch_universe_candles(
                     sym,
                 )
                 break
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.4)
     return results
 
 

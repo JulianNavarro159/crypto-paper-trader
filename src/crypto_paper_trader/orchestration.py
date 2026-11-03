@@ -167,11 +167,20 @@ class RealTimeTradingOrchestrator:
             and self._config.exchange.symbol != "BTCUSDT"
         ):
             strat_cfg = self._config.strategy
-            if (
+            is_oversold_dip = signal.rsi_value <= 45.0
+            is_momentum_breakout = (
                 strat_cfg.enable_decoupled_momentum
                 and signal.rsi_value >= strat_cfg.decoupled_rsi_min
                 and signal.fast_ema > signal.slow_ema
-            ):
+            )
+            if is_oversold_dip:
+                logger.info(
+                    "Permitted oversold dip rebound BUY signal on %s "
+                    "despite BEARISH Bitcoin macro regime (RSI=%.1f).",
+                    signal.symbol,
+                    signal.rsi_value,
+                )
+            elif is_momentum_breakout:
                 logger.info(
                     "Permitted decoupled relative-strength BUY signal on %s "
                     "despite BEARISH Bitcoin macro regime (RSI=%.1f).",

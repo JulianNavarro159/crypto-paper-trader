@@ -123,8 +123,8 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     parser.add_argument(
         "--rescan-hours",
         type=float,
-        default=2.0,
-        help="Hours between universe rescans in auto-select mode (default: 2.0)",
+        default=1.0,
+        help="Hours between universe rescans in auto-select mode (default: 1.0)",
     )
     parser.add_argument(
         "--db-path",
