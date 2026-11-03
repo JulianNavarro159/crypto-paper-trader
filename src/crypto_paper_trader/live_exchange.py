@@ -226,14 +226,8 @@ class BinanceSpotAuthenticatedClient:
         Raises:
             LiveExchangeExecutionError: If all cluster endpoints fail.
         """
-        is_order_request = (
-            method.upper() == "POST" and path == "/api/v3/order"
-        )
         now_ts = time.time()
-        if (
-            not is_order_request
-            and now_ts < BinanceSpotAuthenticatedClient._ip_cooldown_until
-        ):
+        if now_ts < BinanceSpotAuthenticatedClient._ip_cooldown_until:
             wait_rem = int(
                 BinanceSpotAuthenticatedClient._ip_cooldown_until - now_ts
             )
@@ -241,20 +235,16 @@ class BinanceSpotAuthenticatedClient:
                 f"Binance IP 418 cooldown active; skipping request for {wait_rem}s"
             )
 
-        ws_response = self._request_via_ws_api(method, path, params)
-        if ws_response is not None:
-            return ws_response
-
         urls = [
+            self._config.rest_base_url,
             "https://api1.binance.com",
             "https://api2.binance.com",
             "https://api3.binance.com",
             "https://api4.binance.com",
             "https://api-gcp.binance.com",
-            self._config.rest_base_url,
         ]
         last_error: Exception | None = None
-        max_cycles = 2 if is_order_request else 1
+        max_cycles = 1
         for cycle in range(max_cycles):
             for base_url in urls:
                 endpoint = f"{base_url.rstrip('/')}{path}"
@@ -272,15 +262,27 @@ class BinanceSpotAuthenticatedClient:
                                 endpoint, params=signed, headers=headers
                             )
                         if response.status_code == 418:
+                            retry_hdr = response.headers.get(
+                                "Retry-After", "240"
+                            ).strip()
+                            cooldown_secs = (
+                                max(float(retry_hdr) + 15.0, 240.0)
+                                if retry_hdr.isdigit()
+                                else 240.0
+                            )
                             BinanceSpotAuthenticatedClient._ip_cooldown_until = (
-                                time.time() + 180.0
+                                time.time() + cooldown_secs
                             )
                             logger.warning(
-                                "Binance IP ban 418 on %s; initiating 180s cooldown...",
+                                "Binance IP ban 418 on %s (Retry-After=%s); "
+                                "initiating %.0fs quiet cooldown...",
                                 base_url,
+                                retry_hdr,
+                                cooldown_secs,
                             )
                             raise LiveExchangeExecutionError(
-                                "Binance IP ban 418 encountered; cooldown for 180s"
+                                f"Binance IP ban 418 encountered; "
+                                f"cooldown for {int(cooldown_secs)}s"
                             )
                         if response.status_code == 429:
                             last_error = httpx.HTTPStatusError(

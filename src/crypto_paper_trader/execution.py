@@ -556,6 +556,8 @@ class PaperTradingEngine:
         gross_exit_notional_usdt = round(sell_quantity * current_price, 6)
 
         if self._live_client is not None:
+            if self._live_client.is_cooldown_active():
+                return None
             try:
                 live_res = self._live_client.place_market_sell_by_quantity(
                     symbol=pos.symbol,
@@ -565,7 +567,7 @@ class PaperTradingEngine:
             except Exception as exc:
                 logger.warning(
                     "Live partial SELL order deferred due to exchange error (%s); "
-                    "will retry on next tick.",
+                    "will retry after cooldown.",
                     exc,
                 )
                 return None
@@ -723,6 +725,8 @@ class PaperTradingEngine:
         quantity = round(net_notional_usdt / entry_price, 8)
 
         if self._live_client is not None:
+            if self._live_client.is_cooldown_active():
+                return None
             try:
                 live_res = self._live_client.place_market_buy_by_quote(
                     symbol=signal.symbol,
@@ -732,7 +736,7 @@ class PaperTradingEngine:
             except Exception as exc:
                 logger.warning(
                     "Live BUY order deferred due to exchange error (%s); "
-                    "will retry on next signal.",
+                    "will retry after cooldown.",
                     exc,
                 )
                 return None
@@ -843,6 +847,8 @@ class PaperTradingEngine:
         sell_quantity = position.quantity
 
         if self._live_client is not None:
+            if self._live_client.is_cooldown_active():
+                return None
             try:
                 live_res = self._live_client.place_market_sell_by_quantity(
                     symbol=position.symbol,
@@ -852,7 +858,7 @@ class PaperTradingEngine:
             except Exception as exc:
                 logger.warning(
                     "Live SELL order deferred due to exchange error (%s); "
-                    "will retry on next tick.",
+                    "will retry after cooldown.",
                     exc,
                 )
                 return None
