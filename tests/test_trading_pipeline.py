@@ -1217,3 +1217,78 @@ def test_opening_range_breakout_entry_timer_triggers_on_box_breakout() -> None:
         config=StrategyConfig(),
     )
     assert signal.signal_type == SignalType.BUY
+
+
+def test_overbought_entry_blocked_and_hair_trigger_net_profit_lock() -> None:
+    """Verify overbought RSI=63.81 is rejected and +0.23% peak locks net profit."""
+    from crypto_paper_trader.simulation import run_time_machine_simulation
+
+    candles = build_synthetic_candles(count=60, start_price=100.0, step=0.15)
+    now = datetime(2026, 11, 4, 16, 18, tzinfo=timezone.utc)
+    overbought_signal = MarketSignal(
+        symbol="ADAUSDT",
+        evaluated_at=now,
+        signal_type=SignalType.BUY,
+        reference_price=0.5000,
+        stop_loss_price=0.4968,
+        take_profit_price=0.5042,
+        atr_value=0.0030,
+        rsi_value=63.81,
+        fast_ema=0.5002,
+        slow_ema=0.4990,
+    )
+    tm_report = run_time_machine_simulation(
+        candles=candles,
+        signal=overbought_signal,
+        risk_config=RiskConfig(),
+        exchange_config=ExchangeConfig(symbol="ADAUSDT"),
+        replays_count=10_000,
+    )
+    assert tm_report.approved is False
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_hair_trigger.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            config = TradingSystemConfig(
+                exchange=ExchangeConfig(symbol="ADAUSDT", taker_fee_rate=0.001),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            valid_buy = MarketSignal(
+                symbol="ADAUSDT",
+                evaluated_at=now,
+                signal_type=SignalType.BUY,
+                reference_price=1.0000,
+                stop_loss_price=0.9940,
+                take_profit_price=1.0080,
+                atr_value=0.0040,
+                rsi_value=49.0,
+                fast_ema=1.0005,
+                slow_ema=0.9995,
+            )
+            buy_exec = engine.process_signal(valid_buy)
+            assert buy_exec is not None
+
+            engine.evaluate_protective_exits(
+                current_price=1.0024,
+                timestamp=now + timedelta(minutes=2),
+            )
+            pos = engine.active_position
+            assert pos is not None
+            assert pos.stop_loss_price >= 1.0022
+
+            exit_exec = engine.evaluate_protective_exits(
+                current_price=1.0022,
+                timestamp=now + timedelta(minutes=3),
+            )
+            assert exit_exec is not None
+            assert exit_exec.reason == ExitReason.TRAILING_STOP.value
+            assert exit_exec.realized_pnl_usdt > 0.0
+        finally:
+            ledger.close()

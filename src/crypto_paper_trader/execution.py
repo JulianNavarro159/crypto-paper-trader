@@ -498,9 +498,9 @@ class PaperTradingEngine:
             if partial_exec is not None:
                 return partial_exec
 
-        if gain_ratio >= 0.0035:
-            breakeven_floor = round(pos.entry_price * 1.0020, 10)
-            trail_pct = 0.0035 if pos.is_partially_closed else 0.0015
+        if gain_ratio >= 0.0032:
+            breakeven_floor = round(pos.entry_price * 1.0025, 10)
+            trail_pct = 0.0018 if pos.is_partially_closed else 0.0004
             trailing_distance = round(pos.entry_price * trail_pct, 10)
             trailing_candidate = round(new_peak - trailing_distance, 10)
             new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
@@ -509,12 +509,20 @@ class PaperTradingEngine:
                     pos, stop_loss_price=new_sl, peak_price=new_peak
                 )
                 self._ledger.save_open_position(self._active_position)
-        elif gain_ratio >= 0.0018:
-            breakeven_floor = round(pos.entry_price * 1.0015, 10)
-            trail_pct = 0.0006
+        elif gain_ratio >= 0.0020:
+            breakeven_floor = round(pos.entry_price * 1.0019, 10)
+            trail_pct = 0.0002
             trailing_distance = round(pos.entry_price * trail_pct, 10)
             trailing_candidate = round(new_peak - trailing_distance, 10)
             new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
+            if new_sl > pos.stop_loss_price or new_peak > pos.peak_price:
+                self._active_position = replace(
+                    pos, stop_loss_price=new_sl, peak_price=new_peak
+                )
+                self._ledger.save_open_position(self._active_position)
+        elif gain_ratio >= 0.0014:
+            defensive_floor = round(pos.entry_price * 0.9988, 10)
+            new_sl = max(pos.stop_loss_price, defensive_floor)
             if new_sl > pos.stop_loss_price or new_peak > pos.peak_price:
                 self._active_position = replace(
                     pos, stop_loss_price=new_sl, peak_price=new_peak
@@ -750,6 +758,16 @@ class PaperTradingEngine:
         )
         if client_order_id in self._executed_order_ids:
             return None
+
+        if (
+            self._live_client is not None
+            and self._live_client.get_known_usdt_balance() is None
+            and not self._live_client.is_cooldown_active()
+            and hasattr(self._live_client, "fetch_available_usdt_balance")
+        ):
+            live_usdt = self._live_client.fetch_available_usdt_balance()
+            if live_usdt is not None and live_usdt > 0.0:
+                self._available_cash_usdt = round(live_usdt, 6)
 
         effective_alloc = (
             allocation_fraction

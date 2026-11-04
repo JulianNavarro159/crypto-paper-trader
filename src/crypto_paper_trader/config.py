@@ -13,7 +13,7 @@ class CapitalConfig:
         cop_per_usdt_rate: Reference exchange rate from COP to USDT.
     """
 
-    initial_capital_cop: float = 100_000.0
+    initial_capital_cop: float = 110_800.0
     cop_per_usdt_rate: float = 3_194.0
 
     @property
@@ -45,7 +45,7 @@ class UniverseConfig:
     volatile_symbols: tuple[str, ...] = (
         "SUIUSDT",
         "DOGEUSDT",
-        "PEPEUSDT",
+        "ADAUSDT",
         "AVAXUSDT",
         "LINKUSDT",
     )
@@ -114,13 +114,13 @@ class StrategyConfig:
     atr_period: int = 14
     volume_climax_multiplier: float = 1.2
     rsi_entry_min: float = 32.0
-    rsi_entry_max: float = 60.0
+    rsi_entry_max: float = 54.0
     rsi_oversold_threshold: float = 30.0
-    rsi_overbought_exit: float = 62.0
-    atr_stop_loss_multiplier: float = 1.3
-    atr_take_profit_multiplier: float = 1.6
+    rsi_overbought_exit: float = 61.5
+    atr_stop_loss_multiplier: float = 1.1
+    atr_take_profit_multiplier: float = 1.3
     enable_decoupled_momentum: bool = True
-    decoupled_rsi_min: float = 56.0
+    decoupled_rsi_min: float = 58.0
 
 
 @dataclass(frozen=True)
@@ -135,12 +135,12 @@ class RiskConfig:
 
     position_allocation_fraction: float = 0.90
     min_net_profit_ratio: float = 0.0008
-    min_signal_exit_profit_ratio: float = 0.0015
+    min_signal_exit_profit_ratio: float = 0.0017
     enable_partial_take_profit: bool = True
-    tp1_profit_ratio: float = 0.0050
+    tp1_profit_ratio: float = 0.0032
     tp1_close_fraction: float = 0.50
-    tp2_take_profit_ratio: float = 0.0110
-    trailing_atr_multiplier: float = 0.6
+    tp2_take_profit_ratio: float = 0.0055
+    trailing_atr_multiplier: float = 0.5
     enable_time_machine_gate: bool = True
     time_machine_replays: int = 10_000
     time_machine_min_win_prob_pct: float = 55.0

@@ -129,7 +129,8 @@ def evaluate_universe_projection(
         atr_pct = round(
             (latest_signal.atr_value / latest_candle.close_price) * 100.0, 4
         )
-        capped_pf = min(report.profit_factor, 4.0)
+        sample_confidence = min(1.0, max(0.25, report.total_closed_trades / 4.0))
+        capped_pf = min(report.profit_factor, 4.0) * sample_confidence
         downtrend_penalty = (
             15.0
             if (
@@ -138,6 +139,7 @@ def evaluate_universe_projection(
             )
             else 0.0
         )
+        overbought_penalty = 12.0 if latest_signal.rsi_value > 55.0 else 0.0
         tm_report = run_time_machine_simulation(
             candles=candles,
             signal=latest_signal,
@@ -153,7 +155,8 @@ def evaluate_universe_projection(
             + (report.win_rate_pct * 0.20)
             + (atr_pct * 6.0)
             + tm_bonus
-            - downtrend_penalty,
+            - downtrend_penalty
+            - overbought_penalty,
             3,
         )
         category = "STABLE_CORE" if symbol in core_set else "HIGH_VOLATILITY"

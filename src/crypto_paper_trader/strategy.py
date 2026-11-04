@@ -181,18 +181,20 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         )
         & (enriched["close_price"] > enriched["high_price"].shift(1))
         & (enriched["close_price"] > enriched["open_price"])
+        & (enriched["close_price"] <= (enriched["bb_upper"] * 0.995))
         & (
             (prev_vol >= (prev_vol_sma * 1.05))
             | (enriched["volume"] >= (enriched["vol_sma"] * 1.05))
         )
-        & (enriched["rsi"] >= 48.0)
-        & (enriched["rsi"] <= 68.0)
+        & (enriched["rsi"] >= 46.0)
+        & (enriched["rsi"] <= 54.0)
     )
 
     micro_dip_rebound = (
         (prev_low <= enriched["bb_lower"].shift(1) * 1.003)
         & (prev_rsi <= 38.0)
         & (enriched["rsi"] > prev_rsi)
+        & (enriched["rsi"] <= 52.0)
         & (enriched["close_price"] > enriched["open_price"])
         & (enriched["close_price"] > enriched["close_price"].shift(1))
         & (
@@ -204,9 +206,9 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
     ema_recovery = (
         (enriched["fast_ema"] > enriched["slow_ema"])
         & (enriched["fast_ema"].shift(1) <= enriched["slow_ema"].shift(1))
-        & (enriched["close_price"] <= enriched["bb_mid"] * 1.010)
+        & (enriched["close_price"] <= enriched["bb_mid"] * 1.005)
         & (enriched["rsi"] >= 34.0)
-        & (enriched["rsi"] <= 58.0)
+        & (enriched["rsi"] <= 53.0)
     )
 
     rolling_range_high = (
@@ -224,11 +226,24 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         & (enriched["close_price"] > enriched["open_price"])
         & (enriched["fast_ema"] >= enriched["slow_ema"])
         & (enriched["volume"] >= (enriched["vol_sma"] * 0.95))
-        & (enriched["rsi"] >= 46.0)
-        & (enriched["rsi"] <= 61.0)
+        & (enriched["rsi"] >= 45.0)
+        & (enriched["rsi"] <= 60.0)
     )
 
-    buy_mask = (
+    sell_mask = (
+        (enriched["rsi"] >= config.rsi_overbought_exit)
+        | (
+            (enriched["high_price"] >= enriched["bb_upper"] * 0.998)
+            & (enriched["rsi"] >= 58.5)
+        )
+        | (
+            (enriched["rsi"] >= 53.0)
+            & (enriched["rsi"] < prev_rsi)
+            & (enriched["close_price"] < enriched["open_price"])
+        )
+    )
+
+    raw_buy_mask = (
         climax_dip_rebound
         | uptrend_pullback
         | trend_momentum_breakout
@@ -236,15 +251,7 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         | ema_recovery
         | opening_range_breakout
     )
-    sell_mask = (
-        (enriched["rsi"] >= config.rsi_overbought_exit)
-        | (enriched["high_price"] >= enriched["bb_upper"] * 0.998)
-        | (
-            (enriched["rsi"] >= 54.0)
-            & (enriched["rsi"] < prev_rsi)
-            & (enriched["close_price"] < enriched["open_price"])
-        )
-    )
+    buy_mask = raw_buy_mask & (~sell_mask)
 
     signals = np.where(
         buy_mask,
@@ -274,13 +281,19 @@ def build_market_signal_from_row(
     raw_atr = float(row["atr"])
     effective_atr = max(raw_atr, reference_price * 0.0015)
 
-    stop_loss_dist = max(
-        effective_atr * config.atr_stop_loss_multiplier,
-        reference_price * 0.0060,
+    stop_loss_dist = min(
+        max(
+            effective_atr * config.atr_stop_loss_multiplier,
+            reference_price * 0.0060,
+        ),
+        reference_price * 0.0065,
     )
-    take_profit_dist = max(
-        effective_atr * config.atr_take_profit_multiplier,
-        reference_price * 0.0075,
+    take_profit_dist = min(
+        max(
+            effective_atr * config.atr_take_profit_multiplier,
+            reference_price * 0.0075,
+        ),
+        reference_price * 0.0085,
     )
     stop_loss_price = round(reference_price - stop_loss_dist, 10)
     take_profit_price = round(reference_price + take_profit_dist, 10)

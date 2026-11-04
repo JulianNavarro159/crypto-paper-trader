@@ -93,11 +93,11 @@ def run_time_machine_simulation(
     if signal.rsi_value <= 38.0:
         rebound_impulse = ((42.0 - signal.rsi_value) / 100.0) * sigma * 0.45
         mu_cond = max(rebound_impulse, sigma * 0.14)
-    elif signal.fast_ema >= signal.slow_ema and signal.rsi_value <= 66.0:
+    elif signal.fast_ema >= signal.slow_ema and signal.rsi_value <= 61.5:
         trend_impulse = max(ema_spread * 0.25, sigma * 0.15)
         mu_cond = min(trend_impulse, sigma * 0.40)
     else:
-        mu_cond = min(ema_spread * 0.35, -sigma * 0.22)
+        mu_cond = min(ema_spread * 0.35, -sigma * 0.25)
 
     seed_val = abs(
         int(signal.evaluated_at.timestamp()) ^ int(round(entry_price * 10_000))
@@ -127,7 +127,7 @@ def run_time_machine_simulation(
         signal.take_profit_price,
         entry_price * (1.0 + risk_config.tp2_take_profit_ratio),
     )
-    lock_trigger_price = entry_price * 1.0018
+    lock_trigger_price = entry_price * 1.0022
     round_trip_fee = 2.0 * exchange_config.taker_fee_rate
 
     sentinel = horizon_candles + 1
@@ -152,7 +152,7 @@ def run_time_machine_simulation(
     sl_Loss_ret = -((entry_price - sl_price) / entry_price) - round_trip_fee
     tp1_net_ret = risk_config.tp1_profit_ratio - round_trip_fee
     tp2_net_ret = ((tp2_price - entry_price) / entry_price) - round_trip_fee
-    lock_floor_net_ret = 0.0015 - round_trip_fee
+    lock_floor_net_ret = 0.0021 - round_trip_fee
     terminal_net_ret = (
         (close_paths[:, -1] - entry_price) / entry_price
     ) - round_trip_fee
