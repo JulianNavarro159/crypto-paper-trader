@@ -758,6 +758,7 @@ class PaperTradingEngine:
         )
         net_notional_usdt = proposed_notional_usdt - entry_fee_usdt
         quantity = round(net_notional_usdt / entry_price, 8)
+        cash_spent_usdt = proposed_notional_usdt
 
         if self._live_client is not None:
             if self._live_client.is_cooldown_active():
@@ -790,18 +791,33 @@ class PaperTradingEngine:
                     if isinstance(fill, dict)
                     and str(fill.get("commissionAsset", "")).upper() == base_asset
                 )
+                bnb_commission = sum(
+                    float(fill.get("commission", 0.0))
+                    for fill in fills
+                    if isinstance(fill, dict)
+                    and str(fill.get("commissionAsset", "")).upper() == "BNB"
+                )
                 entry_price = live_quote / live_qty
-                if base_commission > 0.0 and base_asset != "BNB":
+                cash_spent_usdt = round(live_quote, 6)
+                pre_base_bal = self._live_client.get_known_asset_balance(base_asset)
+                total_base_after_buy = max(
+                    0.0, pre_base_bal + live_qty - base_commission
+                )
+                if base_commission > 0.0 and total_base_after_buy < live_qty:
                     step_size = self._live_client.fetch_symbol_step_size(signal.symbol)
                     quantity = float(
-                        quantize_step_size(
-                            max(0.0, live_qty - base_commission), step_size
-                        )
+                        quantize_step_size(total_base_after_buy, step_size)
                     )
-                    proposed_notional_usdt = round(quantity * entry_price, 6)
                 else:
                     quantity = live_qty
-                    proposed_notional_usdt = round(live_quote, 6)
+                proposed_notional_usdt = round(quantity * entry_price, 6)
+                retained_base_delta = (live_qty - base_commission) - quantity
+                if base_asset:
+                    self._live_client.adjust_known_asset_balance(
+                        base_asset, retained_base_delta
+                    )
+                if base_asset != "BNB" and bnb_commission > 0.0:
+                    self._live_client.adjust_known_asset_balance("BNB", -bnb_commission)
                 price_delta = entry_price - signal.reference_price
                 stop_loss_price = round(signal.stop_loss_price + price_delta, 8)
                 take_profit_price = round(signal.take_profit_price + price_delta, 8)
@@ -809,7 +825,7 @@ class PaperTradingEngine:
         position_id = f"pos-{client_order_id[-12:]}"
 
         self._available_cash_usdt = round(
-            self._available_cash_usdt - proposed_notional_usdt, 6
+            max(0.0, self._available_cash_usdt - cash_spent_usdt), 6
         )
         if self._live_client is not None:
             self._live_client.update_known_usdt_balance(self._available_cash_usdt)

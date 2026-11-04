@@ -993,12 +993,20 @@ def test_bnb_live_order_preserves_full_quantity_and_accurate_pnl() -> None:
             class StubLiveClient:
                 def __init__(self) -> None:
                     self._known_usdt: float | None = 35.18
+                    self._assets: dict[str, float] = {"BNB": 0.0005}
 
                 def get_known_usdt_balance(self) -> float | None:
                     return self._known_usdt
 
                 def update_known_usdt_balance(self, usdt_balance: float) -> None:
                     self._known_usdt = usdt_balance
+
+                def get_known_asset_balance(self, asset: str) -> float:
+                    return self._assets.get(asset.upper(), 0.0)
+
+                def adjust_known_asset_balance(self, asset: str, delta: float) -> None:
+                    key = asset.upper()
+                    self._assets[key] = max(0.0, self._assets.get(key, 0.0) + delta)
 
                 def is_cooldown_active(self) -> bool:
                     return False

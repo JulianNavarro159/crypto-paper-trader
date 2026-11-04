@@ -80,6 +80,20 @@ class BinanceSpotAuthenticatedClient:
         """Update the tracked live USDT balance after an order fill."""
         self._last_known_usdt_balance = max(0.0, round(usdt_balance, 6))
 
+    def get_known_asset_balance(self, asset: str) -> float:
+        """Return the last known free balance for an asset without a REST call."""
+        entry = self._balance_cache.get(asset.upper())
+        return entry[1] if entry is not None else 0.0
+
+    def adjust_known_asset_balance(self, asset: str, delta: float) -> None:
+        """Adjust the tracked free balance for an asset after an order fill."""
+        upper = asset.upper()
+        current = self.get_known_asset_balance(upper)
+        self._balance_cache[upper] = (
+            time.time(),
+            max(0.0, round(current + delta, 8)),
+        )
+
     @classmethod
     def from_env(cls, config: ExchangeConfig) -> BinanceSpotAuthenticatedClient:
         """Instantiate an authenticated Binance client using environment variables.
@@ -543,7 +557,6 @@ class BinanceSpotAuthenticatedClient:
             "newClientOrderId": client_order_id[:36],
         }
         res = self._request_with_failover("POST", "/api/v3/order", params)
-        self._balance_cache.clear()
         return res
 
     def place_market_sell_by_quantity(
@@ -574,15 +587,14 @@ class BinanceSpotAuthenticatedClient:
         }
         try:
             res = self._request_with_failover("POST", "/api/v3/order", params)
-            self._balance_cache.clear()
             return res
         except LiveExchangeExecutionError as exc:
             if upper_sym.endswith("USDT") and "400" in str(exc):
                 base_asset = upper_sym[:-4]
+                self._balance_cache.pop(base_asset, None)
                 available_base = self.fetch_available_asset_balance(base_asset)
                 if 0.0 < available_base < quantity:
                     params["quantity"] = quantize_step_size(available_base, step_size)
                     res = self._request_with_failover("POST", "/api/v3/order", params)
-                    self._balance_cache.clear()
                     return res
             raise
