@@ -228,100 +228,88 @@ class BinanceSpotAuthenticatedClient:
         """
         now_ts = time.time()
         if now_ts < BinanceSpotAuthenticatedClient._ip_cooldown_until:
-            wait_rem = int(
-                BinanceSpotAuthenticatedClient._ip_cooldown_until - now_ts
-            )
+            wait_rem = int(BinanceSpotAuthenticatedClient._ip_cooldown_until - now_ts)
             raise LiveExchangeExecutionError(
                 f"Binance IP 418 cooldown active; skipping request for {wait_rem}s"
             )
 
         urls = [
-            self._config.rest_base_url,
-            "https://api1.binance.com",
-            "https://api2.binance.com",
-            "https://api3.binance.com",
-            "https://api4.binance.com",
             "https://api-gcp.binance.com",
+            "https://api4.binance.com",
+            "https://api3.binance.com",
+            "https://api2.binance.com",
+            "https://api1.binance.com",
+            self._config.rest_base_url,
         ]
         last_error: Exception | None = None
-        max_cycles = 1
-        for cycle in range(max_cycles):
-            for base_url in urls:
-                endpoint = f"{base_url.rstrip('/')}{path}"
-                signed = self._sign_params(params)
-                headers = dict(self._headers())
-                headers["User-Agent"] = "CryptoPaperTrader/1.0"
-                try:
-                    with httpx.Client(timeout=self._timeout_seconds) as client:
-                        if method.upper() == "GET":
-                            response = client.get(
-                                endpoint, params=signed, headers=headers
-                            )
-                        else:
-                            response = client.post(
-                                endpoint, params=signed, headers=headers
-                            )
-                        if response.status_code == 418:
-                            retry_hdr = response.headers.get(
-                                "Retry-After", "240"
-                            ).strip()
-                            cooldown_secs = (
-                                max(float(retry_hdr) + 15.0, 240.0)
-                                if retry_hdr.isdigit()
-                                else 240.0
-                            )
-                            BinanceSpotAuthenticatedClient._ip_cooldown_until = (
-                                time.time() + cooldown_secs
-                            )
+        is_order_post = method.upper() == "POST" and path == "/api/v3/order"
+        for idx, base_url in enumerate(urls):
+            endpoint = f"{base_url.rstrip('/')}{path}"
+            signed = self._sign_params(params)
+            headers = dict(self._headers())
+            headers["User-Agent"] = "CryptoPaperTrader/1.0"
+            try:
+                with httpx.Client(timeout=self._timeout_seconds) as client:
+                    if method.upper() == "GET":
+                        response = client.get(endpoint, params=signed, headers=headers)
+                    else:
+                        response = client.post(endpoint, params=signed, headers=headers)
+                    if response.status_code == 418:
+                        if is_order_post and idx == 0:
                             logger.warning(
-                                "Binance IP ban 418 on %s (Retry-After=%s); "
-                                "initiating %.0fs quiet cooldown...",
+                                "Binance 418 on %s during order POST; "
+                                "trying backup cluster %s once...",
                                 base_url,
-                                retry_hdr,
-                                cooldown_secs,
+                                urls[1],
                             )
-                            raise LiveExchangeExecutionError(
-                                f"Binance IP ban 418 encountered; "
-                                f"cooldown for {int(cooldown_secs)}s"
-                            )
-                        if response.status_code == 429:
-                            last_error = httpx.HTTPStatusError(
-                                f"Rate limited: HTTP {response.status_code}",
-                                request=response.request,
-                                response=response,
-                            )
-                            logger.warning(
-                                "Binance rate limit 429 on %s; "
-                                "trying fallback cluster...",
-                                base_url,
-                            )
-                            time.sleep(2.0)
                             continue
-                        response.raise_for_status()
-                        data = response.json()
-                        if isinstance(data, dict):
-                            return data
-                        if isinstance(data, list):
-                            return {"result": data}
-                except httpx.HTTPError as exc:
-                    last_error = exc
-                    logger.warning(
-                        "Authenticated request failed on %s (%s); retrying...",
-                        base_url,
-                        exc,
-                    )
-                    time.sleep(0.5)
-
-            if cycle < max_cycles - 1:
-                backoff_seconds = (cycle + 1) * 5.0
-                logger.info(
-                    "All Binance clusters busy for %s; waiting %.1fs before "
-                    "cycle %d...",
-                    path,
-                    backoff_seconds,
-                    cycle + 2,
+                        retry_hdr = response.headers.get("Retry-After", "240").strip()
+                        cooldown_secs = (
+                            max(float(retry_hdr) + 15.0, 240.0)
+                            if retry_hdr.isdigit()
+                            else 240.0
+                        )
+                        BinanceSpotAuthenticatedClient._ip_cooldown_until = (
+                            time.time() + cooldown_secs
+                        )
+                        logger.warning(
+                            "Binance IP ban 418 on %s (Retry-After=%s); "
+                            "initiating %.0fs quiet cooldown...",
+                            base_url,
+                            retry_hdr,
+                            cooldown_secs,
+                        )
+                        raise LiveExchangeExecutionError(
+                            f"Binance IP ban 418 encountered; "
+                            f"cooldown for {int(cooldown_secs)}s"
+                        )
+                    if response.status_code == 429:
+                        last_error = httpx.HTTPStatusError(
+                            f"Rate limited: HTTP {response.status_code}",
+                            request=response.request,
+                            response=response,
+                        )
+                        logger.warning(
+                            "Binance rate limit 429 on %s; "
+                            "trying fallback cluster...",
+                            base_url,
+                        )
+                        time.sleep(2.0)
+                        continue
+                    response.raise_for_status()
+                    data = response.json()
+                    if isinstance(data, dict):
+                        return data
+                    if isinstance(data, list):
+                        return {"result": data}
+            except httpx.HTTPError as exc:
+                last_error = exc
+                logger.warning(
+                    "Authenticated request failed on %s (%s); retrying...",
+                    base_url,
+                    exc,
                 )
-                time.sleep(backoff_seconds)
+                time.sleep(0.5)
 
         raise LiveExchangeExecutionError(
             f"All Binance authenticated clusters failed for {path}: {last_error}"
@@ -409,13 +397,17 @@ class BinanceSpotAuthenticatedClient:
                 continue
 
             if isinstance(trades, list) and trades:
-                last_buy = next(
-                    (t for t in reversed(trades) if t.get("isBuyer")),
-                    trades[-1],
+                last_trade = trades[-1]
+                if not last_trade.get("isBuyer"):
+                    continue
+                entry_price = float(last_trade.get("price", 0.0))
+                last_buy_qty = float(last_trade.get("qty", qty))
+                step_size = self.fetch_symbol_step_size(upper_sym)
+                tradeable_qty = float(
+                    quantize_step_size(min(qty, last_buy_qty), step_size)
                 )
-                entry_price = float(last_buy.get("price", 0.0))
-                if entry_price > 0.0 and (qty * entry_price) >= 5.0:
-                    return (upper_sym, qty, entry_price)
+                if entry_price > 0.0 and (tradeable_qty * entry_price) >= 12.0:
+                    return (upper_sym, tradeable_qty, entry_price)
         return None
 
     def fetch_symbol_step_size(self, symbol: str) -> str:
@@ -481,21 +473,15 @@ class BinanceSpotAuthenticatedClient:
                     raw_msg = ws_conn.recv(timeout=self._timeout_seconds)
                     decoded = json.loads(raw_msg)
                     if decoded.get("status") == 200:
-                        for sym_info in decoded.get("result", {}).get(
-                            "symbols", []
-                        ):
+                        for sym_info in decoded.get("result", {}).get("symbols", []):
                             if sym_info.get("symbol") == upper_sym:
                                 for flt in sym_info.get("filters", []):
                                     if flt.get("filterType") == "LOT_SIZE":
-                                        step = str(
-                                            flt.get("stepSize", "0.00000100")
-                                        )
+                                        step = str(flt.get("stepSize", "0.00000100"))
                                         self._step_size_cache[upper_sym] = step
                                         return step
             except Exception as exc:
-                logger.debug(
-                    "WebSocket exchangeInfo failed on %s: %s", ws_url, exc
-                )
+                logger.debug("WebSocket exchangeInfo failed on %s: %s", ws_url, exc)
 
         return "0.00000100"
 
@@ -543,18 +529,8 @@ class BinanceSpotAuthenticatedClient:
             Raw JSON execution response from Binance Spot API.
         """
         upper_sym = symbol.upper()
-        effective_qty = quantity
-        if upper_sym.endswith("USDT"):
-            base_asset = upper_sym[:-4]
-            try:
-                available_base = self.fetch_available_asset_balance(base_asset)
-                if 0.0 < available_base < effective_qty:
-                    effective_qty = available_base
-            except LiveExchangeExecutionError:
-                pass
-
         step_size = self.fetch_symbol_step_size(upper_sym)
-        formatted_qty = quantize_step_size(effective_qty, step_size)
+        formatted_qty = quantize_step_size(quantity, step_size)
         params = {
             "symbol": upper_sym,
             "side": "SELL",
@@ -562,6 +538,17 @@ class BinanceSpotAuthenticatedClient:
             "quantity": formatted_qty,
             "newClientOrderId": client_order_id[:36],
         }
-        res = self._request_with_failover("POST", "/api/v3/order", params)
-        self._balance_cache.clear()
-        return res
+        try:
+            res = self._request_with_failover("POST", "/api/v3/order", params)
+            self._balance_cache.clear()
+            return res
+        except LiveExchangeExecutionError as exc:
+            if upper_sym.endswith("USDT") and "400" in str(exc):
+                base_asset = upper_sym[:-4]
+                available_base = self.fetch_available_asset_balance(base_asset)
+                if 0.0 < available_base < quantity:
+                    params["quantity"] = quantize_step_size(available_base, step_size)
+                    res = self._request_with_failover("POST", "/api/v3/order", params)
+                    self._balance_cache.clear()
+                    return res
+            raise

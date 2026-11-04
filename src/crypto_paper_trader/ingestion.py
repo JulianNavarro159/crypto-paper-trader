@@ -200,9 +200,7 @@ class BinanceMarketDataClient:
 
         now_ts = time.time()
         if now_ts < BinanceMarketDataClient._market_cooldown_until:
-            wait_rem = int(
-                BinanceMarketDataClient._market_cooldown_until - now_ts
-            )
+            wait_rem = int(BinanceMarketDataClient._market_cooldown_until - now_ts)
             raise MarketDataIngestionError(
                 f"Binance market data IP 418 cooldown active; skipping for {wait_rem}s"
             )

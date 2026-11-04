@@ -6,8 +6,9 @@ import logging
 import os
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 import httpx
 from dotenv import load_dotenv
@@ -25,8 +26,10 @@ from crypto_paper_trader.domain import (
     Candle,
     MacroMarketRegime,
     OrderSide,
+    Position,
 )
 from crypto_paper_trader.execution import LedgerRepository
+from crypto_paper_trader.formatting import format_price, format_quantity
 from crypto_paper_trader.ingestion import BinanceMarketDataClient
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
 from crypto_paper_trader.notifications import (
@@ -268,6 +271,7 @@ async def start_periodic_health_heartbeat(
     notifier: NotificationService,
     config: TradingSystemConfig,
     live_client: BinanceSpotAuthenticatedClient | None,
+    get_active_symbol: Callable[[], str] | None = None,
 ) -> None:
     """Send periodic health confirmation alerts to ntfy every two hours.
 
@@ -275,6 +279,7 @@ async def start_periodic_health_heartbeat(
         notifier: Notification service configured for mobile push.
         config: System trading and ledger configuration.
         live_client: Optional authenticated Binance Spot client.
+        get_active_symbol: Optional callback returning the active symbol.
     """
     await asyncio.sleep(45.0)
     while True:
@@ -303,8 +308,17 @@ async def start_periodic_health_heartbeat(
                     config.capital.initial_capital_usdt + total_realized_pnl, 4
                 )
 
+            monitored_symbol = (
+                open_pos.symbol
+                if open_pos is not None
+                else (
+                    get_active_symbol()
+                    if get_active_symbol is not None
+                    else config.exchange.symbol
+                )
+            )
             heartbeat_msg = format_heartbeat_alert(
-                symbol=config.exchange.symbol,
+                symbol=monitored_symbol,
                 interval=config.exchange.interval,
                 open_position_symbol=open_pos.symbol if open_pos else None,
                 open_position_entry_price=open_pos.entry_price if open_pos else None,
@@ -348,9 +362,7 @@ async def run_application(args: argparse.Namespace) -> None:
         live_client = BinanceSpotAuthenticatedClient.from_env(config.exchange)
         usdt_balance = live_client.fetch_available_usdt_balance()
         cop_rate = config.capital.cop_per_usdt_rate
-        open_pos = LedgerRepository(
-            db_path=config.ledger_db_path
-        ).fetch_open_position()
+        open_pos = LedgerRepository(db_path=config.ledger_db_path).fetch_open_position()
         coin_qty = 0.0
         coin_usdt = 0.0
         base_coin = None
@@ -423,6 +435,34 @@ async def run_application(args: argparse.Namespace) -> None:
         if args.mode in ("realtime", "live")
         else None
     )
+    if existing_open_pos is None and live_client is not None:
+        holding = live_client.fetch_active_spot_holding(config.universe.all_symbols)
+        if holding is not None:
+            held_sym, held_qty, held_entry = holding
+            held_notional = round(held_qty * held_entry, 6)
+            reconciled_pos = Position(
+                position_id=f"reconciled-{held_sym.lower()}",
+                symbol=held_sym,
+                opened_at=datetime.now(tz=timezone.utc),
+                entry_price=held_entry,
+                quantity=held_qty,
+                notional_usdt=held_notional,
+                entry_fee_usdt=round(held_notional * config.exchange.taker_fee_rate, 6),
+                stop_loss_price=round(held_entry * 0.9940, 8),
+                take_profit_price=round(held_entry * 1.0075, 8),
+                peak_price=held_entry,
+            )
+            LedgerRepository(db_path=config.ledger_db_path).save_open_position(
+                reconciled_pos
+            )
+            existing_open_pos = reconciled_pos
+            logger.info(
+                "Reconciled active Binance Spot holding on startup | "
+                "symbol=%s qty=%s entry=%s",
+                held_sym,
+                format_quantity(held_qty),
+                format_price(held_entry),
+            )
 
     active_macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
     initial_universe_candles: dict[str, list[Candle]] = {}
@@ -490,6 +530,7 @@ async def run_application(args: argparse.Namespace) -> None:
             notifier=notifier,
             config=config,
             live_client=live_client,
+            get_active_symbol=lambda: config.exchange.symbol,
         )
     )
 

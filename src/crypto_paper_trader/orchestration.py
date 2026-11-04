@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from crypto_paper_trader.config import TradingSystemConfig
 from crypto_paper_trader.domain import (
     Candle,
+    ExitReason,
     MacroMarketRegime,
     MarketSignal,
     PortfolioSnapshot,
@@ -16,7 +17,7 @@ from crypto_paper_trader.formatting import format_price
 from crypto_paper_trader.ingestion import MarketDataProvider
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
 from crypto_paper_trader.notifications import NotificationService
-from crypto_paper_trader.strategy import evaluate_market_signal
+from crypto_paper_trader.strategy import evaluate_macro_regime, evaluate_market_signal
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ class RealTimeTradingOrchestrator:
         self._last_log_time: float = 0.0
         self._last_logged_signal: SignalType | None = None
         self._macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
+        self._cooldown_until_ts: float = 0.0
 
     def set_macro_regime(self, regime: MacroMarketRegime) -> None:
         """Update the active macro market regime classification.
@@ -95,8 +97,7 @@ class RealTimeTradingOrchestrator:
         """
         if len(self._candle_buffer) >= 30:
             return [
-                self._candle_buffer[key]
-                for key in sorted(self._candle_buffer.keys())
+                self._candle_buffer[key] for key in sorted(self._candle_buffer.keys())
             ]
 
         try:
@@ -133,10 +134,15 @@ class RealTimeTradingOrchestrator:
         """
         rolling_candles = self._upsert_candle(candle)
 
-        self._engine.evaluate_protective_exits(
+        protective_exit = self._engine.evaluate_protective_exits(
             current_price=candle.close_price,
             timestamp=candle.close_time,
         )
+        if (
+            protective_exit is not None
+            and protective_exit.reason == ExitReason.STOP_LOSS.value
+        ):
+            self._cooldown_until_ts = candle.close_time.timestamp() + 900.0
 
         min_required_rows = (
             max(
@@ -161,6 +167,10 @@ class RealTimeTradingOrchestrator:
                 slow_ema=candle.close_price,
             )
         else:
+            if self._config.exchange.symbol == "BTCUSDT":
+                self._macro_regime = evaluate_macro_regime(
+                    rolling_candles, self._config.strategy
+                )
             signal = evaluate_market_signal(
                 candles=rolling_candles,
                 symbol=self._config.exchange.symbol,
@@ -169,11 +179,20 @@ class RealTimeTradingOrchestrator:
 
         if (
             signal.signal_type == SignalType.BUY
+            and candle.close_time.timestamp() < self._cooldown_until_ts
+        ):
+            logger.info(
+                "Suppressed BUY signal on %s during post-stop-loss cooldown.",
+                signal.symbol,
+            )
+            signal = replace(signal, signal_type=SignalType.HOLD)
+
+        if (
+            signal.signal_type == SignalType.BUY
             and self._macro_regime == MacroMarketRegime.BEARISH
-            and self._config.exchange.symbol != "BTCUSDT"
         ):
             strat_cfg = self._config.strategy
-            is_oversold_dip = signal.rsi_value <= 45.0
+            is_oversold_dip = signal.rsi_value <= 35.0
             is_momentum_breakout = (
                 strat_cfg.enable_decoupled_momentum
                 and signal.rsi_value >= strat_cfg.decoupled_rsi_min
@@ -201,7 +220,8 @@ class RealTimeTradingOrchestrator:
                 )
                 signal = replace(signal, signal_type=SignalType.HOLD)
 
-        self._engine.process_signal(signal)
+        if protective_exit is None:
+            self._engine.process_signal(signal)
 
         snapshot = self._engine.capture_portfolio_snapshot(
             current_price=candle.close_price,

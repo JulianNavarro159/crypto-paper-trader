@@ -413,14 +413,13 @@ class PaperTradingEngine:
         self._available_cash_usdt = capital_config.initial_capital_usdt
         self._active_position: Position | None = self._ledger.fetch_open_position()
         if self._active_position is not None:
-            if self._live_client is None:
-                self._available_cash_usdt = round(
-                    max(
-                        0.0,
-                        self._available_cash_usdt - self._active_position.notional_usdt,
-                    ),
-                    6,
-                )
+            self._available_cash_usdt = round(
+                max(
+                    0.0,
+                    self._available_cash_usdt - self._active_position.notional_usdt,
+                ),
+                6,
+            )
             logger.info(
                 "Resumed open position from ledger | symbol=%s entry=%s "
                 "qty=%s sl=%s tp=%s",
@@ -478,7 +477,18 @@ class PaperTradingEngine:
 
         if gain_ratio >= 0.0035:
             breakeven_floor = round(pos.entry_price * 1.0020, 8)
-            trail_pct = 0.012 if pos.is_partially_closed else 0.008
+            trail_pct = 0.0035 if pos.is_partially_closed else 0.0015
+            trailing_distance = round(pos.entry_price * trail_pct, 8)
+            trailing_candidate = round(new_peak - trailing_distance, 8)
+            new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
+            if new_sl > pos.stop_loss_price or new_peak > pos.peak_price:
+                self._active_position = replace(
+                    pos, stop_loss_price=new_sl, peak_price=new_peak
+                )
+                self._ledger.save_open_position(self._active_position)
+        elif gain_ratio >= 0.0018:
+            breakeven_floor = round(pos.entry_price * 1.0015, 8)
+            trail_pct = 0.0006
             trailing_distance = round(pos.entry_price * trail_pct, 8)
             trailing_candidate = round(new_peak - trailing_distance, 8)
             new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
@@ -598,12 +608,12 @@ class PaperTradingEngine:
 
         remaining_quantity = round(pos.quantity - sell_quantity, 8)
         remaining_notional = round(pos.notional_usdt - closed_notional, 6)
-        breakeven_floor = round(pos.entry_price * 1.0020, 8)
+        breakeven_floor = round(pos.entry_price * 1.0025, 8)
         tp2_price = round(
             pos.entry_price * (1.0 + self._risk_config.tp2_take_profit_ratio), 8
         )
         new_peak = max(pos.peak_price, current_price)
-        trail_pct = 0.012
+        trail_pct = 0.0035
         trailing_distance = round(pos.entry_price * trail_pct, 8)
         trailing_candidate = round(new_peak - trailing_distance, 8)
         new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
@@ -743,7 +753,27 @@ class PaperTradingEngine:
             live_qty = float(live_res.get("executedQty", 0.0))
             live_quote = float(live_res.get("cummulativeQuoteQty", 0.0))
             if live_qty > 0.0 and live_quote > 0.0:
-                quantity = live_qty
+                fills = live_res.get("fills", [])
+                base_asset = (
+                    signal.symbol[:-4].upper()
+                    if signal.symbol.upper().endswith("USDT")
+                    else ""
+                )
+                base_commission = sum(
+                    float(fill.get("commission", 0.0))
+                    for fill in fills
+                    if isinstance(fill, dict)
+                    and str(fill.get("commissionAsset", "")).upper() == base_asset
+                )
+                if base_commission > 0.0:
+                    step_size = self._live_client.fetch_symbol_step_size(signal.symbol)
+                    quantity = float(
+                        quantize_step_size(
+                            max(0.0, live_qty - base_commission), step_size
+                        )
+                    )
+                else:
+                    quantity = live_qty
                 entry_price = live_quote / live_qty
                 proposed_notional_usdt = round(live_quote, 6)
                 price_delta = entry_price - signal.reference_price

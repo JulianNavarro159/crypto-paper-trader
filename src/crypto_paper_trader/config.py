@@ -134,12 +134,12 @@ class RiskConfig:
     """
 
     position_allocation_fraction: float = 0.90
-    min_net_profit_ratio: float = 0.0010
-    min_signal_exit_profit_ratio: float = 0.0025
+    min_net_profit_ratio: float = 0.0008
+    min_signal_exit_profit_ratio: float = 0.0015
     enable_partial_take_profit: bool = True
-    tp1_profit_ratio: float = 0.0065
+    tp1_profit_ratio: float = 0.0050
     tp1_close_fraction: float = 0.50
-    tp2_take_profit_ratio: float = 0.0150
+    tp2_take_profit_ratio: float = 0.0110
     trailing_atr_multiplier: float = 0.6
 
 

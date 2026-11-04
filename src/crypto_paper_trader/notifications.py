@@ -481,12 +481,8 @@ def format_rotation_alert(
     Returns:
         Clear explanation of why the monitored currency changed.
     """
-    clean_old = (
-        old_symbol[:-4] if old_symbol.upper().endswith("USDT") else old_symbol
-    )
-    clean_new = (
-        new_symbol[:-4] if new_symbol.upper().endswith("USDT") else new_symbol
-    )
+    clean_old = old_symbol[:-4] if old_symbol.upper().endswith("USDT") else old_symbol
+    clean_new = new_symbol[:-4] if new_symbol.upper().endswith("USDT") else new_symbol
     return (
         "CAMBIO AUTOMATICO DE MONEDA VIGILADA\n"
         f"El bot analizo el mercado y encontro que {clean_new} tiene una mejor "

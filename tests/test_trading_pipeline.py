@@ -768,9 +768,7 @@ def test_micro_candle_15m_scalping_and_profit_lock() -> None:
             assert engine.active_position is not None
 
             tick_time = datetime(2026, 11, 1, 12, 5, tzinfo=timezone.utc)
-            engine.evaluate_protective_exits(
-                current_price=10.0400, timestamp=tick_time
-            )
+            engine.evaluate_protective_exits(current_price=10.0400, timestamp=tick_time)
             pos = engine.active_position
             assert pos is not None
             assert pos.stop_loss_price >= 10.0200
@@ -921,3 +919,65 @@ def test_signal_generation_enforces_minimum_fee_protective_spread() -> None:
         exchange_config=exchange_cfg,
         risk_config=risk_cfg,
     )
+
+
+def test_btc_micro_profit_lock_and_post_stop_loss_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify micro-profit lock at +0.20% and 15m cooldown after stop loss."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_btc_lock.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            config = TradingSystemConfig(
+                exchange=ExchangeConfig(symbol="BTCUSDT"),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            base_time = datetime(2026, 11, 3, 20, 39, tzinfo=timezone.utc)
+            buy_signal = MarketSignal(
+                symbol="BTCUSDT",
+                evaluated_at=base_time,
+                signal_type=SignalType.BUY,
+                reference_price=77890.24,
+                stop_loss_price=77422.90,
+                take_profit_price=78474.42,
+                atr_value=160.0,
+                rsi_value=58.0,
+                fast_ema=77850.0,
+                slow_ema=77700.0,
+            )
+            buy_exec = engine.process_signal(buy_signal)
+            assert buy_exec is not None
+
+            engine.evaluate_protective_exits(
+                current_price=78049.66,
+                timestamp=base_time + timedelta(minutes=65),
+            )
+            pos = engine.active_position
+            assert pos is not None
+            assert pos.stop_loss_price >= 78007.0
+
+            sell_signal = MarketSignal(
+                symbol="BTCUSDT",
+                evaluated_at=base_time + timedelta(minutes=66),
+                signal_type=SignalType.SELL,
+                reference_price=78049.66,
+                stop_loss_price=77500.0,
+                take_profit_price=78600.0,
+                atr_value=150.0,
+                rsi_value=69.64,
+                fast_ema=77890.0,
+                slow_ema=77742.0,
+            )
+            exit_exec = engine.process_signal(sell_signal)
+            assert exit_exec is not None
+            assert exit_exec.reason == ExitReason.SIGNAL_REVERSAL.value
+            assert engine.active_position is None
+        finally:
+            ledger.close()

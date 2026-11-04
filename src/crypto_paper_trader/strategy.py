@@ -194,6 +194,11 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         & (prev_rsi <= 38.0)
         & (enriched["rsi"] > prev_rsi)
         & (enriched["close_price"] > enriched["open_price"])
+        & (enriched["close_price"] > enriched["close_price"].shift(1))
+        & (
+            (enriched["close_price"] - enriched["open_price"])
+            >= (enriched["atr"] * 0.12)
+        )
     )
 
     ema_recovery = (
@@ -211,8 +216,14 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         | micro_dip_rebound
         | ema_recovery
     )
-    sell_mask = (enriched["rsi"] >= config.rsi_overbought_exit) | (
-        enriched["high_price"] >= enriched["bb_upper"] * 0.998
+    sell_mask = (
+        (enriched["rsi"] >= config.rsi_overbought_exit)
+        | (enriched["high_price"] >= enriched["bb_upper"] * 0.998)
+        | (
+            (enriched["rsi"] >= 54.0)
+            & (enriched["rsi"] < prev_rsi)
+            & (enriched["close_price"] < enriched["open_price"])
+        )
     )
 
     signals = np.where(

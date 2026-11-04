@@ -129,11 +129,20 @@ def evaluate_universe_projection(
             (latest_signal.atr_value / latest_candle.close_price) * 100.0, 4
         )
         capped_pf = min(report.profit_factor, 4.0)
+        downtrend_penalty = (
+            15.0
+            if (
+                latest_signal.fast_ema < latest_signal.slow_ema
+                and latest_signal.rsi_value < 42.0
+            )
+            else 0.0
+        )
         composite = round(
             (report.net_return_pct * 2.5)
             + (capped_pf * 12.0)
             + (report.win_rate_pct * 0.20)
-            + (atr_pct * 6.0),
+            + (atr_pct * 6.0)
+            - downtrend_penalty,
             3,
         )
         category = "STABLE_CORE" if symbol in core_set else "HIGH_VOLATILITY"
