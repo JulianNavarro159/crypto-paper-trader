@@ -981,3 +981,103 @@ def test_btc_micro_profit_lock_and_post_stop_loss_cooldown(
             assert engine.active_position is None
         finally:
             ledger.close()
+
+
+def test_bnb_live_order_preserves_full_quantity_and_accurate_pnl() -> None:
+    """Verify BNBUSDT live buy preserves full executed quantity and positive PnL."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_bnb_live.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+
+            class StubLiveClient:
+                def __init__(self) -> None:
+                    self._known_usdt: float | None = 35.18
+
+                def get_known_usdt_balance(self) -> float | None:
+                    return self._known_usdt
+
+                def update_known_usdt_balance(self, usdt_balance: float) -> None:
+                    self._known_usdt = usdt_balance
+
+                def is_cooldown_active(self) -> bool:
+                    return False
+
+                def fetch_symbol_step_size(self, symbol: str) -> str:
+                    return "0.00100000"
+
+                def place_market_buy_by_quote(
+                    self, symbol: str, quote_amount_usdt: float, client_order_id: str
+                ) -> dict[str, object]:
+                    return {
+                        "executedQty": "0.04000000",
+                        "cummulativeQuoteQty": "27.95800000",
+                        "fills": [
+                            {
+                                "price": "698.95000000",
+                                "qty": "0.04000000",
+                                "commission": "0.00003000",
+                                "commissionAsset": "BNB",
+                            }
+                        ],
+                    }
+
+                def place_market_sell_by_quantity(
+                    self, symbol: str, quantity: float, client_order_id: str
+                ) -> dict[str, object]:
+                    return {
+                        "executedQty": f"{quantity:.8f}",
+                        "cummulativeQuoteQty": f"{quantity * 700.19:.8f}",
+                        "fills": [],
+                    }
+
+            config = TradingSystemConfig(
+                exchange=ExchangeConfig(symbol="BNBUSDT"),
+                ledger_db_path=db_path,
+            )
+            stub_client = StubLiveClient()
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+                live_client=stub_client,
+            )
+            assert engine.available_cash_usdt == 35.18
+
+            base_time = datetime(2026, 11, 4, 1, 10, tzinfo=timezone.utc)
+            buy_signal = MarketSignal(
+                symbol="BNBUSDT",
+                evaluated_at=base_time,
+                signal_type=SignalType.BUY,
+                reference_price=698.95,
+                stop_loss_price=694.75,
+                take_profit_price=704.19,
+                atr_value=1.50,
+                rsi_value=56.0,
+                fast_ema=698.90,
+                slow_ema=698.50,
+            )
+            buy_exec = engine.process_signal(buy_signal)
+            assert buy_exec is not None
+            assert engine.active_position is not None
+            assert engine.active_position.quantity == 0.040
+
+            sell_signal = MarketSignal(
+                symbol="BNBUSDT",
+                evaluated_at=base_time + timedelta(minutes=25),
+                signal_type=SignalType.SELL,
+                reference_price=700.19,
+                stop_loss_price=695.0,
+                take_profit_price=705.0,
+                atr_value=1.50,
+                rsi_value=62.5,
+                fast_ema=700.10,
+                slow_ema=699.50,
+            )
+            sell_exec = engine.process_signal(sell_signal)
+            assert sell_exec is not None
+            assert sell_exec.quantity == 0.040
+            assert sell_exec.realized_pnl_usdt > 0.0
+        finally:
+            ledger.close()

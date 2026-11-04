@@ -70,6 +70,15 @@ class BinanceSpotAuthenticatedClient:
         self._timeout_seconds = timeout_seconds
         self._step_size_cache: dict[str, str] = {}
         self._balance_cache: dict[str, tuple[float, float]] = {}
+        self._last_known_usdt_balance: float | None = None
+
+    def get_known_usdt_balance(self) -> float | None:
+        """Return the most recently observed or updated live USDT balance."""
+        return self._last_known_usdt_balance
+
+    def update_known_usdt_balance(self, usdt_balance: float) -> None:
+        """Update the tracked live USDT balance after an order fill."""
+        self._last_known_usdt_balance = max(0.0, round(usdt_balance, 6))
 
     @classmethod
     def from_env(cls, config: ExchangeConfig) -> BinanceSpotAuthenticatedClient:
@@ -227,7 +236,11 @@ class BinanceSpotAuthenticatedClient:
             LiveExchangeExecutionError: If all cluster endpoints fail.
         """
         now_ts = time.time()
-        if now_ts < BinanceSpotAuthenticatedClient._ip_cooldown_until:
+        is_order_post = method.upper() == "POST" and path == "/api/v3/order"
+        if (
+            not is_order_post
+            and now_ts < BinanceSpotAuthenticatedClient._ip_cooldown_until
+        ):
             wait_rem = int(BinanceSpotAuthenticatedClient._ip_cooldown_until - now_ts)
             raise LiveExchangeExecutionError(
                 f"Binance IP 418 cooldown active; skipping request for {wait_rem}s"
@@ -242,7 +255,6 @@ class BinanceSpotAuthenticatedClient:
             self._config.rest_base_url,
         ]
         last_error: Exception | None = None
-        is_order_post = method.upper() == "POST" and path == "/api/v3/order"
         for idx, base_url in enumerate(urls):
             endpoint = f"{base_url.rstrip('/')}{path}"
             signed = self._sign_params(params)
@@ -263,6 +275,9 @@ class BinanceSpotAuthenticatedClient:
                                 urls[1],
                             )
                             continue
+                        ws_fallback = self._request_via_ws_api(method, path, params)
+                        if ws_fallback is not None:
+                            return ws_fallback
                         retry_hdr = response.headers.get("Retry-After", "240").strip()
                         cooldown_secs = (
                             max(float(retry_hdr) + 15.0, 240.0)
@@ -339,6 +354,8 @@ class BinanceSpotAuthenticatedClient:
             cur_asset = str(asset_entry.get("asset", "")).upper()
             cur_free = float(asset_entry.get("free", 0.0))
             self._balance_cache[cur_asset] = (now, cur_free)
+            if cur_asset == "USDT":
+                self._last_known_usdt_balance = round(cur_free, 6)
             if cur_asset == upper_asset:
                 return cur_free
 
@@ -374,10 +391,15 @@ class BinanceSpotAuthenticatedClient:
         except LiveExchangeExecutionError:
             return None
 
+        now = time.time()
         balances_by_asset = {
             str(entry.get("asset", "")).upper(): float(entry.get("free", 0.0))
             for entry in payload.get("balances", [])
         }
+        for asset_code, free_val in balances_by_asset.items():
+            self._balance_cache[asset_code] = (now, free_val)
+        if "USDT" in balances_by_asset:
+            self._last_known_usdt_balance = round(balances_by_asset["USDT"], 6)
 
         for sym in universe_symbols:
             upper_sym = sym.upper()
@@ -401,11 +423,23 @@ class BinanceSpotAuthenticatedClient:
                 if not last_trade.get("isBuyer"):
                     continue
                 entry_price = float(last_trade.get("price", 0.0))
-                last_buy_qty = float(last_trade.get("qty", qty))
-                step_size = self.fetch_symbol_step_size(upper_sym)
-                tradeable_qty = float(
-                    quantize_step_size(min(qty, last_buy_qty), step_size)
+                last_order_id = last_trade.get("orderId")
+                last_buy_qty = sum(
+                    float(t.get("qty", 0.0))
+                    for t in trades
+                    if isinstance(t, dict)
+                    and t.get("isBuyer")
+                    and t.get("orderId") == last_order_id
                 )
+                if last_buy_qty <= 0.0:
+                    last_buy_qty = float(last_trade.get("qty", qty))
+                step_size = self.fetch_symbol_step_size(upper_sym)
+                raw_tradeable = (
+                    max(0.0, qty - 0.0008)
+                    if base_asset == "BNB"
+                    else min(qty, last_buy_qty)
+                )
+                tradeable_qty = float(quantize_step_size(raw_tradeable, step_size))
                 if entry_price > 0.0 and (tradeable_qty * entry_price) >= 12.0:
                     return (upper_sym, tradeable_qty, entry_price)
         return None

@@ -410,16 +410,43 @@ class PaperTradingEngine:
         self._ledger = ledger
         self._notifier = notifier if notifier is not None else NullNotificationService()
         self._live_client = live_client
-        self._available_cash_usdt = capital_config.initial_capital_usdt
+        past_execs = self._ledger.fetch_all_executions()
+        self._realized_pnl_usdt: float = round(
+            sum(
+                e.realized_pnl_usdt
+                for e in past_execs
+                if e.side == OrderSide.SELL
+            ),
+            6,
+        )
+        self._total_fees_paid_usdt: float = round(
+            sum(e.fee_usdt for e in past_execs), 6
+        )
+        self._total_trades: int = len(past_execs)
+        self._executed_order_ids: set[str] = {
+            e.client_order_id for e in past_execs
+        }
         self._active_position: Position | None = self._ledger.fetch_open_position()
-        if self._active_position is not None:
+        known_live_usdt = (
+            self._live_client.get_known_usdt_balance()
+            if self._live_client is not None
+            else None
+        )
+        if known_live_usdt is not None:
+            self._available_cash_usdt = known_live_usdt
+        else:
             self._available_cash_usdt = round(
-                max(
-                    0.0,
-                    self._available_cash_usdt - self._active_position.notional_usdt,
-                ),
-                6,
+                capital_config.initial_capital_usdt + self._realized_pnl_usdt, 6
             )
+            if self._active_position is not None:
+                self._available_cash_usdt = round(
+                    max(
+                        0.0,
+                        self._available_cash_usdt - self._active_position.notional_usdt,
+                    ),
+                    6,
+                )
+        if self._active_position is not None:
             logger.info(
                 "Resumed open position from ledger | symbol=%s entry=%s "
                 "qty=%s sl=%s tp=%s",
@@ -429,10 +456,6 @@ class PaperTradingEngine:
                 format_price(self._active_position.stop_loss_price),
                 format_price(self._active_position.take_profit_price),
             )
-        self._realized_pnl_usdt: float = 0.0
-        self._total_fees_paid_usdt: float = 0.0
-        self._total_trades: int = 0
-        self._executed_order_ids: set[str] = set()
 
     @property
     def available_cash_usdt(self) -> float:
@@ -599,6 +622,8 @@ class PaperTradingEngine:
         self._available_cash_usdt = round(
             self._available_cash_usdt + net_exit_proceeds_usdt, 6
         )
+        if self._live_client is not None:
+            self._live_client.update_known_usdt_balance(self._available_cash_usdt)
         self._realized_pnl_usdt = round(self._realized_pnl_usdt + realized_pnl_usdt, 6)
         self._total_fees_paid_usdt = round(
             self._total_fees_paid_usdt + exit_fee_usdt, 6
@@ -765,17 +790,18 @@ class PaperTradingEngine:
                     if isinstance(fill, dict)
                     and str(fill.get("commissionAsset", "")).upper() == base_asset
                 )
-                if base_commission > 0.0:
+                entry_price = live_quote / live_qty
+                if base_commission > 0.0 and base_asset != "BNB":
                     step_size = self._live_client.fetch_symbol_step_size(signal.symbol)
                     quantity = float(
                         quantize_step_size(
                             max(0.0, live_qty - base_commission), step_size
                         )
                     )
+                    proposed_notional_usdt = round(quantity * entry_price, 6)
                 else:
                     quantity = live_qty
-                entry_price = live_quote / live_qty
-                proposed_notional_usdt = round(live_quote, 6)
+                    proposed_notional_usdt = round(live_quote, 6)
                 price_delta = entry_price - signal.reference_price
                 stop_loss_price = round(signal.stop_loss_price + price_delta, 8)
                 take_profit_price = round(signal.take_profit_price + price_delta, 8)
@@ -785,6 +811,8 @@ class PaperTradingEngine:
         self._available_cash_usdt = round(
             self._available_cash_usdt - proposed_notional_usdt, 6
         )
+        if self._live_client is not None:
+            self._live_client.update_known_usdt_balance(self._available_cash_usdt)
         self._total_fees_paid_usdt = round(
             self._total_fees_paid_usdt + entry_fee_usdt, 6
         )
@@ -908,6 +936,8 @@ class PaperTradingEngine:
         self._available_cash_usdt = round(
             self._available_cash_usdt + net_exit_proceeds_usdt, 6
         )
+        if self._live_client is not None:
+            self._live_client.update_known_usdt_balance(self._available_cash_usdt)
         self._realized_pnl_usdt = round(self._realized_pnl_usdt + realized_pnl_usdt, 6)
         self._total_fees_paid_usdt = round(
             self._total_fees_paid_usdt + exit_fee_usdt, 6

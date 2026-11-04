@@ -302,11 +302,19 @@ async def start_periodic_health_heartbeat(
             win_rate = (
                 (winning_trades / closed_trades * 100.0) if closed_trades > 0 else 0.0
             )
-            usdt_balance = None
-            if open_pos is None:
+            known_usdt = (
+                live_client.get_known_usdt_balance()
+                if live_client is not None
+                else None
+            )
+            if known_usdt is not None:
+                usdt_balance = round(known_usdt, 4)
+            elif open_pos is None:
                 usdt_balance = round(
                     config.capital.initial_capital_usdt + total_realized_pnl, 4
                 )
+            else:
+                usdt_balance = None
 
             monitored_symbol = (
                 open_pos.symbol
