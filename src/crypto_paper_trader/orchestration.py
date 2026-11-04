@@ -17,6 +17,7 @@ from crypto_paper_trader.formatting import format_price
 from crypto_paper_trader.ingestion import MarketDataProvider
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
 from crypto_paper_trader.notifications import NotificationService
+from crypto_paper_trader.simulation import run_time_machine_simulation
 from crypto_paper_trader.strategy import evaluate_macro_regime, evaluate_market_signal
 
 logger = logging.getLogger(__name__)
@@ -220,8 +221,54 @@ class RealTimeTradingOrchestrator:
                 )
                 signal = replace(signal, signal_type=SignalType.HOLD)
 
+        tm_win_prob: float | None = None
+        tm_alloc: float | None = None
+        if (
+            protective_exit is None
+            and self._engine.active_position is None
+            and signal.signal_type == SignalType.BUY
+            and self._config.risk.enable_time_machine_gate
+        ):
+            tm_report = run_time_machine_simulation(
+                candles=rolling_candles,
+                signal=signal,
+                risk_config=self._config.risk,
+                exchange_config=self._config.exchange,
+                replays_count=self._config.risk.time_machine_replays,
+                min_win_probability_pct=self._config.risk.time_machine_min_win_prob_pct,
+            )
+            if not tm_report.approved:
+                logger.info(
+                    "Suppressed BUY signal on %s by Time Machine (%d replays): "
+                    "win_prob=%.1f%% stop_prob=%.1f%% expected_net=%.3f%%.",
+                    signal.symbol,
+                    tm_report.replays_count,
+                    tm_report.win_probability_pct,
+                    tm_report.stop_hit_probability_pct,
+                    tm_report.expected_net_return_pct,
+                )
+                signal = replace(signal, signal_type=SignalType.HOLD)
+            else:
+                tm_win_prob = tm_report.win_probability_pct
+                tm_alloc = tm_report.recommended_allocation_fraction
+                logger.info(
+                    "Time Machine (%d replays) approved BUY on %s | "
+                    "win_prob=%.1f%% target_prob=%.1f%% expected_net=+%.3f%% "
+                    "alloc=%.0f%%",
+                    tm_report.replays_count,
+                    signal.symbol,
+                    tm_report.win_probability_pct,
+                    tm_report.target_hit_probability_pct,
+                    tm_report.expected_net_return_pct,
+                    tm_alloc * 100.0,
+                )
+
         if protective_exit is None:
-            self._engine.process_signal(signal)
+            self._engine.process_signal(
+                signal=signal,
+                win_probability_pct=tm_win_prob,
+                allocation_fraction=tm_alloc,
+            )
 
         snapshot = self._engine.capture_portfolio_snapshot(
             current_price=candle.close_price,

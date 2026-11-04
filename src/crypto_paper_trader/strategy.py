@@ -209,12 +209,32 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         & (enriched["rsi"] <= 58.0)
     )
 
+    rolling_range_high = (
+        enriched["high_price"].shift(1).rolling(window=6, min_periods=3).max()
+    )
+    rolling_range_low = (
+        enriched["low_price"].shift(1).rolling(window=6, min_periods=3).min()
+    )
+    range_compression = (rolling_range_high - rolling_range_low) <= (
+        enriched["atr"] * 3.2
+    )
+    opening_range_breakout = (
+        range_compression
+        & (enriched["close_price"] > rolling_range_high)
+        & (enriched["close_price"] > enriched["open_price"])
+        & (enriched["fast_ema"] >= enriched["slow_ema"])
+        & (enriched["volume"] >= (enriched["vol_sma"] * 0.95))
+        & (enriched["rsi"] >= 46.0)
+        & (enriched["rsi"] <= 61.0)
+    )
+
     buy_mask = (
         climax_dip_rebound
         | uptrend_pullback
         | trend_momentum_breakout
         | micro_dip_rebound
         | ema_recovery
+        | opening_range_breakout
     )
     sell_mask = (
         (enriched["rsi"] >= config.rsi_overbought_exit)

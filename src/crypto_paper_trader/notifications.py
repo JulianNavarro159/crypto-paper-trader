@@ -221,6 +221,7 @@ def format_execution_alert(
     is_live_order: bool = False,
     stop_loss_price: float | None = None,
     take_profit_price: float | None = None,
+    win_probability_pct: float | None = None,
 ) -> str:
     """Format a TradeExecution into a friendly Spanish mobile notification.
 
@@ -231,6 +232,7 @@ def format_execution_alert(
         is_live_order: True if executed on real Binance Spot account, False for paper.
         stop_loss_price: Optional protective stop loss price for BUY alerts.
         take_profit_price: Optional target take profit price for BUY alerts.
+        win_probability_pct: Optional 10,000-replay Time Machine win probability.
 
     Returns:
         Multi-line plain Spanish summary of trade details and portfolio balances.
@@ -252,10 +254,17 @@ def format_execution_alert(
         if take_profit_price is not None and stop_loss_price is not None:
             tp_str = format_price(take_profit_price)
             sl_str = format_price(stop_loss_price)
+            tm_line = (
+                f"\nSimulacion Maquina del Tiempo (10,000 escenarios): "
+                f"{win_probability_pct:.1f}% de probabilidad de ganancia"
+                if win_probability_pct is not None
+                else ""
+            )
             targets_block = (
                 f"\n--- PLAN DE ESTA OPERACION ---\n"
                 f"Meta de ganancia: Vender al llegar a {tp_str} USDT\n"
                 f"Piso de seguridad: Vender a {sl_str} USDT para cuidar tu dinero"
+                f"{tm_line}"
             )
         return (
             f"[{mode_label}] COMPRA DE {base_asset} REALIZADA CON EXITO\n"

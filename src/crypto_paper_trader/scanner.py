@@ -23,6 +23,7 @@ from crypto_paper_trader.domain import (
 )
 from crypto_paper_trader.execution import LedgerRepository, PaperTradingEngine
 from crypto_paper_trader.ingestion import BinanceMarketDataClient
+from crypto_paper_trader.simulation import run_time_machine_simulation
 
 logger = logging.getLogger(__name__)
 
@@ -137,11 +138,21 @@ def evaluate_universe_projection(
             )
             else 0.0
         )
+        tm_report = run_time_machine_simulation(
+            candles=candles,
+            signal=latest_signal,
+            risk_config=config.risk,
+            exchange_config=config.exchange,
+            replays_count=2_500,
+            min_win_probability_pct=config.risk.time_machine_min_win_prob_pct,
+        )
+        tm_bonus = round((tm_report.win_probability_pct - 50.0) * 0.15, 3)
         composite = round(
             (report.net_return_pct * 2.5)
             + (capped_pf * 12.0)
             + (report.win_rate_pct * 0.20)
             + (atr_pct * 6.0)
+            + tm_bonus
             - downtrend_penalty,
             3,
         )

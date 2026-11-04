@@ -689,11 +689,18 @@ class PaperTradingEngine:
         )
         return execution
 
-    def process_signal(self, signal: MarketSignal) -> TradeExecution | None:
+    def process_signal(
+        self,
+        signal: MarketSignal,
+        win_probability_pct: float | None = None,
+        allocation_fraction: float | None = None,
+    ) -> TradeExecution | None:
         """Process a strategy MarketSignal and execute paper orders if valid.
 
         Args:
             signal: Evaluated MarketSignal from the technical strategy layer.
+            win_probability_pct: Optional 10,000-replay Time Machine win probability.
+            allocation_fraction: Optional dynamic budget allocation fraction.
 
         Returns:
             TradeExecution if an entry or exit order was filled, otherwise None.
@@ -711,15 +718,26 @@ class PaperTradingEngine:
             return None
 
         if self._active_position is None and signal.signal_type == SignalType.BUY:
-            return self._open_new_position(signal)
+            return self._open_new_position(
+                signal=signal,
+                win_probability_pct=win_probability_pct,
+                allocation_fraction=allocation_fraction,
+            )
 
         return None
 
-    def _open_new_position(self, signal: MarketSignal) -> TradeExecution | None:
+    def _open_new_position(
+        self,
+        signal: MarketSignal,
+        win_probability_pct: float | None = None,
+        allocation_fraction: float | None = None,
+    ) -> TradeExecution | None:
         """Validate and execute a simulated BUY entry order.
 
         Args:
             signal: BUY MarketSignal with entry, stop loss, and take profit prices.
+            win_probability_pct: Optional 10,000-replay Time Machine win probability.
+            allocation_fraction: Optional dynamic budget allocation fraction.
 
         Returns:
             TradeExecution if the order passed validation and filled, else None.
@@ -733,8 +751,13 @@ class PaperTradingEngine:
         if client_order_id in self._executed_order_ids:
             return None
 
+        effective_alloc = (
+            allocation_fraction
+            if allocation_fraction is not None and allocation_fraction > 0.0
+            else self._risk_config.position_allocation_fraction
+        )
         proposed_notional_usdt = round(
-            self._available_cash_usdt * self._risk_config.position_allocation_fraction,
+            self._available_cash_usdt * effective_alloc,
             4,
         )
 
@@ -883,6 +906,7 @@ class PaperTradingEngine:
                 is_live_order=self._live_client is not None,
                 stop_loss_price=stop_loss_price,
                 take_profit_price=take_profit_price,
+                win_probability_pct=win_probability_pct,
             )
         )
         return execution

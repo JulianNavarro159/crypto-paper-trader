@@ -1089,3 +1089,131 @@ def test_bnb_live_order_preserves_full_quantity_and_accurate_pnl() -> None:
             assert sell_exec.realized_pnl_usdt > 0.0
         finally:
             ledger.close()
+
+
+def test_time_machine_10000_replays_approves_high_edge_and_blocks_negative_edge() -> (
+    None
+):
+    """Verify 10,000-replay Time Machine approves bullish edge and blocks bad setups."""
+    from crypto_paper_trader.simulation import run_time_machine_simulation
+
+    candles = build_synthetic_candles(count=60, start_price=100.0, step=0.20)
+    risk_cfg = RiskConfig()
+    exchange_cfg = ExchangeConfig(symbol="SOLUSDT")
+    now = datetime(2026, 11, 4, 14, 0, tzinfo=timezone.utc)
+
+    strong_signal = MarketSignal(
+        symbol="SOLUSDT",
+        evaluated_at=now,
+        signal_type=SignalType.BUY,
+        reference_price=112.0,
+        stop_loss_price=111.1,
+        take_profit_price=113.2,
+        atr_value=0.6,
+        rsi_value=54.0,
+        fast_ema=112.1,
+        slow_ema=111.4,
+    )
+    approved_report = run_time_machine_simulation(
+        candles=candles,
+        signal=strong_signal,
+        risk_config=risk_cfg,
+        exchange_config=exchange_cfg,
+        replays_count=10_000,
+    )
+    assert approved_report.replays_count == 10_000
+    assert approved_report.approved is True
+    assert approved_report.win_probability_pct >= 55.0
+    assert approved_report.expected_net_return_pct > 0.0
+    assert approved_report.recommended_allocation_fraction >= 0.70
+
+    weak_signal = MarketSignal(
+        symbol="SOLUSDT",
+        evaluated_at=now,
+        signal_type=SignalType.BUY,
+        reference_price=112.0,
+        stop_loss_price=111.8,
+        take_profit_price=114.5,
+        atr_value=0.8,
+        rsi_value=69.5,
+        fast_ema=111.0,
+        slow_ema=112.2,
+    )
+    rejected_report = run_time_machine_simulation(
+        candles=candles,
+        signal=weak_signal,
+        risk_config=risk_cfg,
+        exchange_config=exchange_cfg,
+        replays_count=10_000,
+    )
+    assert rejected_report.approved is False
+    assert rejected_report.recommended_allocation_fraction == 0.0
+
+    exec_record = TradeExecution(
+        client_order_id="test-tm-alert",
+        position_id="pos-tm-1",
+        symbol="SOLUSDT",
+        side=OrderSide.BUY,
+        executed_at=now,
+        execution_price=112.0,
+        quantity=0.25,
+        gross_notional_usdt=28.0,
+        fee_usdt=0.028,
+        realized_pnl_usdt=0.0,
+        reason="SIGNAL_ENTRY",
+    )
+    alert_text = format_execution_alert(
+        execution=exec_record,
+        available_cash_usdt=7.28,
+        cop_per_usdt_rate=3200.0,
+        is_live_order=True,
+        stop_loss_price=111.1,
+        take_profit_price=113.2,
+        win_probability_pct=approved_report.win_probability_pct,
+    )
+    assert "Simulacion Maquina del Tiempo (10,000 escenarios):" in alert_text
+
+
+def test_opening_range_breakout_entry_timer_triggers_on_box_breakout() -> None:
+    """Verify Opening-Range Breakout Entry Timer detects compressed box breakouts."""
+    base_time = datetime(2026, 11, 4, 10, 0, tzinfo=timezone.utc)
+    candles: list[Candle] = []
+    for idx in range(30):
+        open_t = base_time + timedelta(minutes=idx * 15)
+        close_t = open_t + timedelta(minutes=14, seconds=59)
+        offset = 0.04 if idx % 2 == 0 else -0.03
+        price = 100.0 + offset
+        candles.append(
+            Candle(
+                symbol="BTCUSDT",
+                open_time=open_t,
+                close_time=close_t,
+                open_price=round(price - 0.01, 4),
+                high_price=round(price + 0.08, 4),
+                low_price=round(price - 0.08, 4),
+                close_price=round(price, 4),
+                volume=100.0,
+                is_closed=True,
+            )
+        )
+    breakout_open_t = base_time + timedelta(minutes=30 * 15)
+    breakout_close_t = breakout_open_t + timedelta(minutes=14, seconds=59)
+    candles.append(
+        Candle(
+            symbol="BTCUSDT",
+            open_time=breakout_open_t,
+            close_time=breakout_close_t,
+            open_price=100.02,
+            high_price=100.19,
+            low_price=100.00,
+            close_price=100.16,
+            volume=135.0,
+            is_closed=True,
+        )
+    )
+    signal = evaluate_market_signal(
+        candles=candles,
+        symbol="BTCUSDT",
+        config=StrategyConfig(),
+    )
+    assert signal.signal_type == SignalType.BUY

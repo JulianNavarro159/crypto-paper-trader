@@ -141,6 +141,9 @@ class RiskConfig:
     tp1_close_fraction: float = 0.50
     tp2_take_profit_ratio: float = 0.0110
     trailing_atr_multiplier: float = 0.6
+    enable_time_machine_gate: bool = True
+    time_machine_replays: int = 10_000
+    time_machine_min_win_prob_pct: float = 55.0
 
 
 @dataclass(frozen=True)
