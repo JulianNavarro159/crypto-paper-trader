@@ -499,10 +499,10 @@ class PaperTradingEngine:
                 return partial_exec
 
         if gain_ratio >= 0.0035:
-            breakeven_floor = round(pos.entry_price * 1.0020, 8)
+            breakeven_floor = round(pos.entry_price * 1.0020, 10)
             trail_pct = 0.0035 if pos.is_partially_closed else 0.0015
-            trailing_distance = round(pos.entry_price * trail_pct, 8)
-            trailing_candidate = round(new_peak - trailing_distance, 8)
+            trailing_distance = round(pos.entry_price * trail_pct, 10)
+            trailing_candidate = round(new_peak - trailing_distance, 10)
             new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
             if new_sl > pos.stop_loss_price or new_peak > pos.peak_price:
                 self._active_position = replace(
@@ -510,10 +510,10 @@ class PaperTradingEngine:
                 )
                 self._ledger.save_open_position(self._active_position)
         elif gain_ratio >= 0.0018:
-            breakeven_floor = round(pos.entry_price * 1.0015, 8)
+            breakeven_floor = round(pos.entry_price * 1.0015, 10)
             trail_pct = 0.0006
-            trailing_distance = round(pos.entry_price * trail_pct, 8)
-            trailing_candidate = round(new_peak - trailing_distance, 8)
+            trailing_distance = round(pos.entry_price * trail_pct, 10)
+            trailing_candidate = round(new_peak - trailing_distance, 10)
             new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
             if new_sl > pos.stop_loss_price or new_peak > pos.peak_price:
                 self._active_position = replace(

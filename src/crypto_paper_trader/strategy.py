@@ -282,8 +282,8 @@ def build_market_signal_from_row(
         effective_atr * config.atr_take_profit_multiplier,
         reference_price * 0.0075,
     )
-    stop_loss_price = round(reference_price - stop_loss_dist, 8)
-    take_profit_price = round(reference_price + take_profit_dist, 8)
+    stop_loss_price = round(reference_price - stop_loss_dist, 10)
+    take_profit_price = round(reference_price + take_profit_dist, 10)
 
     close_time = row["close_time"]
     evaluated_at = (
@@ -299,10 +299,10 @@ def build_market_signal_from_row(
         reference_price=reference_price,
         stop_loss_price=stop_loss_price,
         take_profit_price=take_profit_price,
-        atr_value=round(effective_atr, 6),
+        atr_value=round(effective_atr, 10),
         rsi_value=round(float(row["rsi"]), 4),
-        fast_ema=round(float(row["fast_ema"]), 6),
-        slow_ema=round(float(row["slow_ema"]), 6),
+        fast_ema=round(float(row["fast_ema"]), 10),
+        slow_ema=round(float(row["slow_ema"]), 10),
     )
 
 

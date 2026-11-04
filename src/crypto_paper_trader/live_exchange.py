@@ -183,10 +183,7 @@ class BinanceSpotAuthenticatedClient:
             Decoded response dictionary if successful, otherwise None.
         """
         ws_method_map: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {
-            ("GET", "/api/v3/account"): (
-                "account.status",
-                {"omitZeroBalances": True},
-            ),
+            ("GET", "/api/v3/account"): ("account.status", {}),
             ("GET", "/api/v3/myTrades"): ("myTrades", {}),
             ("POST", "/api/v3/order"): ("order.place", {}),
         }
@@ -251,6 +248,10 @@ class BinanceSpotAuthenticatedClient:
         """
         now_ts = time.time()
         is_order_post = method.upper() == "POST" and path == "/api/v3/order"
+        if method.upper() == "GET":
+            ws_first = self._request_via_ws_api(method, path, params)
+            if ws_first is not None:
+                return ws_first
         if (
             not is_order_post
             and now_ts < BinanceSpotAuthenticatedClient._ip_cooldown_until
