@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, replace
 
 from crypto_paper_trader.config import TradingSystemConfig
@@ -273,14 +274,14 @@ class RealTimeTradingOrchestrator:
             timestamp=candle.close_time,
         )
 
-        now_ts = candle.close_time.timestamp()
+        wall_now = time.time()
         should_log = (
-            (now_ts - self._last_log_time >= 45.0)
+            (wall_now - self._last_log_time >= 45.0)
             or (signal.signal_type != self._last_logged_signal)
             or (candle.is_closed)
         )
         if should_log:
-            self._last_log_time = now_ts
+            self._last_log_time = wall_now
             self._last_logged_signal = signal.signal_type
             logger.info(
                 "Tick processed | symbol=%s price=%s signal=%s rsi=%.2f "

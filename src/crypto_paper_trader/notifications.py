@@ -48,11 +48,12 @@ class NtfyNotificationService:
         self,
         topic: str,
         base_url: str = "https://ntfy.sh",
-        timeout_seconds: float = 8.0,
+        timeout_seconds: float = 5.0,
     ) -> None:
         self._topic = topic.strip()
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
+        self._cooldown_until: float = 0.0
 
     def send_alert(self, message: str) -> bool:
         """Push a real-time alert to the ntfy mobile application with 429 retries.
@@ -64,6 +65,10 @@ class NtfyNotificationService:
             True if the ntfy server accepted the push, False otherwise.
         """
         if not self._topic:
+            return False
+
+        now_ts = time.time()
+        if now_ts < self._cooldown_until:
             return False
 
         endpoint = f"{self._base_url}/{self._topic}"
@@ -82,23 +87,33 @@ class NtfyNotificationService:
                     )
                     if response.status_code == 429 and attempt < 3:
                         retry_after_str = response.headers.get("Retry-After", "")
-                        wait_sec = (
+                        raw_wait_sec = (
                             float(retry_after_str)
                             if retry_after_str.isdigit()
-                            else float(attempt * 3.0)
+                            else float(attempt * 1.0)
                         )
+                        if raw_wait_sec > 3.0:
+                            cooldown_sec = min(raw_wait_sec, 600.0)
+                            self._cooldown_until = time.time() + cooldown_sec
+                            logger.warning(
+                                "ntfy 429 rate limit (Retry-After=%.0fs); "
+                                "deferring mobile alerts for %.0fs without blocking.",
+                                raw_wait_sec,
+                                cooldown_sec,
+                            )
+                            return False
                         logger.warning(
                             "ntfy 429 rate limit; retrying in %.1fs (try %d/3)",
-                            wait_sec,
+                            raw_wait_sec,
                             attempt,
                         )
-                        time.sleep(wait_sec)
+                        time.sleep(min(raw_wait_sec, 1.0))
                         continue
                     response.raise_for_status()
                 return True
             except httpx.HTTPError as exc:
                 if attempt < 3:
-                    time.sleep(attempt * 2.0)
+                    time.sleep(0.5)
                     continue
                 logger.warning("Failed to deliver ntfy mobile alert: %s", exc)
                 return False

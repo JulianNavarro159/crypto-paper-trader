@@ -252,11 +252,12 @@ async def start_cloud_health_server() -> None:
     if external_url:
 
         async def keep_alive_ping() -> None:
+            ping_target = f"{external_url.rstrip('/')}/health"
             while True:
-                await asyncio.sleep(180.0)
+                await asyncio.sleep(120.0)
                 try:
-                    async with httpx.AsyncClient(timeout=20.0) as client:
-                        response = await client.get(external_url)
+                    async with httpx.AsyncClient(timeout=15.0) as client:
+                        response = await client.get(ping_target)
                         logger.debug(
                             "Keep-alive self-ping dispatched (status=%d)",
                             response.status_code,
@@ -337,10 +338,10 @@ async def start_periodic_health_heartbeat(
                 win_rate_pct=win_rate,
             )
             delivered = notifier.send_alert(heartbeat_msg)
-            interval_seconds = 7200.0 if delivered else 60.0
+            interval_seconds = 7200.0 if delivered else 900.0
         except Exception as heartbeat_exc:
             logger.warning("Heartbeat health alert failed: %s", heartbeat_exc)
-            interval_seconds = 60.0
+            interval_seconds = 900.0
         await asyncio.sleep(interval_seconds)
 
 

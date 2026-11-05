@@ -1602,3 +1602,38 @@ def test_trailing_stop_tier2_positive_net_profit_lock() -> None:
             assert engine.active_position is None
         finally:
             ledger.close()
+
+
+def test_ntfy_long_retry_after_does_not_block_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify long ntfy 429 Retry-After headers return immediately without blocking."""
+    import time as time_mod
+
+    import httpx
+
+    from crypto_paper_trader.notifications import NtfyNotificationService
+
+    calls = 0
+
+    def mock_post(self: object, url: str, **kwargs: object) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        req = httpx.Request("POST", url)
+        return httpx.Response(
+            status_code=429,
+            headers={"Retry-After": "935"},
+            request=req,
+        )
+
+    monkeypatch.setattr(httpx.Client, "post", mock_post)
+    service = NtfyNotificationService(topic="test_topic")
+    start_ts = time_mod.monotonic()
+    first_result = service.send_alert("Alert 1")
+    second_result = service.send_alert("Alert 2")
+    elapsed = time_mod.monotonic() - start_ts
+
+    assert first_result is False
+    assert second_result is False
+    assert calls == 1
+    assert elapsed < 2.0
