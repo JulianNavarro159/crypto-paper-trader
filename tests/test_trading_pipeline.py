@@ -575,7 +575,7 @@ def test_partial_take_profit_and_adaptive_trailing() -> None:
 def test_decoupled_momentum_under_bearish_regime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify strong decoupled momentum signals are permitted in bearish regime."""
+    """Verify overbought momentum signals are suppressed during bearish macro regime."""
     with tempfile.TemporaryDirectory() as temp_dir:
         db_path = Path(temp_dir) / "test_ledger.db"
         ledger = LedgerRepository(db_path=db_path)
@@ -620,8 +620,8 @@ def test_decoupled_momentum_under_bearish_regime(
             )
 
             result = orchestrator.process_candle_event(candles[-1])
-            assert result.signal.signal_type == SignalType.BUY
-            assert trading_engine.active_position is not None
+            assert result.signal.signal_type == SignalType.HOLD
+            assert trading_engine.active_position is None
         finally:
             ledger.close()
 
@@ -832,7 +832,7 @@ def test_orchestrator_handles_bootstrap_failure_gracefully() -> None:
 def test_oversold_dip_rebound_permitted_under_bearish_regime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify oversold dip rebound BUY signals are permitted in bearish regime."""
+    """Verify oversold dip buys require trend stabilization in bearish regime."""
     with tempfile.TemporaryDirectory() as temp_dir:
         db_path = Path(temp_dir) / "test_ledger.db"
         ledger = LedgerRepository(db_path=db_path)
@@ -859,7 +859,7 @@ def test_oversold_dip_rebound_permitted_under_bearish_regime(
             for candle in candles[:-1]:
                 orchestrator._upsert_candle(candle)
 
-            oversold_signal = MarketSignal(
+            falling_knife_signal = MarketSignal(
                 symbol="SUIUSDT",
                 evaluated_at=candles[-1].close_time,
                 signal_type=SignalType.BUY,
@@ -873,11 +873,32 @@ def test_oversold_dip_rebound_permitted_under_bearish_regime(
             )
             monkeypatch.setattr(
                 "crypto_paper_trader.orchestration.evaluate_market_signal",
-                lambda **kwargs: oversold_signal,
+                lambda **kwargs: falling_knife_signal,
             )
 
             result = orchestrator.process_candle_event(candles[-1])
-            assert result.signal.signal_type == SignalType.BUY
+            assert result.signal.signal_type == SignalType.HOLD
+            assert trading_engine.active_position is None
+
+            stabilized_signal = MarketSignal(
+                symbol="SUIUSDT",
+                evaluated_at=candles[-1].close_time,
+                signal_type=SignalType.BUY,
+                reference_price=2.0000,
+                stop_loss_price=1.9800,
+                take_profit_price=2.0400,
+                atr_value=0.0300,
+                rsi_value=31.5,
+                fast_ema=2.0250,
+                slow_ema=2.0200,
+            )
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda **kwargs: stabilized_signal,
+            )
+
+            stabilized_result = orchestrator.process_candle_event(candles[-1])
+            assert stabilized_result.signal.signal_type == SignalType.BUY
             assert trading_engine.active_position is not None
         finally:
             ledger.close()
@@ -908,7 +929,7 @@ def test_signal_generation_enforces_minimum_fee_protective_spread() -> None:
     sl_ratio = (
         signal.reference_price - signal.stop_loss_price
     ) / signal.reference_price
-    assert sl_ratio >= 0.0059
+    assert 0.0039 <= sl_ratio <= 0.0051
 
     risk_cfg = RiskConfig()
     exchange_cfg = ExchangeConfig()
@@ -924,7 +945,7 @@ def test_signal_generation_enforces_minimum_fee_protective_spread() -> None:
 def test_btc_micro_profit_lock_and_post_stop_loss_cooldown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify micro-profit lock at +0.20% and 15m cooldown after stop loss."""
+    """Verify micro-profit lock at +0.22% and signal reversal exit."""
     with tempfile.TemporaryDirectory() as temp_dir:
         db_path = Path(temp_dir) / "test_btc_lock.db"
         ledger = LedgerRepository(db_path=db_path)
@@ -956,7 +977,7 @@ def test_btc_micro_profit_lock_and_post_stop_loss_cooldown(
             assert buy_exec is not None
 
             engine.evaluate_protective_exits(
-                current_price=78049.66,
+                current_price=78070.00,
                 timestamp=base_time + timedelta(minutes=65),
             )
             pos = engine.active_position
@@ -967,7 +988,7 @@ def test_btc_micro_profit_lock_and_post_stop_loss_cooldown(
                 symbol="BTCUSDT",
                 evaluated_at=base_time + timedelta(minutes=66),
                 signal_type=SignalType.SELL,
-                reference_price=78049.66,
+                reference_price=78140.00,
                 stop_loss_price=77500.0,
                 take_profit_price=78600.0,
                 atr_value=150.0,
@@ -1035,7 +1056,7 @@ def test_bnb_live_order_preserves_full_quantity_and_accurate_pnl() -> None:
                 ) -> dict[str, object]:
                     return {
                         "executedQty": f"{quantity:.8f}",
-                        "cummulativeQuoteQty": f"{quantity * 700.19:.8f}",
+                        "cummulativeQuoteQty": f"{quantity * 701.20:.8f}",
                         "fills": [],
                     }
 
@@ -1075,7 +1096,7 @@ def test_bnb_live_order_preserves_full_quantity_and_accurate_pnl() -> None:
                 symbol="BNBUSDT",
                 evaluated_at=base_time + timedelta(minutes=25),
                 signal_type=SignalType.SELL,
-                reference_price=700.19,
+                reference_price=701.20,
                 stop_loss_price=695.0,
                 take_profit_price=705.0,
                 atr_value=1.50,
@@ -1290,5 +1311,294 @@ def test_overbought_entry_blocked_and_hair_trigger_net_profit_lock() -> None:
             assert exit_exec is not None
             assert exit_exec.reason == ExitReason.TRAILING_STOP.value
             assert exit_exec.realized_pnl_usdt > 0.0
+        finally:
+            ledger.close()
+
+
+def test_universal_cooldown_enforced_across_all_protective_and_signal_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify cooldown timers are strictly enforced after all exit reasons."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_cooldown.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            config = TradingSystemConfig(
+                exchange=ExchangeConfig(symbol="SOLUSDT"),
+                ledger_db_path=db_path,
+            )
+            trading_engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            provider = BinanceMarketDataClient(config=config.exchange)
+            orchestrator = RealTimeTradingOrchestrator(
+                config=config,
+                market_data_provider=provider,
+                trading_engine=trading_engine,
+            )
+            now = datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc)
+
+            def mock_buy_signal(candles, symbol, config):
+                latest = candles[-1]
+                return MarketSignal(
+                    symbol=symbol,
+                    evaluated_at=latest.close_time,
+                    signal_type=SignalType.BUY,
+                    reference_price=latest.close_price,
+                    stop_loss_price=round(latest.close_price * 0.995, 4),
+                    take_profit_price=round(latest.close_price * 1.015, 4),
+                    atr_value=0.5,
+                    rsi_value=48.0,
+                    fast_ema=round(latest.close_price + 0.1, 4),
+                    slow_ema=round(latest.close_price - 0.1, 4),
+                )
+
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                mock_buy_signal,
+            )
+            candles = build_synthetic_candles(count=35, start_price=100.0, step=0.0)
+            for c in candles[:-1]:
+                orchestrator._upsert_candle(c)
+
+            first_result = orchestrator.process_candle_event(candles[-1])
+            assert first_result.signal.signal_type == SignalType.BUY
+            assert trading_engine.active_position is not None
+
+            stop_candle = Candle(
+                symbol="SOLUSDT",
+                open_time=now + timedelta(minutes=15),
+                close_time=now + timedelta(minutes=30),
+                open_price=100.0,
+                high_price=100.1,
+                low_price=99.4,
+                close_price=99.4,
+                volume=500.0,
+                is_closed=True,
+            )
+            stop_result = orchestrator.process_candle_event(stop_candle)
+            assert stop_result.latest_candle.close_price == 99.4
+            assert trading_engine.active_position is None
+
+            suppressed_candle = Candle(
+                symbol="SOLUSDT",
+                open_time=now + timedelta(minutes=30),
+                close_time=now + timedelta(minutes=44),
+                open_price=99.8,
+                high_price=100.2,
+                low_price=99.7,
+                close_price=100.0,
+                volume=300.0,
+                is_closed=True,
+            )
+            suppressed_result = orchestrator.process_candle_event(suppressed_candle)
+            assert suppressed_result.signal.signal_type == SignalType.HOLD
+            assert trading_engine.active_position is None
+
+            permitted_candle = Candle(
+                symbol="SOLUSDT",
+                open_time=now + timedelta(minutes=45),
+                close_time=now + timedelta(minutes=60),
+                open_price=100.0,
+                high_price=100.2,
+                low_price=99.9,
+                close_price=100.1,
+                volume=350.0,
+                is_closed=True,
+            )
+            permitted_result = orchestrator.process_candle_event(permitted_candle)
+            assert permitted_result.signal.signal_type == SignalType.BUY
+            assert trading_engine.active_position is not None
+
+            reversal_signal = MarketSignal(
+                symbol="SOLUSDT",
+                evaluated_at=now + timedelta(minutes=65),
+                signal_type=SignalType.SELL,
+                reference_price=100.41,
+                stop_loss_price=99.5,
+                take_profit_price=102.0,
+                atr_value=0.5,
+                rsi_value=62.0,
+                fast_ema=100.3,
+                slow_ema=100.0,
+            )
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda **kwargs: reversal_signal,
+            )
+            reversal_candle = Candle(
+                symbol="SOLUSDT",
+                open_time=now + timedelta(minutes=60),
+                close_time=now + timedelta(minutes=65),
+                open_price=100.1,
+                high_price=100.41,
+                low_price=100.1,
+                close_price=100.41,
+                volume=400.0,
+                is_closed=True,
+            )
+            reversal_result = orchestrator.process_candle_event(reversal_candle)
+            assert reversal_result.signal.signal_type == SignalType.SELL
+            assert trading_engine.active_position is None
+
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                mock_buy_signal,
+            )
+            post_reversal_suppressed = Candle(
+                symbol="SOLUSDT",
+                open_time=now + timedelta(minutes=65),
+                close_time=now + timedelta(minutes=68),
+                open_price=100.4,
+                high_price=100.6,
+                low_price=100.3,
+                close_price=100.4,
+                volume=200.0,
+                is_closed=True,
+            )
+            post_result = orchestrator.process_candle_event(post_reversal_suppressed)
+            assert post_result.signal.signal_type == SignalType.HOLD
+            assert trading_engine.active_position is None
+        finally:
+            ledger.close()
+
+
+def test_signal_reversal_guarantees_strictly_positive_net_pnl_above_fees() -> None:
+    """Verify signal reversal exits suppress sub-fee gains and guarantee
+    positive net profit.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_reversal_fee.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            config = TradingSystemConfig(
+                exchange=ExchangeConfig(
+                    symbol="SOLUSDT",
+                    taker_fee_rate=0.001,
+                ),
+                risk=RiskConfig(
+                    min_signal_exit_profit_ratio=0.0028,
+                    min_net_profit_ratio=0.0010,
+                ),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            now = datetime(2026, 11, 4, 15, 0, tzinfo=timezone.utc)
+            buy_signal = MarketSignal(
+                symbol="SOLUSDT",
+                evaluated_at=now,
+                signal_type=SignalType.BUY,
+                reference_price=100.0,
+                stop_loss_price=99.5,
+                take_profit_price=102.0,
+                atr_value=0.5,
+                rsi_value=50.0,
+                fast_ema=100.1,
+                slow_ema=99.9,
+            )
+            buy_exec = engine.process_signal(buy_signal)
+            assert buy_exec is not None
+            assert engine.active_position is not None
+
+            sub_fee_sell = MarketSignal(
+                symbol="SOLUSDT",
+                evaluated_at=now + timedelta(minutes=5),
+                signal_type=SignalType.SELL,
+                reference_price=100.18,
+                stop_loss_price=99.5,
+                take_profit_price=102.0,
+                atr_value=0.5,
+                rsi_value=59.0,
+                fast_ema=100.1,
+                slow_ema=99.9,
+            )
+            sub_fee_exec = engine.process_signal(sub_fee_sell)
+            assert sub_fee_exec is None
+            assert engine.active_position is not None
+
+            fee_immune_sell = MarketSignal(
+                symbol="SOLUSDT",
+                evaluated_at=now + timedelta(minutes=10),
+                signal_type=SignalType.SELL,
+                reference_price=100.32,
+                stop_loss_price=99.5,
+                take_profit_price=102.0,
+                atr_value=0.5,
+                rsi_value=60.0,
+                fast_ema=100.2,
+                slow_ema=99.9,
+            )
+            valid_exit = engine.process_signal(fee_immune_sell)
+            assert valid_exit is not None
+            assert valid_exit.reason == ExitReason.SIGNAL_REVERSAL.value
+            assert valid_exit.realized_pnl_usdt > 0.0
+            assert engine.active_position is None
+        finally:
+            ledger.close()
+
+
+def test_trailing_stop_tier2_positive_net_profit_lock() -> None:
+    """Verify tier 2 trailing stop locks net profits strictly above round-trip fees."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_tier2_lock.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            config = TradingSystemConfig(
+                exchange=ExchangeConfig(
+                    symbol="DOGEUSDT",
+                    taker_fee_rate=0.001,
+                ),
+                risk=RiskConfig(
+                    min_net_profit_ratio=0.0010,
+                ),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            now = datetime(2026, 11, 4, 16, 0, tzinfo=timezone.utc)
+            buy_signal = MarketSignal(
+                symbol="DOGEUSDT",
+                evaluated_at=now,
+                signal_type=SignalType.BUY,
+                reference_price=0.100000,
+                stop_loss_price=0.099500,
+                take_profit_price=0.101000,
+                atr_value=0.000400,
+                rsi_value=48.0,
+                fast_ema=0.100050,
+                slow_ema=0.099950,
+            )
+            buy_exec = engine.process_signal(buy_signal)
+            assert buy_exec is not None
+            assert engine.active_position is not None
+
+            engine.evaluate_protective_exits(
+                current_price=0.100240,
+                timestamp=now + timedelta(minutes=2),
+            )
+            pos = engine.active_position
+            assert pos is not None
+            assert pos.stop_loss_price >= 0.100220
+
+            exit_exec = engine.evaluate_protective_exits(
+                current_price=0.100220,
+                timestamp=now + timedelta(minutes=4),
+            )
+            assert exit_exec is not None
+            assert exit_exec.reason == ExitReason.TRAILING_STOP.value
+            assert exit_exec.realized_pnl_usdt > 0.0
+            assert engine.active_position is None
         finally:
             ledger.close()

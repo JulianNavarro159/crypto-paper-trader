@@ -139,11 +139,15 @@ class RealTimeTradingOrchestrator:
             current_price=candle.close_price,
             timestamp=candle.close_time,
         )
-        if (
-            protective_exit is not None
-            and protective_exit.reason == ExitReason.STOP_LOSS.value
-        ):
-            self._cooldown_until_ts = candle.close_time.timestamp() + 900.0
+        if protective_exit is not None:
+            if protective_exit.reason == ExitReason.STOP_LOSS.value:
+                self._cooldown_until_ts = candle.close_time.timestamp() + 900.0
+            elif protective_exit.reason in (
+                ExitReason.TRAILING_STOP.value,
+                ExitReason.TAKE_PROFIT.value,
+                ExitReason.PARTIAL_TAKE_PROFIT.value,
+            ):
+                self._cooldown_until_ts = candle.close_time.timestamp() + 300.0
 
         min_required_rows = (
             max(
@@ -183,7 +187,7 @@ class RealTimeTradingOrchestrator:
             and candle.close_time.timestamp() < self._cooldown_until_ts
         ):
             logger.info(
-                "Suppressed BUY signal on %s during post-stop-loss cooldown.",
+                "Suppressed BUY signal on %s during post-exit cooldown.",
                 signal.symbol,
             )
             signal = replace(signal, signal_type=SignalType.HOLD)
@@ -192,24 +196,13 @@ class RealTimeTradingOrchestrator:
             signal.signal_type == SignalType.BUY
             and self._macro_regime == MacroMarketRegime.BEARISH
         ):
-            strat_cfg = self._config.strategy
-            is_oversold_dip = signal.rsi_value <= 35.0
-            is_momentum_breakout = (
-                strat_cfg.enable_decoupled_momentum
-                and signal.rsi_value >= strat_cfg.decoupled_rsi_min
-                and signal.fast_ema > signal.slow_ema
+            is_oversold_dip = (
+                signal.rsi_value <= 32.0 and signal.fast_ema >= signal.slow_ema
             )
             if is_oversold_dip:
                 logger.info(
-                    "Permitted oversold dip rebound BUY signal on %s "
-                    "despite BEARISH Bitcoin macro regime (RSI=%.1f).",
-                    signal.symbol,
-                    signal.rsi_value,
-                )
-            elif is_momentum_breakout:
-                logger.info(
-                    "Permitted decoupled relative-strength BUY signal on %s "
-                    "despite BEARISH Bitcoin macro regime (RSI=%.1f).",
+                    "Permitted stabilized oversold dip rebound BUY on %s "
+                    "during BEARISH macro regime (RSI=%.1f fast_ema>=slow_ema).",
                     signal.symbol,
                     signal.rsi_value,
                 )
@@ -264,11 +257,16 @@ class RealTimeTradingOrchestrator:
                 )
 
         if protective_exit is None:
-            self._engine.process_signal(
+            signal_exec = self._engine.process_signal(
                 signal=signal,
                 win_probability_pct=tm_win_prob,
                 allocation_fraction=tm_alloc,
             )
+            if (
+                signal_exec is not None
+                and signal_exec.reason == ExitReason.SIGNAL_REVERSAL.value
+            ):
+                self._cooldown_until_ts = candle.close_time.timestamp() + 300.0
 
         snapshot = self._engine.capture_portfolio_snapshot(
             current_price=candle.close_price,

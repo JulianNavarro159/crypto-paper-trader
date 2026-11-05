@@ -500,7 +500,7 @@ class PaperTradingEngine:
 
         if gain_ratio >= 0.0032:
             breakeven_floor = round(pos.entry_price * 1.0025, 10)
-            trail_pct = 0.0018 if pos.is_partially_closed else 0.0004
+            trail_pct = 0.0018 if pos.is_partially_closed else 0.0008
             trailing_distance = round(pos.entry_price * trail_pct, 10)
             trailing_candidate = round(new_peak - trailing_distance, 10)
             new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
@@ -509,9 +509,9 @@ class PaperTradingEngine:
                     pos, stop_loss_price=new_sl, peak_price=new_peak
                 )
                 self._ledger.save_open_position(self._active_position)
-        elif gain_ratio >= 0.0020:
-            breakeven_floor = round(pos.entry_price * 1.0019, 10)
-            trail_pct = 0.0002
+        elif gain_ratio >= 0.0022:
+            breakeven_floor = round(pos.entry_price * 1.0022, 10)
+            trail_pct = 0.0008
             trailing_distance = round(pos.entry_price * trail_pct, 10)
             trailing_candidate = round(new_peak - trailing_distance, 10)
             new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
@@ -714,8 +714,13 @@ class PaperTradingEngine:
             TradeExecution if an entry or exit order was filled, otherwise None.
         """
         if self._active_position is not None and signal.signal_type == SignalType.SELL:
+            min_ratio = max(
+                self._risk_config.min_signal_exit_profit_ratio,
+                (self._exchange_config.taker_fee_rate * 2.0)
+                + self._risk_config.min_net_profit_ratio,
+            )
             min_profitable_exit = self._active_position.entry_price * (
-                1.0 + self._risk_config.min_signal_exit_profit_ratio
+                1.0 + min_ratio
             )
             if signal.reference_price >= min_profitable_exit:
                 return self._close_active_position(

@@ -227,7 +227,8 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         & (enriched["fast_ema"] >= enriched["slow_ema"])
         & (enriched["volume"] >= (enriched["vol_sma"] * 0.95))
         & (enriched["rsi"] >= 45.0)
-        & (enriched["rsi"] <= 60.0)
+        & (enriched["rsi"] <= config.rsi_entry_max)
+        & (enriched["close_price"] <= (enriched["bb_upper"] * 0.995))
     )
 
     sell_mask = (
@@ -284,9 +285,9 @@ def build_market_signal_from_row(
     stop_loss_dist = min(
         max(
             effective_atr * config.atr_stop_loss_multiplier,
-            reference_price * 0.0060,
+            reference_price * 0.0040,
         ),
-        reference_price * 0.0065,
+        reference_price * 0.0050,
     )
     take_profit_dist = min(
         max(
