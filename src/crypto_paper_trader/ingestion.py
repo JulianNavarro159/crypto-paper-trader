@@ -77,10 +77,15 @@ def parse_ws_kline_payload(payload: dict[str, Any]) -> Candle:
     Raises:
         MarketDataIngestionError: If required keys are missing from payload.
     """
-    if "k" not in payload:
+    inner = (
+        payload["data"]
+        if "data" in payload and isinstance(payload["data"], dict)
+        else payload
+    )
+    if "k" not in inner:
         raise MarketDataIngestionError("WebSocket message missing 'k' kline object.")
 
-    kline = payload["k"]
+    kline = inner["k"]
     open_time = datetime.fromtimestamp(int(kline["t"]) / 1000.0, tz=timezone.utc)
     close_time = datetime.fromtimestamp(int(kline["T"]) / 1000.0, tz=timezone.utc)
 
@@ -116,9 +121,15 @@ class BinanceMarketDataClient:
         self,
         config: ExchangeConfig,
         http_timeout_seconds: float = 10.0,
+        symbols: Sequence[str] | None = None,
     ) -> None:
         self._config = config
         self._http_timeout_seconds = http_timeout_seconds
+        self._symbols: tuple[str, ...] = (
+            tuple(dict.fromkeys(s.upper() for s in symbols if s.strip()))
+            if symbols
+            else (config.symbol.upper(),)
+        )
 
     async def _fetch_klines_via_ws_api(
         self, params: dict[str, str | int]
@@ -344,17 +355,32 @@ class BinanceMarketDataClient:
         Yields:
             Candle instances updated in real time.
         """
-        stream_name = f"{self._config.symbol.lower()}@kline_{self._config.interval}"
-        ws_bases = (
-            self._config.ws_base_url,
-            "wss://stream.binance.us:9443/ws",
-        )
+        is_multi = len(self._symbols) > 1
+        if is_multi:
+            streams_query = "/".join(
+                f"{sym.lower()}@kline_{self._config.interval}"
+                for sym in self._symbols
+            )
+            primary_root = self._config.ws_base_url.rstrip("/")
+            if primary_root.endswith("/ws"):
+                primary_root = primary_root[:-3]
+            ws_urls = (
+                f"{primary_root}/stream?streams={streams_query}",
+                f"wss://stream.binance.us:9443/stream?streams={streams_query}",
+            )
+        else:
+            single_sym = self._symbols[0].lower()
+            stream_name = f"{single_sym}@kline_{self._config.interval}"
+            ws_urls = (
+                f"{self._config.ws_base_url.rstrip('/')}/{stream_name}",
+                f"wss://stream.binance.us:9443/ws/{stream_name}",
+            )
+
         events_received = 0
         attempt_idx = 0
 
         while True:
-            base_url = ws_bases[attempt_idx % len(ws_bases)]
-            ws_url = f"{base_url.rstrip('/')}/{stream_name}"
+            ws_url = ws_urls[attempt_idx % len(ws_urls)]
             attempt_idx += 1
             try:
                 async with websockets.connect(
@@ -373,7 +399,7 @@ class BinanceMarketDataClient:
                 logger.warning(
                     "WebSocket disconnected or encounter error on %s (%s); "
                     "reconnecting in 3 seconds...",
-                    base_url,
+                    ws_url,
                     exc,
                 )
                 await asyncio.sleep(3.0)

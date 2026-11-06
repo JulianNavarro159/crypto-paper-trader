@@ -38,7 +38,6 @@ from crypto_paper_trader.notifications import (
     format_balance_summary_alert,
     format_heartbeat_alert,
     format_recovery_alert,
-    format_rotation_alert,
     format_startup_alert,
 )
 from crypto_paper_trader.orchestration import build_default_orchestrator
@@ -481,7 +480,8 @@ async def run_application(args: argparse.Namespace) -> None:
             config,
             exchange=replace(config.exchange, symbol=existing_open_pos.symbol),
         )
-    elif args.auto_select:
+
+    if args.auto_select:
         try:
             initial_universe_candles = await fetch_universe_candles(
                 config=config,
@@ -500,7 +500,7 @@ async def run_application(args: argparse.Namespace) -> None:
                 config=config,
             )
             log_universe_ranking(rankings)
-            if rankings:
+            if rankings and existing_open_pos is None:
                 best_symbol = rankings[0].symbol
                 config = replace(
                     config,
@@ -513,7 +513,11 @@ async def run_application(args: argparse.Namespace) -> None:
                 config.exchange.symbol,
             )
 
-    provider = BinanceMarketDataClient(config=config.exchange)
+    use_multi_radar = bool(args.auto_select and args.mode != "backtest")
+    provider = BinanceMarketDataClient(
+        config=config.exchange,
+        symbols=config.universe.all_symbols if use_multi_radar else None,
+    )
 
     if args.mode == "backtest":
         historical_candles = await provider.fetch_paginated_historical_candles(
@@ -549,8 +553,13 @@ async def run_application(args: argparse.Namespace) -> None:
         provider=provider,
         notifier=notifier,
         live_client=live_client,
+        multi_symbol_mode=use_multi_radar,
     )
-    if config.exchange.symbol in initial_universe_candles:
+    if use_multi_radar:
+        for sym_candles in initial_universe_candles.values():
+            for seed_candle in sym_candles:
+                orchestrator._upsert_candle(seed_candle)
+    elif config.exchange.symbol in initial_universe_candles:
         for seed_candle in initial_universe_candles[config.exchange.symbol]:
             orchestrator._upsert_candle(seed_candle)
 
@@ -619,29 +628,14 @@ async def run_application(args: argparse.Namespace) -> None:
                         config=config,
                     )
                     log_universe_ranking(rankings)
+                    for sym_candles in universe_candles.values():
+                        for seed_candle in sym_candles:
+                            orchestrator._upsert_candle(seed_candle)
                     if rankings and rankings[0].symbol != config.exchange.symbol:
-                        old_symbol = config.exchange.symbol
                         new_symbol = rankings[0].symbol
                         config = replace(
                             config,
                             exchange=replace(config.exchange, symbol=new_symbol),
-                        )
-                        provider = BinanceMarketDataClient(config=config.exchange)
-                        orchestrator = build_default_orchestrator(
-                            config=config,
-                            provider=provider,
-                            notifier=notifier,
-                            live_client=live_client,
-                        )
-                        if new_symbol in universe_candles:
-                            for seed_candle in universe_candles[new_symbol]:
-                                orchestrator._upsert_candle(seed_candle)
-                        notifier.send_alert(
-                            format_rotation_alert(
-                                old_symbol=old_symbol,
-                                new_symbol=new_symbol,
-                                interval=config.exchange.interval,
-                            )
                         )
                 except Exception as exc:
                     logger.warning(

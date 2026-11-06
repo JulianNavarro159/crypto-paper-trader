@@ -1637,3 +1637,127 @@ def test_ntfy_long_retry_after_does_not_block_event_loop(
     assert second_result is False
     assert calls == 1
     assert elapsed < 2.0
+
+
+def test_multi_symbol_radar_executes_cross_symbol_entry_and_isolates_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify 10-coin multi-symbol radar enters cross-symbol BUY and isolates exits."""
+    from dataclasses import replace
+
+    from crypto_paper_trader.ingestion import parse_ws_kline_payload
+
+    combined_payload = {
+        "stream": "solusdt@kline_15m",
+        "data": {
+            "k": {
+                "s": "SOLUSDT",
+                "t": 1793900000000,
+                "T": 1793900899999,
+                "o": "100.00",
+                "h": "100.50",
+                "l": "99.90",
+                "c": "100.20",
+                "v": "500.0",
+                "x": False,
+            }
+        },
+    }
+    parsed = parse_ws_kline_payload(combined_payload)
+    assert parsed.symbol == "SOLUSDT"
+    assert parsed.close_price == 100.20
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_multi_radar.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            config = TradingSystemConfig(
+                exchange=ExchangeConfig(symbol="ADAUSDT"),
+                risk=RiskConfig(
+                    enable_time_machine_gate=False,
+                    enable_partial_take_profit=False,
+                ),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            provider = BinanceMarketDataClient(
+                config=config.exchange,
+                symbols=("ADAUSDT", "SOLUSDT", "BTCUSDT"),
+            )
+            orchestrator = RealTimeTradingOrchestrator(
+                config=config,
+                market_data_provider=provider,
+                trading_engine=engine,
+                multi_symbol_mode=True,
+            )
+
+            sol_candles = [
+                replace(c, symbol="SOLUSDT")
+                for c in build_synthetic_candles(count=35, start_price=100.0, step=0.1)
+            ]
+            for c in sol_candles[:-1]:
+                orchestrator._upsert_candle(c)
+
+            sol_buy = MarketSignal(
+                symbol="SOLUSDT",
+                evaluated_at=sol_candles[-1].close_time,
+                signal_type=SignalType.BUY,
+                reference_price=103.40,
+                stop_loss_price=102.88,
+                take_profit_price=104.20,
+                atr_value=0.40,
+                rsi_value=50.0,
+                fast_ema=103.35,
+                slow_ema=103.10,
+            )
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda **kwargs: sol_buy,
+            )
+
+            res_entry = orchestrator.process_candle_event(sol_candles[-1])
+            assert res_entry.signal.signal_type == SignalType.BUY
+            assert engine.active_position is not None
+            assert engine.active_position.symbol == "SOLUSDT"
+
+            ada_tick = Candle(
+                symbol="ADAUSDT",
+                open_time=sol_candles[-1].open_time + timedelta(minutes=1),
+                close_time=sol_candles[-1].close_time + timedelta(minutes=1),
+                open_price=0.35,
+                high_price=0.36,
+                low_price=0.34,
+                close_price=0.35,
+                volume=1000.0,
+                is_closed=False,
+            )
+            res_ada = orchestrator.process_candle_event(ada_tick)
+            assert res_ada.signal.signal_type == SignalType.HOLD
+            assert engine.active_position is not None
+            assert engine.active_position.symbol == "SOLUSDT"
+            assert res_ada.snapshot.total_equity_usdt > 30.0
+
+            sol_tp_tick = Candle(
+                symbol="SOLUSDT",
+                open_time=sol_candles[-1].open_time + timedelta(minutes=2),
+                close_time=sol_candles[-1].close_time + timedelta(minutes=2),
+                open_price=104.00,
+                high_price=104.35,
+                low_price=103.95,
+                close_price=104.30,
+                volume=800.0,
+                is_closed=False,
+            )
+            orchestrator.process_candle_event(sol_tp_tick)
+            assert engine.active_position is None
+            execs = ledger.fetch_all_executions()
+            assert len(execs) >= 2
+            assert execs[-1].symbol == "SOLUSDT"
+            assert execs[-1].realized_pnl_usdt > 0.0
+        finally:
+            ledger.close()

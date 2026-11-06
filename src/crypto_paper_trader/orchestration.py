@@ -53,11 +53,15 @@ class RealTimeTradingOrchestrator:
         config: TradingSystemConfig,
         market_data_provider: MarketDataProvider,
         trading_engine: PaperTradingEngine,
+        multi_symbol_mode: bool = False,
     ) -> None:
         self._config = config
         self._provider = market_data_provider
         self._engine = trading_engine
+        self._multi_symbol_mode = multi_symbol_mode
         self._candle_buffer: dict[int, Candle] = {}
+        self._buffers_by_symbol: dict[str, dict[int, Candle]] = {}
+        self._last_price_by_symbol: dict[str, float] = {}
         self._last_log_time: float = 0.0
         self._last_logged_signal: SignalType | None = None
         self._macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
@@ -81,10 +85,21 @@ class RealTimeTradingOrchestrator:
             Sorted list of buffered candles trimmed to bootstrap_candle_limit.
         """
         epoch_key = int(candle.open_time.timestamp())
-        self._candle_buffer[epoch_key] = candle
-
-        sorted_keys = sorted(self._candle_buffer.keys())
         max_capacity = self._config.exchange.bootstrap_candle_limit + 10
+
+        if self._multi_symbol_mode:
+            sym_key = candle.symbol.upper()
+            self._last_price_by_symbol[sym_key] = candle.close_price
+            sym_buf = self._buffers_by_symbol.setdefault(sym_key, {})
+            sym_buf[epoch_key] = candle
+            sorted_keys = sorted(sym_buf.keys())
+            if len(sorted_keys) > max_capacity:
+                for old_key in sorted_keys[:-max_capacity]:
+                    del sym_buf[old_key]
+            return [sym_buf[key] for key in sorted(sym_buf.keys())]
+
+        self._candle_buffer[epoch_key] = candle
+        sorted_keys = sorted(self._candle_buffer.keys())
         if len(sorted_keys) > max_capacity:
             for old_key in sorted_keys[:-max_capacity]:
                 del self._candle_buffer[old_key]
@@ -97,6 +112,14 @@ class RealTimeTradingOrchestrator:
         Returns:
             Chronological list of bootstrapped candles.
         """
+        if self._multi_symbol_mode and any(
+            len(buf) >= 30 for buf in self._buffers_by_symbol.values()
+        ):
+            primary = self._buffers_by_symbol.get(
+                self._config.exchange.symbol.upper(), {}
+            )
+            return [primary[key] for key in sorted(primary.keys())]
+
         if len(self._candle_buffer) >= 30:
             return [
                 self._candle_buffer[key] for key in sorted(self._candle_buffer.keys())
@@ -135,6 +158,58 @@ class RealTimeTradingOrchestrator:
             CycleEvaluationResult summarizing signal and portfolio equity.
         """
         rolling_candles = self._upsert_candle(candle)
+        target_symbol = (
+            candle.symbol.upper()
+            if self._multi_symbol_mode
+            else self._config.exchange.symbol
+        )
+
+        min_required_rows = (
+            max(
+                self._config.strategy.slow_ema_period,
+                self._config.strategy.rsi_period,
+                self._config.strategy.atr_period,
+                self._config.strategy.bollinger_period,
+            )
+            + 2
+        )
+
+        if target_symbol == "BTCUSDT" and len(rolling_candles) >= min_required_rows:
+            self._macro_regime = evaluate_macro_regime(
+                rolling_candles, self._config.strategy
+            )
+
+        active_pos = self._engine.active_position
+        if (
+            self._multi_symbol_mode
+            and active_pos is not None
+            and active_pos.symbol.upper() != target_symbol
+        ):
+            held_sym = active_pos.symbol.upper()
+            held_price = self._last_price_by_symbol.get(
+                held_sym, active_pos.entry_price
+            )
+            snapshot = self._engine.capture_portfolio_snapshot(
+                current_price=held_price,
+                timestamp=candle.close_time,
+            )
+            idle_signal = MarketSignal(
+                symbol=target_symbol,
+                evaluated_at=candle.close_time,
+                signal_type=SignalType.HOLD,
+                reference_price=candle.close_price,
+                stop_loss_price=candle.close_price * 0.995,
+                take_profit_price=candle.close_price * 1.008,
+                atr_value=candle.close_price * 0.005,
+                rsi_value=50.0,
+                fast_ema=candle.close_price,
+                slow_ema=candle.close_price,
+            )
+            return CycleEvaluationResult(
+                latest_candle=candle,
+                signal=idle_signal,
+                snapshot=snapshot,
+            )
 
         protective_exit = self._engine.evaluate_protective_exits(
             current_price=candle.close_price,
@@ -150,18 +225,9 @@ class RealTimeTradingOrchestrator:
             ):
                 self._cooldown_until_ts = candle.close_time.timestamp() + 300.0
 
-        min_required_rows = (
-            max(
-                self._config.strategy.slow_ema_period,
-                self._config.strategy.rsi_period,
-                self._config.strategy.atr_period,
-                self._config.strategy.bollinger_period,
-            )
-            + 2
-        )
         if len(rolling_candles) < min_required_rows:
             signal = MarketSignal(
-                symbol=self._config.exchange.symbol,
+                symbol=target_symbol,
                 evaluated_at=candle.close_time,
                 signal_type=SignalType.HOLD,
                 reference_price=candle.close_price,
@@ -173,13 +239,9 @@ class RealTimeTradingOrchestrator:
                 slow_ema=candle.close_price,
             )
         else:
-            if self._config.exchange.symbol == "BTCUSDT":
-                self._macro_regime = evaluate_macro_regime(
-                    rolling_candles, self._config.strategy
-                )
             signal = evaluate_market_signal(
                 candles=rolling_candles,
-                symbol=self._config.exchange.symbol,
+                symbol=target_symbol,
                 config=self._config.strategy,
             )
 
@@ -330,6 +392,7 @@ def build_default_orchestrator(
     provider: MarketDataProvider,
     notifier: NotificationService | None = None,
     live_client: BinanceSpotAuthenticatedClient | None = None,
+    multi_symbol_mode: bool = False,
 ) -> RealTimeTradingOrchestrator:
     """Assemble a RealTimeTradingOrchestrator with its ledger and engine.
 
@@ -338,6 +401,7 @@ def build_default_orchestrator(
         provider: MarketDataProvider implementation for REST and WebSocket IO.
         notifier: Optional mobile notification service.
         live_client: Optional authenticated Binance client for live orders.
+        multi_symbol_mode: Enable simultaneous multi-asset WebSocket radar.
 
     Returns:
         Configured RealTimeTradingOrchestrator instance.
@@ -355,4 +419,5 @@ def build_default_orchestrator(
         config=config,
         market_data_provider=provider,
         trading_engine=engine,
+        multi_symbol_mode=multi_symbol_mode,
     )

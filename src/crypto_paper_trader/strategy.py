@@ -379,7 +379,7 @@ def evaluate_macro_regime(
     last_slow = float(slow_ema.iloc[-1])
     last_rsi = float(rsi.iloc[-1])
 
-    if last_fast < last_slow and last_rsi < 48.0:
+    if last_fast < last_slow and last_rsi < 39.0:
         return MacroMarketRegime.BEARISH
 
     if last_fast > last_slow and last_rsi >= 50.0:
