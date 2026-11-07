@@ -36,6 +36,49 @@ from crypto_paper_trader.validation import (
 logger = logging.getLogger(__name__)
 
 
+def compute_no_loss_exit_levels(
+    entry_price: float,
+    quantity: float,
+    notional_usdt: float,
+    taker_fee_rate: float,
+    min_target_net_profit_usdt: float,
+    include_live_spread_cushion: bool = False,
+) -> tuple[float, float]:
+    """Compute fee-covered safety floor and micro-profit target price.
+
+    Args:
+        entry_price: Executed purchase price per unit of base asset.
+        quantity: Base asset quantity held in the position.
+        notional_usdt: Total USDT cost basis allocated to the position.
+        taker_fee_rate: Fractional exchange fee rate per side.
+        min_target_net_profit_usdt: Minimum net USDT gain required to sell.
+        include_live_spread_cushion: Add bid-ask spread cushion for live fills.
+
+    Returns:
+        Tuple of (safety_floor_price, target_take_profit_price) strictly
+        greater than or equal to entry_price.
+    """
+    safe_qty = max(quantity, 1e-12)
+    safe_net_factor = max(1.0 - taker_fee_rate, 1e-9)
+    implied_entry_cost = (safe_qty * entry_price) / safe_net_factor
+    effective_cost_usdt = max(notional_usdt, implied_entry_cost)
+    net_denom = safe_qty * safe_net_factor
+
+    min_profit_usdt = max(0.0, min_target_net_profit_usdt)
+    rounding_guard_usdt = 0.0015
+    raw_floor_price = (
+        effective_cost_usdt + min_profit_usdt + rounding_guard_usdt
+    ) / net_denom
+    safety_floor_price = round(max(entry_price, raw_floor_price), 10)
+
+    cushion_ratio = 0.00035 if include_live_spread_cushion else 0.00005
+    target_take_profit_price = round(
+        max(safety_floor_price, safety_floor_price * (1.0 + cushion_ratio)),
+        10,
+    )
+    return safety_floor_price, target_take_profit_price
+
+
 def generate_client_order_id(
     symbol: str,
     side: OrderSide,
@@ -447,6 +490,24 @@ class PaperTradingEngine:
                     6,
                 )
         if self._active_position is not None:
+            if self._risk_config.no_loss_spot_mode:
+                upgraded_sl, upgraded_tp = compute_no_loss_exit_levels(
+                    entry_price=self._active_position.entry_price,
+                    quantity=self._active_position.quantity,
+                    notional_usdt=self._active_position.notional_usdt,
+                    taker_fee_rate=self._exchange_config.taker_fee_rate,
+                    min_target_net_profit_usdt=(
+                        self._risk_config.min_target_net_profit_usdt
+                    ),
+                    include_live_spread_cushion=self._live_client is not None,
+                )
+                if self._active_position.stop_loss_price < upgraded_sl:
+                    self._active_position = replace(
+                        self._active_position,
+                        stop_loss_price=upgraded_sl,
+                        take_profit_price=upgraded_tp,
+                    )
+                    self._ledger.save_open_position(self._active_position)
             logger.info(
                 "Resumed open position from ledger | symbol=%s entry=%s "
                 "qty=%s sl=%s tp=%s",
@@ -456,6 +517,11 @@ class PaperTradingEngine:
                 format_price(self._active_position.stop_loss_price),
                 format_price(self._active_position.take_profit_price),
             )
+
+    @property
+    def no_loss_spot_mode(self) -> bool:
+        """Return True when below-entry sales are strictly prohibited."""
+        return self._risk_config.no_loss_spot_mode
 
     @property
     def available_cash_usdt(self) -> float:
@@ -486,6 +552,47 @@ class PaperTradingEngine:
 
         pos = self._active_position
         new_peak = max(pos.peak_price, current_price, pos.entry_price)
+
+        if self._risk_config.no_loss_spot_mode:
+            safety_floor, _ = compute_no_loss_exit_levels(
+                entry_price=pos.entry_price,
+                quantity=pos.quantity,
+                notional_usdt=pos.notional_usdt,
+                taker_fee_rate=self._exchange_config.taker_fee_rate,
+                min_target_net_profit_usdt=(
+                    self._risk_config.min_target_net_profit_usdt
+                ),
+                include_live_spread_cushion=self._live_client is not None,
+            )
+            effective_floor = max(pos.stop_loss_price, safety_floor)
+            if new_peak > pos.peak_price or effective_floor > pos.stop_loss_price:
+                pos = replace(
+                    pos,
+                    stop_loss_price=effective_floor,
+                    peak_price=new_peak,
+                )
+                self._active_position = pos
+                self._ledger.save_open_position(pos)
+
+            if current_price < effective_floor:
+                return None
+
+            if current_price >= pos.take_profit_price:
+                return self._close_active_position(
+                    exit_price=current_price,
+                    timestamp=timestamp,
+                    reason=ExitReason.TAKE_PROFIT.value,
+                )
+
+            if new_peak >= pos.take_profit_price and current_price >= effective_floor:
+                return self._close_active_position(
+                    exit_price=current_price,
+                    timestamp=timestamp,
+                    reason=ExitReason.TRAILING_STOP.value,
+                )
+
+            return None
+
         gain_ratio = (new_peak - pos.entry_price) / pos.entry_price
         current_gain = (current_price - pos.entry_price) / pos.entry_price
 
@@ -714,14 +821,30 @@ class PaperTradingEngine:
             TradeExecution if an entry or exit order was filled, otherwise None.
         """
         if self._active_position is not None and signal.signal_type == SignalType.SELL:
-            min_ratio = max(
-                self._risk_config.min_signal_exit_profit_ratio,
-                (self._exchange_config.taker_fee_rate * 2.0)
-                + self._risk_config.min_net_profit_ratio,
-            )
-            min_profitable_exit = self._active_position.entry_price * (
-                1.0 + min_ratio
-            )
+            if self._risk_config.no_loss_spot_mode:
+                safety_floor, _ = compute_no_loss_exit_levels(
+                    entry_price=self._active_position.entry_price,
+                    quantity=self._active_position.quantity,
+                    notional_usdt=self._active_position.notional_usdt,
+                    taker_fee_rate=self._exchange_config.taker_fee_rate,
+                    min_target_net_profit_usdt=(
+                        self._risk_config.min_target_net_profit_usdt
+                    ),
+                    include_live_spread_cushion=self._live_client is not None,
+                )
+                min_profitable_exit = max(
+                    self._active_position.stop_loss_price,
+                    safety_floor,
+                )
+            else:
+                min_ratio = max(
+                    self._risk_config.min_signal_exit_profit_ratio,
+                    (self._exchange_config.taker_fee_rate * 2.0)
+                    + self._risk_config.min_net_profit_ratio,
+                )
+                min_profitable_exit = self._active_position.entry_price * (
+                    1.0 + min_ratio
+                )
             if signal.reference_price >= min_profitable_exit:
                 return self._close_active_position(
                     exit_price=signal.reference_price,
@@ -868,6 +991,18 @@ class PaperTradingEngine:
                 stop_loss_price = round(signal.stop_loss_price + price_delta, 8)
                 take_profit_price = round(signal.take_profit_price + price_delta, 8)
 
+        if self._risk_config.no_loss_spot_mode:
+            stop_loss_price, take_profit_price = compute_no_loss_exit_levels(
+                entry_price=entry_price,
+                quantity=quantity,
+                notional_usdt=proposed_notional_usdt,
+                taker_fee_rate=self._exchange_config.taker_fee_rate,
+                min_target_net_profit_usdt=(
+                    self._risk_config.min_target_net_profit_usdt
+                ),
+                include_live_spread_cushion=self._live_client is not None,
+            )
+
         position_id = f"pos-{client_order_id[-12:]}"
 
         self._available_cash_usdt = round(
@@ -954,6 +1089,17 @@ class PaperTradingEngine:
             return None
 
         position = self._active_position
+        if (
+            self._risk_config.no_loss_spot_mode
+            and exit_price < position.stop_loss_price
+        ):
+            logger.info(
+                "Deferred exit on %s: price %s is below no-loss safety floor %s.",
+                position.symbol,
+                format_price(exit_price),
+                format_price(position.stop_loss_price),
+            )
+            return None
         client_order_id = generate_client_order_id(
             symbol=position.symbol,
             side=OrderSide.SELL,

@@ -277,6 +277,19 @@ class RealTimeTradingOrchestrator:
                 )
                 signal = replace(signal, signal_type=SignalType.HOLD)
 
+        if (
+            signal.signal_type == SignalType.BUY
+            and self._config.risk.no_loss_spot_mode
+            and signal.rsi_value > 51.5
+        ):
+            logger.info(
+                "Suppressed BUY signal on %s in no-loss spot mode: "
+                "RSI=%.2f exceeds pullback ceiling 51.5.",
+                signal.symbol,
+                signal.rsi_value,
+            )
+            signal = replace(signal, signal_type=SignalType.HOLD)
+
         tm_win_prob: float | None = None
         tm_alloc: float | None = None
         if (

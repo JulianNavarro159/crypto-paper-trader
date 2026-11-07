@@ -20,6 +20,7 @@ from crypto_paper_trader.backtest import (
 from crypto_paper_trader.config import (
     CapitalConfig,
     ExchangeConfig,
+    RiskConfig,
     TradingSystemConfig,
 )
 from crypto_paper_trader.domain import (
@@ -28,7 +29,7 @@ from crypto_paper_trader.domain import (
     OrderSide,
     Position,
 )
-from crypto_paper_trader.execution import LedgerRepository
+from crypto_paper_trader.execution import LedgerRepository, compute_no_loss_exit_levels
 from crypto_paper_trader.formatting import format_price, format_quantity
 from crypto_paper_trader.ingestion import BinanceMarketDataClient
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
@@ -104,8 +105,8 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     parser.add_argument(
         "--capital-cop",
         type=float,
-        default=100_000.0,
-        help="Initial capital in Colombian Pesos (default: 100000.0)",
+        default=102_200.0,
+        help="Initial capital in Colombian Pesos (default: 102200.0)",
     )
     parser.add_argument(
         "--cop-rate",
@@ -363,6 +364,7 @@ async def run_application(args: argparse.Namespace) -> None:
             symbol=args.symbol.upper(),
             interval=args.interval,
         ),
+        risk=RiskConfig.spot_no_loss_micro_profit(),
         ledger_db_path=args.db_path,
     )
 
@@ -448,6 +450,18 @@ async def run_application(args: argparse.Namespace) -> None:
         if holding is not None:
             held_sym, held_qty, held_entry = holding
             held_notional = round(held_qty * held_entry, 6)
+            if config.risk.no_loss_spot_mode:
+                rec_sl, rec_tp = compute_no_loss_exit_levels(
+                    entry_price=held_entry,
+                    quantity=held_qty,
+                    notional_usdt=held_notional,
+                    taker_fee_rate=config.exchange.taker_fee_rate,
+                    min_target_net_profit_usdt=config.risk.min_target_net_profit_usdt,
+                    include_live_spread_cushion=True,
+                )
+            else:
+                rec_sl = round(held_entry * 0.9940, 8)
+                rec_tp = round(held_entry * 1.0075, 8)
             reconciled_pos = Position(
                 position_id=f"reconciled-{held_sym.lower()}",
                 symbol=held_sym,
@@ -456,8 +470,8 @@ async def run_application(args: argparse.Namespace) -> None:
                 quantity=held_qty,
                 notional_usdt=held_notional,
                 entry_fee_usdt=round(held_notional * config.exchange.taker_fee_rate, 6),
-                stop_loss_price=round(held_entry * 0.9940, 8),
-                take_profit_price=round(held_entry * 1.0075, 8),
+                stop_loss_price=rec_sl,
+                take_profit_price=rec_tp,
                 peak_price=held_entry,
             )
             LedgerRepository(db_path=config.ledger_db_path).save_open_position(

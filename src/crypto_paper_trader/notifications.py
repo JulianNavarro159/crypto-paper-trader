@@ -275,10 +275,16 @@ def format_execution_alert(
                 if win_probability_pct is not None
                 else ""
             )
+            floor_line = (
+                f"Piso de seguridad: Protegido en {sl_str} USDT "
+                f"(nunca vende menor a tu compra)"
+                if stop_loss_price >= execution.execution_price
+                else f"Piso de seguridad: Vender a {sl_str} USDT para cuidar tu dinero"
+            )
             targets_block = (
                 f"\n--- PLAN DE ESTA OPERACION ---\n"
                 f"Meta de ganancia: Vender al llegar a {tp_str} USDT\n"
-                f"Piso de seguridad: Vender a {sl_str} USDT para cuidar tu dinero"
+                f"{floor_line}"
                 f"{tm_line}"
             )
         return (

@@ -13,7 +13,7 @@ class CapitalConfig:
         cop_per_usdt_rate: Reference exchange rate from COP to USDT.
     """
 
-    initial_capital_cop: float = 110_800.0
+    initial_capital_cop: float = 102_200.0
     cop_per_usdt_rate: float = 3_194.0
 
     @property
@@ -39,7 +39,7 @@ class UniverseConfig:
         "BTCUSDT",
         "ETHUSDT",
         "SOLUSDT",
-        "BNBUSDT",
+        "LTCUSDT",
         "XRPUSDT",
     )
     volatile_symbols: tuple[str, ...] = (
@@ -144,6 +144,30 @@ class RiskConfig:
     enable_time_machine_gate: bool = True
     time_machine_replays: int = 10_000
     time_machine_min_win_prob_pct: float = 55.0
+    no_loss_spot_mode: bool = False
+    min_target_net_profit_usdt: float = 0.01
+
+    @classmethod
+    def spot_no_loss_micro_profit(
+        cls,
+        min_target_net_profit_usdt: float = 0.01,
+    ) -> RiskConfig:
+        """Build production Spot risk rules banning below-entry sales.
+
+        Args:
+            min_target_net_profit_usdt: Minimum net USDT gain required to exit.
+
+        Returns:
+            Configured RiskConfig enforcing safety floor >= entry price.
+        """
+        return cls(
+            position_allocation_fraction=0.90,
+            min_net_profit_ratio=0.0003,
+            min_signal_exit_profit_ratio=0.0023,
+            enable_partial_take_profit=False,
+            no_loss_spot_mode=True,
+            min_target_net_profit_usdt=min_target_net_profit_usdt,
+        )
 
 
 @dataclass(frozen=True)

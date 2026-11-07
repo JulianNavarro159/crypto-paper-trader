@@ -162,7 +162,20 @@ def _execute_simulation_loop(
     for candle, signal in paired_signals:
         active_pos = engine.active_position
         if active_pos is not None:
-            if candle.low_price <= active_pos.stop_loss_price:
+            if engine.no_loss_spot_mode:
+                if candle.high_price >= active_pos.take_profit_price:
+                    engine.evaluate_protective_exits(
+                        current_price=active_pos.take_profit_price,
+                        timestamp=candle.close_time,
+                    )
+                else:
+                    closed = engine.evaluate_protective_exits(
+                        current_price=candle.close_price,
+                        timestamp=candle.close_time,
+                    )
+                    if closed is None:
+                        engine.process_signal(signal)
+            elif candle.low_price <= active_pos.stop_loss_price:
                 engine.evaluate_protective_exits(
                     current_price=active_pos.stop_loss_price,
                     timestamp=candle.close_time,

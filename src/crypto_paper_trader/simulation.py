@@ -121,6 +121,62 @@ def run_time_machine_simulation(
     high_paths = close_paths * (1.0 + sim_upper_wicks)
     low_paths = close_paths * (1.0 - sim_lower_wicks)
 
+    round_trip_fee = 2.0 * exchange_config.taker_fee_rate
+
+    if risk_config.no_loss_spot_mode:
+        micro_tp_ratio = round_trip_fee + 0.0007
+        micro_tp_price = entry_price * (1.0 + micro_tp_ratio)
+        adverse_dip_price = entry_price * 0.9920
+        sentinel = horizon_candles + 1
+        tp_mask = high_paths >= micro_tp_price
+        dip_mask = low_paths <= adverse_dip_price
+        first_tp = np.where(
+            np.any(tp_mask, axis=1), np.argmax(tp_mask, axis=1), sentinel
+        )
+        first_dip = np.where(
+            np.any(dip_mask, axis=1), np.argmax(dip_mask, axis=1), sentinel
+        )
+        clean_micro_win = (first_tp < sentinel) & (first_tp <= first_dip)
+        delayed_micro_win = (first_tp < sentinel) & (first_tp > first_dip)
+        micro_net_ret = micro_tp_ratio - round_trip_fee
+        terminal_unrealized_ret = (
+            (close_paths[:, -1] - entry_price) / entry_price
+        ) - round_trip_fee
+        net_returns = np.where(
+            clean_micro_win,
+            micro_net_ret,
+            np.where(
+                delayed_micro_win,
+                micro_net_ret * 0.5,
+                np.minimum(0.0, terminal_unrealized_ret),
+            ),
+        )
+        win_prob = round(float(np.mean(clean_micro_win) * 100.0), 2)
+        target_prob = round(
+            float(np.mean(clean_micro_win | delayed_micro_win) * 100.0), 2
+        )
+        stop_prob = round(float(np.mean(first_dip < first_tp) * 100.0), 2)
+        expected_ret = round(float(np.mean(net_returns) * 100.0), 4)
+        approved = bool(win_prob >= min_win_probability_pct and expected_ret > 0.0)
+        base_alloc = risk_config.position_allocation_fraction
+        if not approved:
+            rec_alloc = 0.0
+        elif win_prob >= 65.0:
+            rec_alloc = base_alloc
+        else:
+            rec_alloc = round(max(0.70, base_alloc * 0.85), 2)
+        return TimeMachineSimulationReport(
+            symbol=signal.symbol,
+            replays_count=replays_count,
+            horizon_candles=horizon_candles,
+            win_probability_pct=win_prob,
+            target_hit_probability_pct=target_prob,
+            stop_hit_probability_pct=stop_prob,
+            expected_net_return_pct=expected_ret,
+            recommended_allocation_fraction=rec_alloc,
+            approved=approved,
+        )
+
     sl_price = signal.stop_loss_price
     tp1_price = entry_price * (1.0 + risk_config.tp1_profit_ratio)
     tp2_price = max(
@@ -128,7 +184,6 @@ def run_time_machine_simulation(
         entry_price * (1.0 + risk_config.tp2_take_profit_ratio),
     )
     lock_trigger_price = entry_price * 1.0022
-    round_trip_fee = 2.0 * exchange_config.taker_fee_rate
 
     sentinel = horizon_candles + 1
     sl_mask = low_paths <= sl_price

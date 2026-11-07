@@ -238,7 +238,20 @@ def run_multi_asset_rotation_backtest(
                 )
                 if held_entry is not None:
                     held_candle, held_signal = held_entry
-                    if held_candle.low_price <= active_pos.stop_loss_price:
+                    if engine.no_loss_spot_mode:
+                        if held_candle.high_price >= active_pos.take_profit_price:
+                            engine.evaluate_protective_exits(
+                                current_price=active_pos.take_profit_price,
+                                timestamp=held_candle.close_time,
+                            )
+                        else:
+                            closed = engine.evaluate_protective_exits(
+                                current_price=held_candle.close_price,
+                                timestamp=held_candle.close_time,
+                            )
+                            if closed is None:
+                                engine.process_signal(held_signal)
+                    elif held_candle.low_price <= active_pos.stop_loss_price:
                         engine.evaluate_protective_exits(
                             current_price=active_pos.stop_loss_price,
                             timestamp=held_candle.close_time,

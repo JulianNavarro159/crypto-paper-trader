@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1761,3 +1762,215 @@ def test_multi_symbol_radar_executes_cross_symbol_entry_and_isolates_position(
             assert execs[-1].realized_pnl_usdt > 0.0
         finally:
             ledger.close()
+
+
+def test_spot_no_loss_micro_profit_never_sells_below_entry_and_banks_micro_gain() -> (
+    None
+):
+    """Verify no-loss Spot mode enforces floor >= entry and sells at +0.01 USDT net."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_no_loss_spot.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            capital_cfg = CapitalConfig(
+                initial_capital_cop=102_200.0,
+                cop_per_usdt_rate=3_194.0,
+            )
+            exchange_cfg = ExchangeConfig(symbol="ETHUSDT", taker_fee_rate=0.001)
+            risk_cfg = RiskConfig.spot_no_loss_micro_profit(
+                min_target_net_profit_usdt=0.01
+            )
+            engine = PaperTradingEngine(
+                capital_config=capital_cfg,
+                exchange_config=exchange_cfg,
+                risk_config=risk_cfg,
+                ledger=ledger,
+            )
+            initial_cash = engine.available_cash_usdt
+            t0 = datetime(2026, 11, 7, 6, 0, tzinfo=timezone.utc)
+            buy_signal = MarketSignal(
+                symbol="ETHUSDT",
+                evaluated_at=t0,
+                signal_type=SignalType.BUY,
+                reference_price=2246.97,
+                stop_loss_price=2237.98,
+                take_profit_price=2263.82,
+                atr_value=8.5,
+                rsi_value=44.0,
+                fast_ema=2247.10,
+                slow_ema=2246.50,
+            )
+            buy_exec = engine.process_signal(buy_signal)
+            assert buy_exec is not None
+            pos = engine.active_position
+            assert pos is not None
+            assert pos.stop_loss_price > pos.entry_price
+            assert pos.take_profit_price >= pos.stop_loss_price
+
+            buy_alert = format_execution_alert(
+                execution=buy_exec,
+                available_cash_usdt=engine.available_cash_usdt,
+                cop_per_usdt_rate=capital_cfg.cop_per_usdt_rate,
+                is_live_order=True,
+                stop_loss_price=pos.stop_loss_price,
+                take_profit_price=pos.take_profit_price,
+            )
+            assert "nunca vende menor a tu compra" in buy_alert
+
+            for idx, dip_price in enumerate([2246.97, 2245.00, 2237.32, 2215.00]):
+                dip_res = engine.evaluate_protective_exits(
+                    current_price=dip_price,
+                    timestamp=t0 + timedelta(minutes=idx + 1),
+                )
+                assert dip_res is None
+                assert engine.active_position is not None
+
+            for idx, sub_fee_sell_price in enumerate([2237.32, 2246.97, 2249.00]):
+                sell_sig = MarketSignal(
+                    symbol="ETHUSDT",
+                    evaluated_at=t0 + timedelta(minutes=10 + idx),
+                    signal_type=SignalType.SELL,
+                    reference_price=sub_fee_sell_price,
+                    stop_loss_price=2230.0,
+                    take_profit_price=2260.0,
+                    atr_value=8.5,
+                    rsi_value=62.0,
+                    fast_ema=2247.0,
+                    slow_ema=2246.5,
+                )
+                assert engine.process_signal(sell_sig) is None
+                assert engine.active_position is not None
+
+            target_price = pos.take_profit_price
+            win_exec = engine.evaluate_protective_exits(
+                current_price=target_price,
+                timestamp=t0 + timedelta(minutes=20),
+            )
+            assert win_exec is not None
+            assert win_exec.side == OrderSide.SELL
+            assert win_exec.execution_price > buy_exec.execution_price
+            assert win_exec.realized_pnl_usdt >= 0.01
+            assert engine.available_cash_usdt >= round(initial_cash + 0.01, 4)
+            assert engine.active_position is None
+        finally:
+            ledger.close()
+
+
+def test_spot_no_loss_upgrades_resumed_position_and_blocks_top_chasing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify resumed positions upgrade floor >= entry and high-RSI buys are blocked."""
+    from crypto_paper_trader.config import UniverseConfig
+    from crypto_paper_trader.domain import Position
+
+    assert "BNBUSDT" not in UniverseConfig().all_symbols
+    assert "LTCUSDT" in UniverseConfig().core_symbols
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_upgrade_no_loss.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            t0 = datetime(2026, 11, 7, 10, 0, tzinfo=timezone.utc)
+            legacy_pos = Position(
+                position_id="pos-legacy-1",
+                symbol="SOLUSDT",
+                opened_at=t0,
+                entry_price=100.00,
+                quantity=0.28,
+                notional_usdt=28.00,
+                entry_fee_usdt=0.028,
+                stop_loss_price=99.50,
+                take_profit_price=100.80,
+                peak_price=100.00,
+            )
+            ledger.save_open_position(legacy_pos)
+
+            config = TradingSystemConfig(
+                exchange=ExchangeConfig(symbol="SOLUSDT", taker_fee_rate=0.001),
+                risk=RiskConfig.spot_no_loss_micro_profit(),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            resumed = engine.active_position
+            assert resumed is not None
+            assert resumed.stop_loss_price > 100.00
+
+            engine._active_position = None
+            ledger.clear_open_position()
+
+            provider = BinanceMarketDataClient(config=config.exchange)
+            orchestrator = RealTimeTradingOrchestrator(
+                config=replace(
+                    config,
+                    risk=replace(config.risk, enable_time_machine_gate=False),
+                ),
+                market_data_provider=provider,
+                trading_engine=engine,
+            )
+            candles = build_synthetic_candles(count=35, start_price=100.0, step=0.1)
+            for c in candles[:-1]:
+                orchestrator._upsert_candle(c)
+
+            high_rsi_buy = MarketSignal(
+                symbol="SOLUSDT",
+                evaluated_at=candles[-1].close_time,
+                signal_type=SignalType.BUY,
+                reference_price=103.40,
+                stop_loss_price=102.88,
+                take_profit_price=104.20,
+                atr_value=0.40,
+                rsi_value=53.5,
+                fast_ema=103.35,
+                slow_ema=103.10,
+            )
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda **kwargs: high_rsi_buy,
+            )
+            suppressed = orchestrator.process_candle_event(candles[-1])
+            assert suppressed.signal.signal_type == SignalType.HOLD
+            assert engine.active_position is None
+        finally:
+            ledger.close()
+
+
+def test_spot_no_loss_backtest_and_time_machine_record_zero_losing_sales() -> None:
+    """Verify backtest and Time Machine under no-loss Spot mode record zero losses."""
+    from crypto_paper_trader.simulation import run_time_machine_simulation
+
+    candles = build_synthetic_candles(count=70, start_price=100.0, step=0.20)
+    config = TradingSystemConfig(
+        risk=RiskConfig.spot_no_loss_micro_profit(),
+    )
+    report = run_historical_backtest(candles=candles, config=config)
+    assert report.losing_trades == 0
+    for exec_item in report.executions:
+        if exec_item.side == OrderSide.SELL:
+            assert exec_item.realized_pnl_usdt >= 0.01
+
+    signal = MarketSignal(
+        symbol="SOLUSDT",
+        evaluated_at=candles[-1].close_time,
+        signal_type=SignalType.BUY,
+        reference_price=candles[-1].close_price,
+        stop_loss_price=candles[-1].close_price * 0.995,
+        take_profit_price=candles[-1].close_price * 1.008,
+        atr_value=0.60,
+        rsi_value=45.0,
+        fast_ema=candles[-1].close_price + 0.1,
+        slow_ema=candles[-1].close_price - 0.1,
+    )
+    tm_res = run_time_machine_simulation(
+        candles=candles,
+        signal=signal,
+        risk_config=config.risk,
+        exchange_config=config.exchange,
+        replays_count=5_000,
+    )
+    assert tm_res.replays_count == 5_000
+    assert 0.0 <= tm_res.win_probability_pct <= 100.0

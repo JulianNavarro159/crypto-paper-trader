@@ -1,12 +1,12 @@
 # Crypto Paper & Live Trader Workspace Rules
 
-## 1. Fee-Covered Net Profit Invariants
+## 1. Fee-Covered Net Profit & Zero-Below-Entry Spot Invariants
 - Round-trip Spot taker fees on Binance without BNB discount equal `0.20%` (`0.10%` entry + `0.10%` exit).
-- Never configure a profit-lock floor (`breakeven_floor`) or signal-reversal exit threshold (`min_signal_exit_profit_ratio`) below the round-trip fee threshold when locking positive gains. Any locked profit exit must guarantee positive net PnL in USDT after deducting both entry and exit commissions.
-- Maintain a multi-tier protective trailing stop in `PaperTradingEngine.evaluate_protective_exits`:
-  - Cut downside risk early once unrealized gain reaches `+0.14%`.
-  - Lock guaranteed net profit (`>= +0.21%` gross floor with `0.02%` hair-trigger trail) once unrealized gain reaches `+0.22%`.
-  - Execute partial take-profit (`TP1`) at `+0.32%` and trail the remaining runner tightly.
+- In production Spot execution (`RiskConfig.spot_no_loss_micro_profit()`, `no_loss_spot_mode=True`):
+  - **Never sell below purchase price:** `stop_loss_price` (`Piso de seguridad`) must strictly satisfy `stop_loss_price >= entry_price` and cover round-trip commissions plus `min_target_net_profit_usdt` (`0.01 USDT`). Temporary 1x Spot drawdowns are held safely in Spot (zero leverage, zero liquidation risk) rather than realizing losses below `entry_price`.
+  - **Immediate micro-profit capture (`>= +0.01 USDT` net):** Execute a full `100%` position exit as soon as price clears round-trip fees, `+0.01 USDT` net gain, and the live bid-ask spread cushion (`compute_no_loss_exit_levels`).
+  - **Preserve BNB fee reserve:** Keep `BNBUSDT` out of `UniverseConfig` so the account's `BNB` balance remains dedicated to `0.075%` fee discounts without `0.001 BNB` lot-size truncation.
+- When `no_loss_spot_mode=False` (legacy/backtest stop-loss mode), maintain the multi-tier protective trailing stop in `PaperTradingEngine.evaluate_protective_exits` so locked profit exits always exceed round-trip fees.
 
 ## 2. Anti-Overbought & Tick-Precision Entry Guardrails
 - Always enforce `buy_mask = raw_buy_mask & (~sell_mask)` in `enrich_with_indicators` so a BUY signal can never fire on a candle where any SELL or overbought condition is active.
