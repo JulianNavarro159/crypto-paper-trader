@@ -66,6 +66,7 @@ class RealTimeTradingOrchestrator:
         self._last_logged_signal: SignalType | None = None
         self._macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
         self._cooldown_until_ts: float = 0.0
+        self._qualified_symbols: set[str] = set()
 
     def set_macro_regime(self, regime: MacroMarketRegime) -> None:
         """Update the active macro market regime classification.
@@ -74,6 +75,14 @@ class RealTimeTradingOrchestrator:
             regime: MacroMarketRegime indicating overall market bias.
         """
         self._macro_regime = regime
+
+    def set_qualified_symbols(self, symbols: set[str]) -> None:
+        """Restrict multi-symbol BUY entries to top-ranked universe symbols.
+
+        Args:
+            symbols: Set of uppercase symbol identifiers approved by the scanner.
+        """
+        self._qualified_symbols = {sym.upper() for sym in symbols}
 
     def _upsert_candle(self, candle: Candle) -> list[Candle]:
         """Insert or update a candle in the rolling window by open_time epoch.
@@ -297,6 +306,20 @@ class RealTimeTradingOrchestrator:
 
         if (
             signal.signal_type == SignalType.BUY
+            and self._multi_symbol_mode
+            and self._qualified_symbols
+            and target_symbol not in self._qualified_symbols
+        ):
+            logger.info(
+                "Suppressed BUY signal on %s: symbol not in top qualified "
+                "universe ranking %s.",
+                signal.symbol,
+                sorted(self._qualified_symbols),
+            )
+            signal = replace(signal, signal_type=SignalType.HOLD)
+
+        if (
+            signal.signal_type == SignalType.BUY
             and self._config.risk.no_loss_spot_mode
             and signal.rsi_value > 54.5
         ):
@@ -305,6 +328,22 @@ class RealTimeTradingOrchestrator:
                 "RSI=%.2f exceeds pullback ceiling 54.5.",
                 signal.symbol,
                 signal.rsi_value,
+            )
+            signal = replace(signal, signal_type=SignalType.HOLD)
+
+        if (
+            signal.signal_type == SignalType.BUY
+            and self._config.risk.no_loss_spot_mode
+            and len(rolling_candles) >= 3
+            and signal.fast_ema < signal.slow_ema
+            and candle.low_price < rolling_candles[-2].low_price
+            and candle.close_price <= rolling_candles[-2].high_price
+            and signal.rsi_value > 33.0
+        ):
+            logger.info(
+                "Suppressed BUY signal on %s in no-loss spot mode: "
+                "unconfirmed lower-low structure while fast_ema < slow_ema.",
+                signal.symbol,
             )
             signal = replace(signal, signal_type=SignalType.HOLD)
 

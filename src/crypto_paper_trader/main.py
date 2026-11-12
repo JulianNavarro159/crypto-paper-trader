@@ -47,6 +47,7 @@ from crypto_paper_trader.scanner import (
     evaluate_universe_projection,
     fetch_universe_candles,
     run_multi_asset_rotation_backtest,
+    select_qualified_universe_symbols,
 )
 from crypto_paper_trader.strategy import evaluate_macro_regime
 
@@ -488,6 +489,7 @@ async def run_application(args: argparse.Namespace) -> None:
 
     active_macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
     initial_universe_candles: dict[str, list[Candle]] = {}
+    initial_qualified_symbols: set[str] = set()
 
     if existing_open_pos is not None:
         config = replace(
@@ -514,6 +516,7 @@ async def run_application(args: argparse.Namespace) -> None:
                 config=config,
             )
             log_universe_ranking(rankings)
+            initial_qualified_symbols = select_qualified_universe_symbols(rankings)
             if rankings and existing_open_pos is None:
                 best_symbol = rankings[0].symbol
                 config = replace(
@@ -569,6 +572,8 @@ async def run_application(args: argparse.Namespace) -> None:
         live_client=live_client,
         multi_symbol_mode=use_multi_radar,
     )
+    if initial_qualified_symbols:
+        orchestrator.set_qualified_symbols(initial_qualified_symbols)
     if use_multi_radar:
         for sym_candles in initial_universe_candles.values():
             for seed_candle in sym_candles:
@@ -647,6 +652,9 @@ async def run_application(args: argparse.Namespace) -> None:
                         config=config,
                     )
                     log_universe_ranking(rankings)
+                    orchestrator.set_qualified_symbols(
+                        select_qualified_universe_symbols(rankings)
+                    )
                     for sym_candles in universe_candles.values():
                         for seed_candle in sym_candles:
                             orchestrator._upsert_candle(seed_candle)

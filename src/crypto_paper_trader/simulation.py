@@ -90,7 +90,20 @@ def run_time_machine_simulation(
     lower_wicks = np.clip((body_bot - lows) / np.maximum(closes, 1e-12), 0.0, sigma)
 
     ema_spread = (signal.fast_ema - signal.slow_ema) / entry_price
-    if signal.rsi_value <= 48.0:
+    drift_lookback = min(4, len(closes) - 1)
+    short_drift = (closes[-1] - closes[-1 - drift_lookback]) / max(
+        closes[-1 - drift_lookback], 1e-12
+    )
+    has_higher_low = bool(lows[-1] >= lows[-2] or closes[-1] > highs[-2])
+
+    if (
+        signal.fast_ema < signal.slow_ema
+        and short_drift < -0.0025
+        and not has_higher_low
+        and signal.rsi_value > 33.0
+    ):
+        mu_cond = min(ema_spread * 0.35, -sigma * 0.20)
+    elif signal.rsi_value <= 48.0:
         rebound_impulse = ((50.0 - signal.rsi_value) / 100.0) * sigma * 0.45
         mu_cond = max(rebound_impulse, sigma * 0.14)
     elif signal.fast_ema >= signal.slow_ema and signal.rsi_value <= 61.5:
@@ -126,7 +139,7 @@ def run_time_machine_simulation(
     if risk_config.no_loss_spot_mode:
         micro_tp_ratio = round_trip_fee + 0.0007
         micro_tp_price = entry_price * (1.0 + micro_tp_ratio)
-        adverse_dip_price = entry_price * 0.9920
+        adverse_dip_price = entry_price * 0.9950
         sentinel = horizon_candles + 1
         tp_mask = high_paths >= micro_tp_price
         dip_mask = low_paths <= adverse_dip_price
@@ -154,7 +167,11 @@ def run_time_machine_simulation(
         target_prob = round(float(np.mean(clean_micro_win) * 100.0), 2)
         stop_prob = round(float(np.mean(~hit_any_win) * 100.0), 2)
         expected_ret = round(float(np.mean(net_returns) * 100.0), 4)
-        approved = bool(win_prob >= min_win_probability_pct and expected_ret > 0.0)
+        approved = bool(
+            win_prob >= min_win_probability_pct
+            and target_prob >= 45.0
+            and expected_ret > 0.0
+        )
         base_alloc = risk_config.position_allocation_fraction
         if not approved:
             rec_alloc = 0.0

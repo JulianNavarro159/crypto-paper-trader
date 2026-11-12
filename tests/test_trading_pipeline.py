@@ -1981,3 +1981,131 @@ def test_spot_no_loss_backtest_and_time_machine_record_zero_losing_sales() -> No
     assert tm_res.approved is True
     assert tm_res.win_probability_pct >= 55.0
     assert tm_res.expected_net_return_pct > 0.0
+
+
+def test_sniper_anti_dip_and_qualified_universe_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify universe qualification gate and anti-dip lower-low filter block traps."""
+    from crypto_paper_trader.scanner import (
+        AssetProjectionScore,
+        select_qualified_universe_symbols,
+    )
+    from crypto_paper_trader.simulation import run_time_machine_simulation
+
+    scores = [
+        AssetProjectionScore(
+            symbol="SOLUSDT",
+            category="STABLE_CORE",
+            current_price=83.22,
+            atr_volatility_pct=0.45,
+            historical_return_pct=0.39,
+            win_rate_pct=100.0,
+            profit_factor=99.99,
+            closed_trades=3,
+            composite_score=76.48,
+        ),
+        AssetProjectionScore(
+            symbol="AVAXUSDT",
+            category="HIGH_VOLATILITY",
+            current_price=8.60,
+            atr_volatility_pct=0.52,
+            historical_return_pct=0.25,
+            win_rate_pct=100.0,
+            profit_factor=99.99,
+            closed_trades=2,
+            composite_score=62.10,
+        ),
+        AssetProjectionScore(
+            symbol="ADAUSDT",
+            category="HIGH_VOLATILITY",
+            current_price=0.1736,
+            atr_volatility_pct=0.30,
+            historical_return_pct=-0.45,
+            win_rate_pct=0.0,
+            profit_factor=0.0,
+            closed_trades=0,
+            composite_score=-12.82,
+        ),
+    ]
+    qualified = select_qualified_universe_symbols(scores, max_symbols=5)
+    assert qualified == {"SOLUSDT", "AVAXUSDT"}
+
+    falling_candles = build_synthetic_candles(
+        count=40, start_price=100.0, step=-0.35
+    )
+    falling_signal = MarketSignal(
+        symbol="ADAUSDT",
+        evaluated_at=falling_candles[-1].close_time,
+        signal_type=SignalType.BUY,
+        reference_price=falling_candles[-1].close_price,
+        stop_loss_price=falling_candles[-1].close_price * 0.995,
+        take_profit_price=falling_candles[-1].close_price * 1.008,
+        atr_value=0.45,
+        rsi_value=42.0,
+        fast_ema=falling_candles[-1].close_price - 0.1,
+        slow_ema=falling_candles[-1].close_price + 0.5,
+    )
+    tm_falling = run_time_machine_simulation(
+        candles=falling_candles,
+        signal=falling_signal,
+        risk_config=RiskConfig.spot_no_loss_micro_profit(),
+        exchange_config=ExchangeConfig(),
+        replays_count=5_000,
+    )
+    assert tm_falling.approved is False
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_sniper_filter.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            config = TradingSystemConfig(
+                exchange=ExchangeConfig(symbol="SOLUSDT"),
+                risk=replace(
+                    RiskConfig.spot_no_loss_micro_profit(),
+                    enable_time_machine_gate=False,
+                ),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            provider = BinanceMarketDataClient(config=config.exchange)
+            orchestrator = RealTimeTradingOrchestrator(
+                config=config,
+                market_data_provider=provider,
+                trading_engine=engine,
+                multi_symbol_mode=True,
+            )
+            orchestrator.set_qualified_symbols(qualified)
+
+            ada_candles = [
+                replace(c, symbol="ADAUSDT")
+                for c in build_synthetic_candles(count=35, start_price=1.0, step=0.01)
+            ]
+            for c in ada_candles[:-1]:
+                orchestrator._upsert_candle(c)
+
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda **kwargs: MarketSignal(
+                    symbol="ADAUSDT",
+                    evaluated_at=ada_candles[-1].close_time,
+                    signal_type=SignalType.BUY,
+                    reference_price=ada_candles[-1].close_price,
+                    stop_loss_price=ada_candles[-1].close_price * 0.995,
+                    take_profit_price=ada_candles[-1].close_price * 1.008,
+                    atr_value=0.01,
+                    rsi_value=44.0,
+                    fast_ema=ada_candles[-1].close_price,
+                    slow_ema=ada_candles[-1].close_price * 0.999,
+                ),
+            )
+            res_unqualified = orchestrator.process_candle_event(ada_candles[-1])
+            assert res_unqualified.signal.signal_type == SignalType.HOLD
+            assert engine.active_position is None
+        finally:
+            ledger.close()

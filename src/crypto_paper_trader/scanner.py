@@ -140,6 +140,21 @@ def evaluate_universe_projection(
             else 0.0
         )
         overbought_penalty = 12.0 if latest_signal.rsi_value > 55.0 else 0.0
+        lookback_idx = max(0, len(candles) - 12)
+        recent_return_pct = (
+            (latest_candle.close_price - candles[lookback_idx].close_price)
+            / max(candles[lookback_idx].close_price, 1e-12)
+        ) * 100.0
+        momentum_bonus = round(max(-8.0, min(10.0, recent_return_pct * 3.5)), 3)
+        trend_alignment_bonus = (
+            4.0
+            if (
+                latest_signal.fast_ema >= latest_signal.slow_ema
+                and 34.0 <= latest_signal.rsi_value <= 53.5
+            )
+            else 0.0
+        )
+
         tm_report = run_time_machine_simulation(
             candles=candles,
             signal=latest_signal,
@@ -155,6 +170,8 @@ def evaluate_universe_projection(
             + (report.win_rate_pct * 0.20)
             + (atr_pct * 6.0)
             + tm_bonus
+            + momentum_bonus
+            + trend_alignment_bonus
             - downtrend_penalty
             - overbought_penalty,
             3,
@@ -175,6 +192,31 @@ def evaluate_universe_projection(
         )
 
     return sorted(scores, key=lambda item: item.composite_score, reverse=True)
+
+
+def select_qualified_universe_symbols(
+    rankings: Sequence[AssetProjectionScore],
+    max_symbols: int = 5,
+) -> set[str]:
+    """Select the top-ranked universe symbols with positive composite scores.
+
+    Args:
+        rankings: Sorted sequence of AssetProjectionScore objects.
+        max_symbols: Maximum number of top-ranked symbols to permit for entry.
+
+    Returns:
+        Set of uppercase symbol strings qualified for multi-symbol BUY entries.
+    """
+    if not rankings:
+        return set()
+    positive_top = {
+        item.symbol.upper()
+        for item in rankings[:max_symbols]
+        if item.composite_score > 0.0
+    }
+    if positive_top:
+        return positive_top
+    return {rankings[0].symbol.upper()}
 
 
 def run_multi_asset_rotation_backtest(

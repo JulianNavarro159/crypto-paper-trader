@@ -190,6 +190,13 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         & (enriched["rsi"] <= 54.0)
     )
 
+    higher_low_or_breakout = (enriched["low_price"] >= prev_low) | (
+        enriched["close_price"] > enriched["high_price"].shift(1)
+    )
+    stabilizing_fast_ema = enriched["fast_ema"] >= (
+        enriched["fast_ema"].shift(1) * 0.9996
+    )
+
     micro_dip_rebound = (
         (prev_low <= enriched["bb_lower"].shift(1) * 1.003)
         & (prev_rsi <= 38.0)
@@ -197,6 +204,7 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         & (enriched["rsi"] <= 52.0)
         & (enriched["close_price"] > enriched["open_price"])
         & (enriched["close_price"] > enriched["close_price"].shift(1))
+        & higher_low_or_breakout
         & (
             (enriched["close_price"] - enriched["open_price"])
             >= (enriched["atr"] * 0.12)
@@ -219,6 +227,8 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         & (enriched["close_price"] <= enriched["bb_mid"] * 1.001)
         & (enriched["close_price"] > enriched["open_price"])
         & (enriched["close_price"] >= enriched["close_price"].shift(1))
+        & higher_low_or_breakout
+        & stabilizing_fast_ema
         & (enriched["rsi"] >= 30.0)
         & (enriched["rsi"] <= 50.0)
         & (enriched["rsi"] > prev_rsi)
