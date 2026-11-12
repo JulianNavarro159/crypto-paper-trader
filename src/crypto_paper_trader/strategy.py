@@ -211,6 +211,19 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         & (enriched["rsi"] <= 53.0)
     )
 
+    bollinger_support_bounce = (
+        (
+            (enriched["low_price"] <= enriched["bb_lower"] * 1.006)
+            | (prev_low <= enriched["bb_lower"].shift(1) * 1.006)
+        )
+        & (enriched["close_price"] <= enriched["bb_mid"] * 1.001)
+        & (enriched["close_price"] > enriched["open_price"])
+        & (enriched["close_price"] >= enriched["close_price"].shift(1))
+        & (enriched["rsi"] >= 30.0)
+        & (enriched["rsi"] <= 50.0)
+        & (enriched["rsi"] > prev_rsi)
+    )
+
     rolling_range_high = (
         enriched["high_price"].shift(1).rolling(window=6, min_periods=3).max()
     )
@@ -250,6 +263,7 @@ def enrich_with_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.Da
         | trend_momentum_breakout
         | micro_dip_rebound
         | ema_recovery
+        | bollinger_support_bounce
         | opening_range_breakout
     )
     buy_mask = raw_buy_mask & (~sell_mask)

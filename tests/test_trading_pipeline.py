@@ -1911,22 +1911,27 @@ def test_spot_no_loss_upgrades_resumed_position_and_blocks_top_chasing(
                 ),
                 market_data_provider=provider,
                 trading_engine=engine,
+                multi_symbol_mode=True,
             )
-            candles = build_synthetic_candles(count=35, start_price=100.0, step=0.1)
+            candles = build_synthetic_candles(count=65, start_price=100.0, step=0.1)
             for c in candles[:-1]:
                 orchestrator._upsert_candle(c)
+
+            buffered_map = orchestrator.get_buffered_universe_candles(min_candles=60)
+            assert "SOLUSDT" in buffered_map
+            assert len(buffered_map["SOLUSDT"]) >= 60
 
             high_rsi_buy = MarketSignal(
                 symbol="SOLUSDT",
                 evaluated_at=candles[-1].close_time,
                 signal_type=SignalType.BUY,
-                reference_price=103.40,
-                stop_loss_price=102.88,
-                take_profit_price=104.20,
+                reference_price=106.40,
+                stop_loss_price=105.88,
+                take_profit_price=107.20,
                 atr_value=0.40,
-                rsi_value=53.5,
-                fast_ema=103.35,
-                slow_ema=103.10,
+                rsi_value=56.0,
+                fast_ema=106.35,
+                slow_ema=106.10,
             )
             monkeypatch.setattr(
                 "crypto_paper_trader.orchestration.evaluate_market_signal",
@@ -1973,4 +1978,6 @@ def test_spot_no_loss_backtest_and_time_machine_record_zero_losing_sales() -> No
         replays_count=5_000,
     )
     assert tm_res.replays_count == 5_000
-    assert 0.0 <= tm_res.win_probability_pct <= 100.0
+    assert tm_res.approved is True
+    assert tm_res.win_probability_pct >= 55.0
+    assert tm_res.expected_net_return_pct > 0.0

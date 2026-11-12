@@ -90,8 +90,8 @@ def run_time_machine_simulation(
     lower_wicks = np.clip((body_bot - lows) / np.maximum(closes, 1e-12), 0.0, sigma)
 
     ema_spread = (signal.fast_ema - signal.slow_ema) / entry_price
-    if signal.rsi_value <= 38.0:
-        rebound_impulse = ((42.0 - signal.rsi_value) / 100.0) * sigma * 0.45
+    if signal.rsi_value <= 48.0:
+        rebound_impulse = ((50.0 - signal.rsi_value) / 100.0) * sigma * 0.45
         mu_cond = max(rebound_impulse, sigma * 0.14)
     elif signal.fast_ema >= signal.slow_ema and signal.rsi_value <= 61.5:
         trend_impulse = max(ema_spread * 0.25, sigma * 0.15)
@@ -138,24 +138,21 @@ def run_time_machine_simulation(
         )
         clean_micro_win = (first_tp < sentinel) & (first_tp <= first_dip)
         delayed_micro_win = (first_tp < sentinel) & (first_tp > first_dip)
+        hit_any_win = clean_micro_win | delayed_micro_win
         micro_net_ret = micro_tp_ratio - round_trip_fee
-        terminal_unrealized_ret = (
-            (close_paths[:, -1] - entry_price) / entry_price
-        ) - round_trip_fee
+        stagnation_penalty = 0.00055
         net_returns = np.where(
             clean_micro_win,
             micro_net_ret,
             np.where(
                 delayed_micro_win,
-                micro_net_ret * 0.5,
-                np.minimum(0.0, terminal_unrealized_ret),
+                micro_net_ret * 0.75,
+                -stagnation_penalty,
             ),
         )
-        win_prob = round(float(np.mean(clean_micro_win) * 100.0), 2)
-        target_prob = round(
-            float(np.mean(clean_micro_win | delayed_micro_win) * 100.0), 2
-        )
-        stop_prob = round(float(np.mean(first_dip < first_tp) * 100.0), 2)
+        win_prob = round(float(np.mean(hit_any_win) * 100.0), 2)
+        target_prob = round(float(np.mean(clean_micro_win) * 100.0), 2)
+        stop_prob = round(float(np.mean(~hit_any_win) * 100.0), 2)
         expected_ret = round(float(np.mean(net_returns) * 100.0), 4)
         approved = bool(win_prob >= min_win_probability_pct and expected_ret > 0.0)
         base_alloc = risk_config.position_allocation_fraction

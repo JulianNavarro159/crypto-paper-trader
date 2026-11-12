@@ -129,8 +129,8 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     parser.add_argument(
         "--rescan-hours",
         type=float,
-        default=1.0,
-        help="Hours between universe rescans in auto-select mode (default: 1.0)",
+        default=0.25,
+        help="Hours between universe rescans in auto-select mode (default: 0.25)",
     )
     parser.add_argument(
         "--db-path",
@@ -584,7 +584,7 @@ async def run_application(args: argparse.Namespace) -> None:
                 await orchestrator.run_realtime_session(max_ws_events=args.max_events)
                 return
 
-            rescan_seconds = max(args.rescan_hours * 3600.0, 300.0)
+            rescan_seconds = max(args.rescan_hours * 3600.0, 180.0)
             try:
                 await asyncio.wait_for(
                     orchestrator.run_realtime_session(max_ws_events=None),
@@ -606,23 +606,28 @@ async def run_application(args: argparse.Namespace) -> None:
                     )
                     continue
 
-                if BinanceMarketDataClient.is_cooldown_active():
-                    logger.info(
-                        "Skipping universe rescan: Binance 418 cooldown active; "
-                        "continuing with current symbol %s.",
-                        config.exchange.symbol,
-                    )
-                    continue
-
                 logger.info(
-                    "Running scheduled %.1fh universe projection rescan...",
+                    "Running scheduled %.2fh universe projection rescan...",
                     args.rescan_hours,
                 )
                 try:
-                    universe_candles = await fetch_universe_candles(
-                        config=config,
-                        candle_count=args.backtest_candles,
+                    buffered_universe = orchestrator.get_buffered_universe_candles(
+                        min_candles=60
                     )
+                    if len(buffered_universe) >= len(config.universe.all_symbols):
+                        universe_candles = buffered_universe
+                    elif BinanceMarketDataClient.is_cooldown_active():
+                        logger.info(
+                            "Skipping REST universe rescan: Binance 418 cooldown "
+                            "active; using %d buffered symbols.",
+                            len(buffered_universe),
+                        )
+                        universe_candles = buffered_universe
+                    else:
+                        universe_candles = await fetch_universe_candles(
+                            config=config,
+                            candle_count=args.backtest_candles,
+                        )
                     if not universe_candles:
                         logger.info(
                             "Universe candles unavailable; keeping current symbol %s.",

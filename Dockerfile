@@ -7,4 +7,4 @@ COPY src ./src
 
 RUN pip install --no-cache-dir .
 
-CMD ["python", "-m", "crypto_paper_trader.main", "--mode", "live", "--auto-select", "--interval", "15m", "--rescan-hours", "1.0"]
+CMD ["python", "-m", "crypto_paper_trader.main", "--mode", "live", "--auto-select", "--interval", "15m", "--rescan-hours", "0.25"]

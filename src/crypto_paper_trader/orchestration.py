@@ -106,6 +106,24 @@ class RealTimeTradingOrchestrator:
 
         return [self._candle_buffer[key] for key in sorted(self._candle_buffer.keys())]
 
+    def get_buffered_universe_candles(
+        self,
+        min_candles: int = 60,
+    ) -> dict[str, list[Candle]]:
+        """Return in-memory rolling candle windows for symbols with enough history.
+
+        Args:
+            min_candles: Minimum number of buffered candles required per symbol.
+
+        Returns:
+            Mapping from uppercase symbol to its chronological list of Candles.
+        """
+        buffered: dict[str, list[Candle]] = {}
+        for sym_key, sym_buf in self._buffers_by_symbol.items():
+            if len(sym_buf) >= min_candles:
+                buffered[sym_key] = [sym_buf[k] for k in sorted(sym_buf.keys())]
+        return buffered
+
     async def bootstrap_market_history(self) -> list[Candle]:
         """Load initial historical candles into the rolling memory buffer.
 
@@ -280,11 +298,11 @@ class RealTimeTradingOrchestrator:
         if (
             signal.signal_type == SignalType.BUY
             and self._config.risk.no_loss_spot_mode
-            and signal.rsi_value > 51.5
+            and signal.rsi_value > 54.5
         ):
             logger.info(
                 "Suppressed BUY signal on %s in no-loss spot mode: "
-                "RSI=%.2f exceeds pullback ceiling 51.5.",
+                "RSI=%.2f exceeds pullback ceiling 54.5.",
                 signal.symbol,
                 signal.rsi_value,
             )
