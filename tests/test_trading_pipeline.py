@@ -2411,3 +2411,71 @@ def test_partial_unlock_and_tranche_allocation_preserves_liquidity() -> None:
             assert has_partial is True
         finally:
             ledger.close()
+
+
+def test_qualified_altcoin_rotation_operates_when_btc_macro_is_bearish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify qualified altcoin rebound trades proceed during BEARISH BTC regime."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_bearish_rotation.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            config = TradingSystemConfig(
+                capital=CapitalConfig(
+                    initial_capital_cop=51_600.0,
+                    cop_per_usdt_rate=3_194.0,
+                ),
+                exchange=ExchangeConfig(symbol="XRPUSDT"),
+                risk=replace(
+                    RiskConfig.spot_no_loss_trailing_runner(btc_unlock_mode="NONE"),
+                    enable_time_machine_gate=False,
+                ),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            provider = BinanceMarketDataClient(
+                config=config.exchange,
+                symbols=("BTCUSDT", "XRPUSDT", "LTCUSDT"),
+            )
+            orchestrator = RealTimeTradingOrchestrator(
+                config=config,
+                market_data_provider=provider,
+                trading_engine=engine,
+                multi_symbol_mode=True,
+            )
+            orchestrator.set_macro_regime(MacroMarketRegime.BEARISH)
+            orchestrator.set_qualified_symbols({"XRPUSDT", "AVAXUSDT"})
+
+            xrp_candles = [
+                replace(c, symbol="XRPUSDT")
+                for c in build_synthetic_candles(count=35, start_price=0.95, step=0.001)
+            ]
+            for c in xrp_candles[:-1]:
+                orchestrator._upsert_candle(c)
+
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda **kwargs: MarketSignal(
+                    symbol="XRPUSDT",
+                    evaluated_at=xrp_candles[-1].close_time,
+                    signal_type=SignalType.BUY,
+                    reference_price=xrp_candles[-1].close_price,
+                    stop_loss_price=xrp_candles[-1].close_price * 0.995,
+                    take_profit_price=xrp_candles[-1].close_price * 1.008,
+                    atr_value=0.005,
+                    rsi_value=49.5,
+                    fast_ema=xrp_candles[-1].close_price * 0.999,
+                    slow_ema=xrp_candles[-1].close_price,
+                ),
+            )
+            res = orchestrator.process_candle_event(xrp_candles[-1])
+            assert res.signal.signal_type == SignalType.BUY
+            assert engine.has_position("XRPUSDT") is True
+        finally:
+            ledger.close()

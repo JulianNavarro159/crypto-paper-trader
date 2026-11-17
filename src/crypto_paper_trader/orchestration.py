@@ -307,12 +307,29 @@ class RealTimeTradingOrchestrator:
             is_oversold_dip = (
                 signal.rsi_value <= 32.0 and signal.fast_ema >= signal.slow_ema
             )
-            if is_oversold_dip:
+            is_qualified_decoupled_rotation = (
+                self._config.risk.no_loss_spot_mode
+                and self._config.risk.allow_secondary_symbol_slot
+                and target_symbol != "BTCUSDT"
+                and (
+                    not self._qualified_symbols
+                    or target_symbol in self._qualified_symbols
+                )
+                and candle.close_price > candle.open_price
+                and signal.fast_ema >= (signal.slow_ema * 0.9960)
+                and 30.0 <= signal.rsi_value <= 53.5
+            )
+            if is_oversold_dip or is_qualified_decoupled_rotation:
                 logger.info(
-                    "Permitted stabilized oversold dip rebound BUY on %s "
-                    "during BEARISH macro regime (RSI=%.1f fast_ema>=slow_ema).",
+                    "Permitted %s BUY on %s during BEARISH BTC regime "
+                    "(RSI=%.1f fast_ema=%s slow_ema=%s).",
+                    "qualified decoupled rotation"
+                    if is_qualified_decoupled_rotation
+                    else "stabilized oversold dip",
                     signal.symbol,
                     signal.rsi_value,
+                    format_price(signal.fast_ema),
+                    format_price(signal.slow_ema),
                 )
             else:
                 logger.info(
