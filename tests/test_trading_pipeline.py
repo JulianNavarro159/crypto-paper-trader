@@ -2109,3 +2109,305 @@ def test_sniper_anti_dip_and_qualified_universe_filtering(
             assert engine.active_position is None
         finally:
             ledger.close()
+
+
+def test_no_loss_trailing_runner_captures_extended_gains_above_safety_floor() -> None:
+    """Verify No-Loss Trailing Runner lets strong surges run above fee floor."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_trailing_runner.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            config = TradingSystemConfig(
+                exchange=ExchangeConfig(symbol="SOLUSDT", taker_fee_rate=0.001),
+                risk=RiskConfig.spot_no_loss_trailing_runner(btc_unlock_mode="NONE"),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            t0 = datetime(2026, 11, 17, 10, 0, tzinfo=timezone.utc)
+            buy_signal = MarketSignal(
+                symbol="SOLUSDT",
+                evaluated_at=t0,
+                signal_type=SignalType.BUY,
+                reference_price=72.00,
+                stop_loss_price=71.50,
+                take_profit_price=72.60,
+                atr_value=0.35,
+                rsi_value=44.0,
+                fast_ema=72.05,
+                slow_ema=71.90,
+            )
+            buy_exec = engine.process_signal(buy_signal)
+            assert buy_exec is not None
+            pos = engine.get_open_position("SOLUSDT")
+            assert pos is not None
+            initial_cash = config.capital.initial_capital_usdt
+            assert 14.0 <= buy_exec.gross_notional_usdt <= 16.5
+            assert engine.available_cash_usdt >= 15.0
+
+            assert (
+                engine.evaluate_protective_exits(
+                    current_price=72.22,
+                    timestamp=t0 + timedelta(minutes=1),
+                    symbol="SOLUSDT",
+                )
+                is None
+            )
+            assert (
+                engine.evaluate_protective_exits(
+                    current_price=73.44,
+                    timestamp=t0 + timedelta(minutes=2),
+                    symbol="SOLUSDT",
+                )
+                is None
+            )
+            sell_exec = engine.evaluate_protective_exits(
+                current_price=73.15,
+                timestamp=t0 + timedelta(minutes=3),
+                symbol="SOLUSDT",
+            )
+            assert sell_exec is not None
+            assert sell_exec.reason == ExitReason.TRAILING_STOP.value
+            assert sell_exec.realized_pnl_usdt > 0.15
+            assert engine.available_cash_usdt > initial_cash
+            assert engine.get_open_position("SOLUSDT") is None
+        finally:
+            ledger.close()
+
+
+def test_dual_slot_parallel_altcoin_trading_while_btc_position_is_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify secondary altcoin slots trade concurrently while BTC awaits recovery."""
+    from crypto_paper_trader.domain import Position
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_dual_slot.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            t0 = datetime(2026, 11, 17, 10, 0, tzinfo=timezone.utc)
+            btc_pos = Position(
+                position_id="reconciled-btcusdt",
+                symbol="BTCUSDT",
+                opened_at=t0 - timedelta(days=5),
+                entry_price=73_852.00,
+                quantity=0.000190,
+                notional_usdt=14.03188,
+                entry_fee_usdt=0.014,
+                stop_loss_price=74_060.86,
+                take_profit_price=74_086.78,
+                peak_price=73_852.00,
+            )
+            ledger.save_open_position_for_symbol(btc_pos)
+
+            config = TradingSystemConfig(
+                capital=CapitalConfig(
+                    initial_capital_cop=96_400.0,
+                    cop_per_usdt_rate=3_194.0,
+                ),
+                exchange=ExchangeConfig(symbol="SOLUSDT"),
+                risk=replace(
+                    RiskConfig.spot_no_loss_trailing_runner(btc_unlock_mode="NONE"),
+                    enable_time_machine_gate=False,
+                ),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            assert engine.has_position("BTCUSDT") is True
+            assert engine.available_cash_usdt > 15.5
+            assert engine.can_open_position_for_symbol("SOLUSDT") is True
+
+            provider = BinanceMarketDataClient(
+                config=config.exchange,
+                symbols=("BTCUSDT", "SOLUSDT"),
+            )
+            orchestrator = RealTimeTradingOrchestrator(
+                config=config,
+                market_data_provider=provider,
+                trading_engine=engine,
+                multi_symbol_mode=True,
+            )
+            sol_candles = [
+                replace(c, symbol="SOLUSDT")
+                for c in build_synthetic_candles(count=35, start_price=70.0, step=0.08)
+            ]
+            for c in sol_candles[:-1]:
+                orchestrator._upsert_candle(c)
+
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda **kwargs: MarketSignal(
+                    symbol="SOLUSDT",
+                    evaluated_at=sol_candles[-1].close_time,
+                    signal_type=SignalType.BUY,
+                    reference_price=sol_candles[-1].close_price,
+                    stop_loss_price=sol_candles[-1].close_price * 0.995,
+                    take_profit_price=sol_candles[-1].close_price * 1.008,
+                    atr_value=0.35,
+                    rsi_value=45.0,
+                    fast_ema=sol_candles[-1].close_price,
+                    slow_ema=sol_candles[-1].close_price * 0.999,
+                ),
+            )
+            entry_res = orchestrator.process_candle_event(sol_candles[-1])
+            assert entry_res.signal.signal_type == SignalType.BUY
+            assert engine.has_position("BTCUSDT") is True
+            assert engine.has_position("SOLUSDT") is True
+
+            sol_surge = Candle(
+                symbol="SOLUSDT",
+                open_time=sol_candles[-1].open_time + timedelta(minutes=15),
+                close_time=sol_candles[-1].close_time + timedelta(minutes=15),
+                open_price=sol_candles[-1].close_price,
+                high_price=sol_candles[-1].close_price * 1.015,
+                low_price=sol_candles[-1].close_price,
+                close_price=sol_candles[-1].close_price * 1.015,
+                volume=500.0,
+                is_closed=False,
+            )
+            orchestrator.process_candle_event(sol_surge)
+
+            sol_pullback = Candle(
+                symbol="SOLUSDT",
+                open_time=sol_candles[-1].open_time + timedelta(minutes=16),
+                close_time=sol_candles[-1].close_time + timedelta(minutes=16),
+                open_price=sol_candles[-1].close_price * 1.015,
+                high_price=sol_candles[-1].close_price * 1.015,
+                low_price=sol_candles[-1].close_price * 1.010,
+                close_price=sol_candles[-1].close_price * 1.010,
+                volume=400.0,
+                is_closed=False,
+            )
+            orchestrator.process_candle_event(sol_pullback)
+            assert engine.has_position("SOLUSDT") is False
+            assert engine.has_position("BTCUSDT") is True
+            execs = ledger.fetch_all_executions()
+            assert execs[-1].symbol == "SOLUSDT"
+            assert execs[-1].realized_pnl_usdt > 0.04
+        finally:
+            ledger.close()
+
+
+def test_partial_unlock_and_tranche_allocation_preserves_liquidity() -> None:
+    """Verify idempotent 50% BTC unlock and post-partial Spot reconciliation."""
+    from crypto_paper_trader.domain import Position
+    from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_partial_unlock.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            t0 = datetime(2026, 11, 12, 3, 9, 35, tzinfo=timezone.utc)
+            btc_pos = Position(
+                position_id="reconciled-btcusdt",
+                symbol="BTCUSDT",
+                opened_at=t0,
+                entry_price=73_852.00,
+                quantity=0.000380,
+                notional_usdt=28.06376,
+                entry_fee_usdt=0.02806,
+                stop_loss_price=74_030.22,
+                take_profit_price=74_056.13,
+                peak_price=73_852.00,
+            )
+            ledger.save_open_position_for_symbol(btc_pos)
+
+            config = TradingSystemConfig(
+                capital=CapitalConfig(
+                    initial_capital_cop=102_270.0,
+                    cop_per_usdt_rate=3_194.0,
+                ),
+                exchange=ExchangeConfig(symbol="BTCUSDT"),
+                risk=RiskConfig.spot_no_loss_trailing_runner(
+                    btc_unlock_mode="PARTIAL_50"
+                ),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            unlock_exec = engine.execute_controlled_partial_unlock(
+                symbol="BTCUSDT",
+                fraction=0.50,
+                current_price=64_250.00,
+                timestamp=datetime(2026, 11, 17, 16, 15, tzinfo=timezone.utc),
+            )
+            assert unlock_exec is not None
+            assert unlock_exec.reason == "PARTIAL_UNLOCK"
+            assert unlock_exec.quantity == pytest.approx(0.000190, abs=1e-8)
+            assert engine.available_cash_usdt >= 16.0
+
+            duplicate_unlock = engine.execute_controlled_partial_unlock(
+                symbol="BTCUSDT",
+                fraction=0.50,
+                current_price=64_250.00,
+            )
+            assert duplicate_unlock is None
+
+            remaining_btc = engine.get_open_position("BTCUSDT")
+            assert remaining_btc is not None
+            assert remaining_btc.quantity == pytest.approx(0.000190, abs=1e-8)
+            assert remaining_btc.stop_loss_price > 73_852.00
+
+            client = BinanceSpotAuthenticatedClient(
+                config=ExchangeConfig(),
+                api_key="k",
+                api_secret="s",
+            )
+            client._step_size_cache["BTCUSDT"] = "0.00001000"
+
+            def fake_request(
+                method: str, path: str, params: dict[str, object]
+            ) -> dict[str, object]:
+                if path == "/api/v3/account":
+                    return {
+                        "balances": [
+                            {"asset": "USDT", "free": "16.1500"},
+                            {"asset": "BTC", "free": "0.00019961"},
+                        ]
+                    }
+                if path == "/api/v3/myTrades" and params.get("symbol") == "BTCUSDT":
+                    return {
+                        "result": [
+                            {
+                                "id": 1,
+                                "orderId": 100,
+                                "isBuyer": True,
+                                "qty": "0.00038000",
+                                "price": "73852.00",
+                                "time": 1000,
+                            },
+                            {
+                                "id": 2,
+                                "orderId": 200,
+                                "isBuyer": False,
+                                "qty": "0.00019000",
+                                "price": "64250.00",
+                                "time": 2000,
+                            },
+                        ]
+                    }
+                return {"result": []}
+
+            client._request_with_failover = fake_request
+            reconciled = client.fetch_active_spot_holdings(("BTCUSDT", "SOLUSDT"))
+            assert len(reconciled) == 1
+            sym, rem_qty, rem_entry, has_partial = reconciled[0]
+            assert sym == "BTCUSDT"
+            assert rem_qty == pytest.approx(0.000190, abs=1e-8)
+            assert rem_entry == pytest.approx(73_852.00, abs=1e-2)
+            assert has_partial is True
+        finally:
+            ledger.close()

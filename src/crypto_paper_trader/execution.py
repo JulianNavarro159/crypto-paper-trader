@@ -4,7 +4,7 @@ import hashlib
 import logging
 import sqlite3
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -307,6 +307,108 @@ class LedgerRepository:
             is_partially_closed=is_partially_closed,
         )
 
+    def save_open_position_for_symbol(self, position: Position) -> None:
+        """Persist or replace an open position scoped by symbol.
+
+        Args:
+            position: Open Position domain model to store.
+        """
+        connection = self._get_connection()
+        connection.execute(
+            "DELETE FROM open_positions WHERE UPPER(symbol) = UPPER(?)",
+            (position.symbol,),
+        )
+        connection.execute(
+            """
+            INSERT INTO open_positions (
+                position_id,
+                symbol,
+                opened_at,
+                entry_price,
+                quantity,
+                notional_usdt,
+                entry_fee_usdt,
+                stop_loss_price,
+                take_profit_price,
+                peak_price,
+                is_partially_closed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                position.position_id,
+                position.symbol,
+                position.opened_at.isoformat(),
+                position.entry_price,
+                position.quantity,
+                position.notional_usdt,
+                position.entry_fee_usdt,
+                position.stop_loss_price,
+                position.take_profit_price,
+                position.peak_price,
+                1 if position.is_partially_closed else 0,
+            ),
+        )
+        connection.commit()
+
+    def clear_open_position_for_symbol(self, symbol: str) -> None:
+        """Remove a persisted open position for a specific trading symbol.
+
+        Args:
+            symbol: Trading pair symbol whose position has closed.
+        """
+        connection = self._get_connection()
+        connection.execute(
+            "DELETE FROM open_positions WHERE UPPER(symbol) = UPPER(?)",
+            (symbol,),
+        )
+        connection.commit()
+
+    def fetch_all_open_positions(self) -> list[Position]:
+        """Retrieve all persisted active open positions sorted by open time.
+
+        Returns:
+            Chronological list of currently open Position records.
+        """
+        connection = self._get_connection()
+        cursor = connection.execute(
+            """
+            SELECT
+                position_id,
+                symbol,
+                opened_at,
+                entry_price,
+                quantity,
+                notional_usdt,
+                entry_fee_usdt,
+                stop_loss_price,
+                take_profit_price,
+                peak_price,
+                is_partially_closed
+            FROM open_positions
+            ORDER BY opened_at ASC
+            """
+        )
+        rows = cursor.fetchall()
+        positions: list[Position] = []
+        for row in rows:
+            is_partially_closed = bool(row[10]) if len(row) > 10 else False
+            positions.append(
+                Position(
+                    position_id=str(row[0]),
+                    symbol=str(row[1]),
+                    opened_at=datetime.fromisoformat(row[2]),
+                    entry_price=float(row[3]),
+                    quantity=float(row[4]),
+                    notional_usdt=float(row[5]),
+                    entry_fee_usdt=float(row[6]),
+                    stop_loss_price=float(row[7]),
+                    take_profit_price=float(row[8]),
+                    peak_price=float(row[9]),
+                    is_partially_closed=is_partially_closed,
+                )
+            )
+        return positions
+
     def record_execution(self, execution: TradeExecution) -> bool:
         """Persist a trade execution idempotently using client_order_id.
 
@@ -469,7 +571,15 @@ class PaperTradingEngine:
         self._executed_order_ids: set[str] = {
             e.client_order_id for e in past_execs
         }
-        self._active_position: Position | None = self._ledger.fetch_open_position()
+        self._dca_applied_position_ids: set[str] = {
+            e.position_id for e in past_execs if e.reason == "SMART_DCA"
+        }
+        loaded_positions = self._ledger.fetch_all_open_positions()
+        self._open_positions: dict[str, Position] = {
+            pos.symbol.upper(): pos for pos in loaded_positions
+        }
+        self._active_position: Position | None = None
+        self._sync_primary_active_position()
         known_live_usdt = (
             self._live_client.get_known_usdt_balance()
             if self._live_client is not None
@@ -478,45 +588,58 @@ class PaperTradingEngine:
         if known_live_usdt is not None:
             self._available_cash_usdt = known_live_usdt
         else:
-            self._available_cash_usdt = round(
-                capital_config.initial_capital_usdt + self._realized_pnl_usdt, 6
+            open_notional_total = sum(
+                pos.notional_usdt for pos in self._open_positions.values()
             )
-            if self._active_position is not None:
-                self._available_cash_usdt = round(
-                    max(
-                        0.0,
-                        self._available_cash_usdt - self._active_position.notional_usdt,
-                    ),
-                    6,
-                )
-        if self._active_position is not None:
+            self._available_cash_usdt = round(
+                max(
+                    0.0,
+                    capital_config.initial_capital_usdt
+                    + self._realized_pnl_usdt
+                    - open_notional_total,
+                ),
+                6,
+            )
+        for sym_key, pos in list(self._open_positions.items()):
             if self._risk_config.no_loss_spot_mode:
                 upgraded_sl, upgraded_tp = compute_no_loss_exit_levels(
-                    entry_price=self._active_position.entry_price,
-                    quantity=self._active_position.quantity,
-                    notional_usdt=self._active_position.notional_usdt,
+                    entry_price=pos.entry_price,
+                    quantity=pos.quantity,
+                    notional_usdt=pos.notional_usdt,
                     taker_fee_rate=self._exchange_config.taker_fee_rate,
                     min_target_net_profit_usdt=(
                         self._risk_config.min_target_net_profit_usdt
                     ),
                     include_live_spread_cushion=self._live_client is not None,
                 )
-                if self._active_position.stop_loss_price < upgraded_sl:
-                    self._active_position = replace(
-                        self._active_position,
+                if pos.stop_loss_price < upgraded_sl:
+                    pos = replace(
+                        pos,
                         stop_loss_price=upgraded_sl,
                         take_profit_price=upgraded_tp,
                     )
-                    self._ledger.save_open_position(self._active_position)
+                    self._open_positions[sym_key] = pos
+                    self._ledger.save_open_position_for_symbol(pos)
             logger.info(
                 "Resumed open position from ledger | symbol=%s entry=%s "
                 "qty=%s sl=%s tp=%s",
-                self._active_position.symbol,
-                format_price(self._active_position.entry_price),
-                format_quantity(self._active_position.quantity),
-                format_price(self._active_position.stop_loss_price),
-                format_price(self._active_position.take_profit_price),
+                pos.symbol,
+                format_price(pos.entry_price),
+                format_quantity(pos.quantity),
+                format_price(pos.stop_loss_price),
+                format_price(pos.take_profit_price),
             )
+        self._sync_primary_active_position()
+
+    def _sync_primary_active_position(self) -> None:
+        """Keep _active_position aligned with the primary open position."""
+        self._active_position = next(iter(self._open_positions.values()), None)
+
+    def _reconcile_external_clear(self) -> None:
+        """Synchronize internal position map if ledger open positions were cleared."""
+        if self._active_position is None and self._open_positions:
+            if not self._ledger.fetch_all_open_positions():
+                self._open_positions.clear()
 
     @property
     def no_loss_spot_mode(self) -> bool:
@@ -530,27 +653,121 @@ class PaperTradingEngine:
 
     @property
     def active_position(self) -> Position | None:
-        """Return currently open paper position or None."""
+        """Return currently open primary position or None."""
+        self._reconcile_external_clear()
         return self._active_position
+
+    @property
+    def active_positions(self) -> tuple[Position, ...]:
+        """Return all currently open positions across symbols."""
+        self._reconcile_external_clear()
+        return tuple(self._open_positions.values())
+
+    def has_any_position(self) -> bool:
+        """Return True when at least one open position exists."""
+        self._reconcile_external_clear()
+        return bool(self._open_positions)
+
+    def has_position(self, symbol: str) -> bool:
+        """Return True when an open position exists for the given symbol."""
+        self._reconcile_external_clear()
+        return symbol.upper() in self._open_positions
+
+    def get_open_position(self, symbol: str) -> Position | None:
+        """Return the open position for a specific symbol or None."""
+        self._reconcile_external_clear()
+        return self._open_positions.get(symbol.upper())
+
+    def can_open_position_for_symbol(self, symbol: str) -> bool:
+        """Return True if a new slot is available to open a position for symbol."""
+        self._reconcile_external_clear()
+        upper_sym = symbol.upper()
+        if upper_sym in self._open_positions:
+            return False
+        if not self._open_positions:
+            return True
+        if not self._risk_config.allow_secondary_symbol_slot:
+            return False
+        if len(self._open_positions) >= max(
+            1, self._risk_config.max_concurrent_positions
+        ):
+            return False
+        min_required_cash = self._exchange_config.min_notional_usdt + 0.50
+        return self._available_cash_usdt >= min_required_cash
+
+    def can_open_additional_positions(self) -> bool:
+        """Return True if additional slots and cash remain for concurrent trades."""
+        self._reconcile_external_clear()
+        if not self._open_positions:
+            return True
+        if not self._risk_config.allow_secondary_symbol_slot:
+            return False
+        if len(self._open_positions) >= max(
+            1, self._risk_config.max_concurrent_positions
+        ):
+            return False
+        min_required_cash = self._exchange_config.min_notional_usdt + 0.50
+        return self._available_cash_usdt >= min_required_cash
+
+    def _can_dca_position(self, pos: Position, current_price: float) -> bool:
+        """Return True if a held non-reconciled position qualifies for Smart DCA."""
+        if not self._risk_config.enable_dca_average_down:
+            return False
+        if pos.position_id.startswith("reconciled-"):
+            return False
+        if pos.position_id in self._dca_applied_position_ids:
+            return False
+        if pos.is_partially_closed:
+            return False
+        trigger_price = pos.entry_price * (
+            1.0 - self._risk_config.dca_trigger_drawdown_ratio
+        )
+        if current_price > trigger_price:
+            return False
+        min_required_cash = self._exchange_config.min_notional_usdt + 0.50
+        return self._available_cash_usdt >= min_required_cash
+
+    def can_open_or_dca_symbol(self, symbol: str, current_price: float) -> bool:
+        """Return True if symbol can open a fresh slot or execute a Smart DCA buy."""
+        self._reconcile_external_clear()
+        pos = self._open_positions.get(symbol.upper())
+        if pos is None:
+            return self.can_open_position_for_symbol(symbol)
+        return self._can_dca_position(pos, current_price)
+
+    def _resolve_target_position(self, symbol: str | None) -> Position | None:
+        """Resolve either a symbol-scoped position or the primary active position."""
+        self._reconcile_external_clear()
+        if symbol is not None:
+            return self._open_positions.get(symbol.upper())
+        return self._active_position
+
+    def _persist_position_update(self, position: Position) -> None:
+        """Update cached position map, primary reference, and SQLite ledger."""
+        self._open_positions[position.symbol.upper()] = position
+        self._sync_primary_active_position()
+        self._ledger.save_open_position_for_symbol(position)
 
     def evaluate_protective_exits(
         self,
         current_price: float,
         timestamp: datetime,
+        symbol: str | None = None,
     ) -> TradeExecution | None:
         """Check whether an open position has triggered stop loss or take profit.
 
         Args:
             current_price: Latest market trade or close price.
             timestamp: UTC timestamp of the price observation.
+            symbol: Optional trading symbol to scope exit checks cleanly.
 
         Returns:
             TradeExecution if the position was closed, otherwise None.
         """
-        if self._active_position is None:
+        pos = self._resolve_target_position(symbol)
+        if pos is None:
             return None
 
-        pos = self._active_position
         new_peak = max(pos.peak_price, current_price, pos.entry_price)
 
         if self._risk_config.no_loss_spot_mode:
@@ -565,14 +782,48 @@ class PaperTradingEngine:
                 include_live_spread_cushion=self._live_client is not None,
             )
             effective_floor = max(pos.stop_loss_price, safety_floor)
+            round_trip_fee = 2.0 * self._exchange_config.taker_fee_rate
+            arm_price = max(
+                round(safety_floor * 1.0008, 10),
+                round(
+                    pos.entry_price
+                    * (
+                        1.0
+                        + round_trip_fee
+                        + self._risk_config.no_loss_trailing_arm_ratio
+                    ),
+                    10,
+                ),
+            )
+            if (
+                self._risk_config.enable_no_loss_trailing_runner
+                and new_peak >= arm_price
+            ):
+                pullback_ratio = self._risk_config.no_loss_trailing_pullback_ratio
+                trail_floor = round(new_peak * (1.0 - pullback_ratio), 10)
+                effective_floor = max(effective_floor, safety_floor, trail_floor)
+
             if new_peak > pos.peak_price or effective_floor > pos.stop_loss_price:
                 pos = replace(
                     pos,
                     stop_loss_price=effective_floor,
                     peak_price=new_peak,
                 )
-                self._active_position = pos
-                self._ledger.save_open_position(pos)
+                self._persist_position_update(pos)
+
+            if self._risk_config.enable_no_loss_trailing_runner:
+                if (
+                    new_peak >= arm_price
+                    and current_price <= effective_floor
+                    and current_price >= safety_floor
+                ):
+                    return self._close_active_position(
+                        exit_price=current_price,
+                        timestamp=timestamp,
+                        reason=ExitReason.TRAILING_STOP.value,
+                        symbol=pos.symbol,
+                    )
+                return None
 
             if current_price < effective_floor:
                 return None
@@ -582,6 +833,7 @@ class PaperTradingEngine:
                     exit_price=current_price,
                     timestamp=timestamp,
                     reason=ExitReason.TAKE_PROFIT.value,
+                    symbol=pos.symbol,
                 )
 
             if new_peak >= pos.take_profit_price and current_price >= effective_floor:
@@ -589,6 +841,7 @@ class PaperTradingEngine:
                     exit_price=current_price,
                     timestamp=timestamp,
                     reason=ExitReason.TRAILING_STOP.value,
+                    symbol=pos.symbol,
                 )
 
             return None
@@ -601,7 +854,9 @@ class PaperTradingEngine:
             and not pos.is_partially_closed
             and current_gain >= self._risk_config.tp1_profit_ratio
         ):
-            partial_exec = self._execute_partial_take_profit(current_price, timestamp)
+            partial_exec = self._execute_partial_take_profit(
+                current_price, timestamp, pos
+            )
             if partial_exec is not None:
                 return partial_exec
 
@@ -612,10 +867,8 @@ class PaperTradingEngine:
             trailing_candidate = round(new_peak - trailing_distance, 10)
             new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
             if new_sl > pos.stop_loss_price or new_peak > pos.peak_price:
-                self._active_position = replace(
-                    pos, stop_loss_price=new_sl, peak_price=new_peak
-                )
-                self._ledger.save_open_position(self._active_position)
+                pos = replace(pos, stop_loss_price=new_sl, peak_price=new_peak)
+                self._persist_position_update(pos)
         elif gain_ratio >= 0.0022:
             breakeven_floor = round(pos.entry_price * 1.0022, 10)
             trail_pct = 0.0008
@@ -623,40 +876,38 @@ class PaperTradingEngine:
             trailing_candidate = round(new_peak - trailing_distance, 10)
             new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
             if new_sl > pos.stop_loss_price or new_peak > pos.peak_price:
-                self._active_position = replace(
-                    pos, stop_loss_price=new_sl, peak_price=new_peak
-                )
-                self._ledger.save_open_position(self._active_position)
+                pos = replace(pos, stop_loss_price=new_sl, peak_price=new_peak)
+                self._persist_position_update(pos)
         elif gain_ratio >= 0.0014:
             defensive_floor = round(pos.entry_price * 0.9988, 10)
             new_sl = max(pos.stop_loss_price, defensive_floor)
             if new_sl > pos.stop_loss_price or new_peak > pos.peak_price:
-                self._active_position = replace(
-                    pos, stop_loss_price=new_sl, peak_price=new_peak
-                )
-                self._ledger.save_open_position(self._active_position)
+                pos = replace(pos, stop_loss_price=new_sl, peak_price=new_peak)
+                self._persist_position_update(pos)
         elif new_peak > pos.peak_price:
-            self._active_position = replace(pos, peak_price=new_peak)
-            self._ledger.save_open_position(self._active_position)
+            pos = replace(pos, peak_price=new_peak)
+            self._persist_position_update(pos)
 
-        if current_price <= self._active_position.stop_loss_price:
+        updated_pos = self._open_positions.get(pos.symbol.upper(), pos)
+        if current_price <= updated_pos.stop_loss_price:
             reason = (
                 ExitReason.TRAILING_STOP.value
-                if self._active_position.stop_loss_price
-                >= self._active_position.entry_price
+                if updated_pos.stop_loss_price >= updated_pos.entry_price
                 else ExitReason.STOP_LOSS.value
             )
             return self._close_active_position(
                 exit_price=current_price,
                 timestamp=timestamp,
                 reason=reason,
+                symbol=updated_pos.symbol,
             )
 
-        if current_price >= self._active_position.take_profit_price:
+        if current_price >= updated_pos.take_profit_price:
             return self._close_active_position(
                 exit_price=current_price,
                 timestamp=timestamp,
                 reason=ExitReason.TAKE_PROFIT.value,
+                symbol=updated_pos.symbol,
             )
 
         return None
@@ -665,6 +916,7 @@ class PaperTradingEngine:
         self,
         current_price: float,
         timestamp: datetime,
+        target_position: Position | None = None,
     ) -> TradeExecution | None:
         """Execute a partial take-profit order locking in profit on half the position.
 
@@ -675,10 +927,13 @@ class PaperTradingEngine:
         Returns:
             TradeExecution representing the partial SELL order, or None.
         """
-        if self._active_position is None or self._active_position.is_partially_closed:
+        pos = (
+            target_position
+            if target_position is not None
+            else self._active_position
+        )
+        if pos is None or pos.is_partially_closed:
             return None
-
-        pos = self._active_position
         raw_qty_to_sell = pos.quantity * self._risk_config.tp1_close_fraction
         if self._live_client is not None:
             step_size = self._live_client.fetch_symbol_step_size(pos.symbol)
@@ -758,7 +1013,7 @@ class PaperTradingEngine:
         trailing_candidate = round(new_peak - trailing_distance, 8)
         new_sl = max(pos.stop_loss_price, breakeven_floor, trailing_candidate)
 
-        self._active_position = replace(
+        updated_pos = replace(
             pos,
             quantity=remaining_quantity,
             notional_usdt=remaining_notional,
@@ -767,7 +1022,7 @@ class PaperTradingEngine:
             is_partially_closed=True,
             peak_price=new_peak,
         )
-        self._ledger.save_open_position(self._active_position)
+        self._persist_position_update(updated_pos)
 
         execution = TradeExecution(
             client_order_id=client_order_id,
@@ -820,12 +1075,15 @@ class PaperTradingEngine:
         Returns:
             TradeExecution if an entry or exit order was filled, otherwise None.
         """
-        if self._active_position is not None and signal.signal_type == SignalType.SELL:
+        self._reconcile_external_clear()
+        target_pos = self._open_positions.get(signal.symbol.upper())
+
+        if target_pos is not None and signal.signal_type == SignalType.SELL:
             if self._risk_config.no_loss_spot_mode:
                 safety_floor, _ = compute_no_loss_exit_levels(
-                    entry_price=self._active_position.entry_price,
-                    quantity=self._active_position.quantity,
-                    notional_usdt=self._active_position.notional_usdt,
+                    entry_price=target_pos.entry_price,
+                    quantity=target_pos.quantity,
+                    notional_usdt=target_pos.notional_usdt,
                     taker_fee_rate=self._exchange_config.taker_fee_rate,
                     min_target_net_profit_usdt=(
                         self._risk_config.min_target_net_profit_usdt
@@ -833,7 +1091,7 @@ class PaperTradingEngine:
                     include_live_spread_cushion=self._live_client is not None,
                 )
                 min_profitable_exit = max(
-                    self._active_position.stop_loss_price,
+                    target_pos.stop_loss_price,
                     safety_floor,
                 )
             else:
@@ -842,23 +1100,31 @@ class PaperTradingEngine:
                     (self._exchange_config.taker_fee_rate * 2.0)
                     + self._risk_config.min_net_profit_ratio,
                 )
-                min_profitable_exit = self._active_position.entry_price * (
-                    1.0 + min_ratio
-                )
+                min_profitable_exit = target_pos.entry_price * (1.0 + min_ratio)
             if signal.reference_price >= min_profitable_exit:
                 return self._close_active_position(
                     exit_price=signal.reference_price,
                     timestamp=signal.evaluated_at,
                     reason=ExitReason.SIGNAL_REVERSAL.value,
+                    symbol=target_pos.symbol,
                 )
             return None
 
-        if self._active_position is None and signal.signal_type == SignalType.BUY:
-            return self._open_new_position(
-                signal=signal,
-                win_probability_pct=win_probability_pct,
-                allocation_fraction=allocation_fraction,
-            )
+        if signal.signal_type == SignalType.BUY:
+            if target_pos is None and self.can_open_position_for_symbol(signal.symbol):
+                return self._open_new_position(
+                    signal=signal,
+                    win_probability_pct=win_probability_pct,
+                    allocation_fraction=allocation_fraction,
+                )
+            if target_pos is not None and self._can_dca_position(
+                target_pos, signal.reference_price
+            ):
+                return self._average_down_position(
+                    existing_pos=target_pos,
+                    signal=signal,
+                    win_probability_pct=win_probability_pct,
+                )
 
         return None
 
@@ -878,6 +1144,9 @@ class PaperTradingEngine:
         Returns:
             TradeExecution if the order passed validation and filled, else None.
         """
+        if not self.can_open_position_for_symbol(signal.symbol):
+            return None
+
         client_order_id = generate_client_order_id(
             symbol=signal.symbol,
             side=OrderSide.BUY,
@@ -897,11 +1166,17 @@ class PaperTradingEngine:
             if live_usdt is not None and live_usdt > 0.0:
                 self._available_cash_usdt = round(live_usdt, 6)
 
-        effective_alloc = (
-            allocation_fraction
-            if allocation_fraction is not None and allocation_fraction > 0.0
-            else self._risk_config.position_allocation_fraction
-        )
+        if (
+            self._risk_config.enable_tranche_split
+            and self._available_cash_usdt
+            >= self._risk_config.tranche_split_min_cash_usdt
+        ):
+            effective_alloc = self._risk_config.tranche_split_fraction
+        elif allocation_fraction is not None and allocation_fraction > 0.0:
+            effective_alloc = allocation_fraction
+        else:
+            effective_alloc = self._risk_config.position_allocation_fraction
+
         proposed_notional_usdt = round(
             self._available_cash_usdt * effective_alloc,
             4,
@@ -1016,7 +1291,7 @@ class PaperTradingEngine:
         self._total_trades += 1
         self._executed_order_ids.add(client_order_id)
 
-        self._active_position = Position(
+        new_pos = Position(
             position_id=position_id,
             symbol=signal.symbol,
             opened_at=signal.evaluated_at,
@@ -1028,7 +1303,7 @@ class PaperTradingEngine:
             take_profit_price=take_profit_price,
             peak_price=entry_price,
         )
-        self._ledger.save_open_position(self._active_position)
+        self._persist_position_update(new_pos)
 
         execution = TradeExecution(
             client_order_id=client_order_id,
@@ -1069,11 +1344,301 @@ class PaperTradingEngine:
         )
         return execution
 
+    def _average_down_position(
+        self,
+        existing_pos: Position,
+        signal: MarketSignal,
+        win_probability_pct: float | None = None,
+    ) -> TradeExecution | None:
+        """Execute a Smart DCA buy tranche to lower an open position's average cost.
+
+        Args:
+            existing_pos: Currently held open position for signal.symbol.
+            signal: Confirmed BUY signal on a rebound structure.
+            win_probability_pct: Optional Time Machine win probability percentage.
+
+        Returns:
+            TradeExecution if the Smart DCA order succeeded, else None.
+        """
+        client_order_id = generate_client_order_id(
+            symbol=signal.symbol,
+            side=OrderSide.BUY,
+            timestamp=signal.evaluated_at,
+            reason="SMART_DCA",
+        )
+        if client_order_id in self._executed_order_ids:
+            return None
+
+        proposed_notional_usdt = round(
+            self._available_cash_usdt * self._risk_config.position_allocation_fraction,
+            4,
+        )
+        try:
+            validate_entry_order_viability(
+                signal=signal,
+                proposed_notional_usdt=proposed_notional_usdt,
+                available_cash_usdt=self._available_cash_usdt,
+                exchange_config=self._exchange_config,
+                risk_config=self._risk_config,
+            )
+        except OrderValidationError as exc:
+            logger.warning("Skipped Smart DCA BUY due to validation: %s", exc)
+            return None
+
+        add_price = signal.reference_price
+        add_fee_usdt = round(
+            proposed_notional_usdt * self._exchange_config.taker_fee_rate, 6
+        )
+        add_qty = round((proposed_notional_usdt - add_fee_usdt) / add_price, 8)
+        cash_spent_usdt = proposed_notional_usdt
+        add_notional = proposed_notional_usdt
+
+        if self._live_client is not None:
+            if self._live_client.is_cooldown_active():
+                return None
+            try:
+                live_res = self._live_client.place_market_buy_by_quote(
+                    symbol=signal.symbol,
+                    quote_amount_usdt=proposed_notional_usdt,
+                    client_order_id=client_order_id,
+                )
+            except Exception as exc:
+                logger.warning("Live Smart DCA BUY deferred (%s).", exc)
+                return None
+            live_qty = float(live_res.get("executedQty", 0.0))
+            live_quote = float(live_res.get("cummulativeQuoteQty", 0.0))
+            if live_qty > 0.0 and live_quote > 0.0:
+                add_price = live_quote / live_qty
+                cash_spent_usdt = round(live_quote, 6)
+                add_qty = live_qty
+                add_notional = round(add_qty * add_price, 6)
+
+        combined_qty = round(existing_pos.quantity + add_qty, 8)
+        combined_notional = round(existing_pos.notional_usdt + add_notional, 6)
+        new_avg_entry = combined_notional / max(combined_qty, 1e-12)
+        if self._risk_config.no_loss_spot_mode:
+            new_sl, new_tp = compute_no_loss_exit_levels(
+                entry_price=new_avg_entry,
+                quantity=combined_qty,
+                notional_usdt=combined_notional,
+                taker_fee_rate=self._exchange_config.taker_fee_rate,
+                min_target_net_profit_usdt=self._risk_config.min_target_net_profit_usdt,
+                include_live_spread_cushion=self._live_client is not None,
+            )
+        else:
+            new_sl = round(new_avg_entry * 0.995, 8)
+            new_tp = round(new_avg_entry * 1.0075, 8)
+
+        self._available_cash_usdt = round(
+            max(0.0, self._available_cash_usdt - cash_spent_usdt), 6
+        )
+        if self._live_client is not None:
+            self._live_client.update_known_usdt_balance(self._available_cash_usdt)
+        self._total_fees_paid_usdt = round(
+            self._total_fees_paid_usdt + add_fee_usdt, 6
+        )
+        self._total_trades += 1
+        self._executed_order_ids.add(client_order_id)
+        self._dca_applied_position_ids.add(existing_pos.position_id)
+
+        updated_pos = replace(
+            existing_pos,
+            entry_price=new_avg_entry,
+            quantity=combined_qty,
+            notional_usdt=combined_notional,
+            entry_fee_usdt=round(existing_pos.entry_fee_usdt + add_fee_usdt, 6),
+            stop_loss_price=new_sl,
+            take_profit_price=new_tp,
+            peak_price=max(add_price, new_avg_entry),
+        )
+        self._persist_position_update(updated_pos)
+
+        execution = TradeExecution(
+            client_order_id=client_order_id,
+            position_id=existing_pos.position_id,
+            symbol=signal.symbol,
+            side=OrderSide.BUY,
+            executed_at=signal.evaluated_at,
+            execution_price=add_price,
+            quantity=add_qty,
+            gross_notional_usdt=add_notional,
+            fee_usdt=add_fee_usdt,
+            realized_pnl_usdt=0.0,
+            reason="SMART_DCA",
+        )
+        self._ledger.record_execution(execution)
+        self._notifier.send_alert(
+            format_execution_alert(
+                execution=execution,
+                available_cash_usdt=self._available_cash_usdt,
+                cop_per_usdt_rate=self._capital_config.cop_per_usdt_rate,
+                is_live_order=self._live_client is not None,
+                stop_loss_price=new_sl,
+                take_profit_price=new_tp,
+                win_probability_pct=win_probability_pct,
+            )
+        )
+        return execution
+
+    def execute_controlled_partial_unlock(
+        self,
+        symbol: str,
+        fraction: float = 0.50,
+        current_price: float | None = None,
+        timestamp: datetime | None = None,
+    ) -> TradeExecution | None:
+        """Sell a controlled fraction of an open holding to unlock active cash.
+
+        Args:
+            symbol: Held trading pair symbol such as BTCUSDT.
+            fraction: Fraction of held quantity to liquidate cleanly in Spot.
+            current_price: Reference valuation price when running offline or paper.
+            timestamp: UTC timestamp for ledger accounting.
+
+        Returns:
+            TradeExecution for the partial liquidation if performed, else None.
+        """
+        pos = self._open_positions.get(symbol.upper())
+        if pos is None or not 0.0 < fraction < 1.0:
+            return None
+
+        client_order_id = f"unlock-{pos.symbol.lower()}-half-50pct"
+        if client_order_id in self._executed_order_ids:
+            return None
+
+        if self._live_client is not None:
+            step_size = self._live_client.fetch_symbol_step_size(pos.symbol)
+            sell_qty = float(quantize_step_size(pos.quantity * fraction, step_size))
+            remaining_qty = float(
+                quantize_step_size(pos.quantity - sell_qty, step_size)
+            )
+        else:
+            sell_qty = round(pos.quantity * fraction, 8)
+            remaining_qty = round(pos.quantity - sell_qty, 8)
+
+        if sell_qty <= 0.0 or (remaining_qty * pos.entry_price) < 4.5:
+            return None
+
+        exec_time = (
+            timestamp if timestamp is not None else datetime.now(tz=timezone.utc)
+        )
+        actual_price = current_price if current_price is not None else pos.entry_price
+        gross_proceeds = round(sell_qty * actual_price, 6)
+
+        if self._live_client is not None:
+            if self._live_client.is_cooldown_active():
+                return None
+            try:
+                live_res = self._live_client.place_market_sell_by_quantity(
+                    symbol=pos.symbol,
+                    quantity=sell_qty,
+                    client_order_id=client_order_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Controlled partial unlock on %s deferred (%s).",
+                    pos.symbol,
+                    exc,
+                )
+                return None
+            live_qty = float(live_res.get("executedQty", 0.0))
+            live_quote = float(live_res.get("cummulativeQuoteQty", 0.0))
+            if live_qty > 0.0 and live_quote > 0.0:
+                sell_qty = live_qty
+                gross_proceeds = round(live_quote, 6)
+                actual_price = live_quote / live_qty
+                step_size = self._live_client.fetch_symbol_step_size(pos.symbol)
+                remaining_qty = float(
+                    quantize_step_size(max(0.0, pos.quantity - sell_qty), step_size)
+                )
+
+        exit_fee = round(gross_proceeds * self._exchange_config.taker_fee_rate, 6)
+        net_proceeds = gross_proceeds - exit_fee
+        sold_fraction = sell_qty / max(pos.quantity, 1e-12)
+        closed_notional = round(pos.notional_usdt * sold_fraction, 6)
+        realized_pnl = round(net_proceeds - closed_notional, 6)
+
+        self._available_cash_usdt = round(
+            self._available_cash_usdt + net_proceeds, 6
+        )
+        if self._live_client is not None:
+            self._live_client._balance_cache.pop("USDT", None)
+            try:
+                refreshed_usdt = self._live_client.fetch_available_usdt_balance()
+                if refreshed_usdt >= 0.0:
+                    self._available_cash_usdt = round(refreshed_usdt, 6)
+            except Exception:
+                self._live_client.update_known_usdt_balance(self._available_cash_usdt)
+
+        self._realized_pnl_usdt = round(self._realized_pnl_usdt + realized_pnl, 6)
+        self._total_fees_paid_usdt = round(self._total_fees_paid_usdt + exit_fee, 6)
+        self._total_trades += 1
+        self._executed_order_ids.add(client_order_id)
+
+        remaining_notional = round(remaining_qty * pos.entry_price, 6)
+        if self._risk_config.no_loss_spot_mode:
+            new_sl, new_tp = compute_no_loss_exit_levels(
+                entry_price=pos.entry_price,
+                quantity=remaining_qty,
+                notional_usdt=remaining_notional,
+                taker_fee_rate=self._exchange_config.taker_fee_rate,
+                min_target_net_profit_usdt=self._risk_config.min_target_net_profit_usdt,
+                include_live_spread_cushion=self._live_client is not None,
+            )
+        else:
+            new_sl = pos.stop_loss_price
+            new_tp = pos.take_profit_price
+
+        updated_pos = replace(
+            pos,
+            quantity=remaining_qty,
+            notional_usdt=remaining_notional,
+            stop_loss_price=new_sl,
+            take_profit_price=new_tp,
+        )
+        self._persist_position_update(updated_pos)
+
+        execution = TradeExecution(
+            client_order_id=client_order_id,
+            position_id=pos.position_id,
+            symbol=pos.symbol,
+            side=OrderSide.SELL,
+            executed_at=exec_time,
+            execution_price=actual_price,
+            quantity=sell_qty,
+            gross_notional_usdt=gross_proceeds,
+            fee_usdt=exit_fee,
+            realized_pnl_usdt=realized_pnl,
+            reason="PARTIAL_UNLOCK",
+        )
+        self._ledger.record_execution(execution)
+        mode_tag = "LIVE" if self._live_client is not None else "PAPER"
+        logger.info(
+            "Executed %s PARTIAL UNLOCK | symbol=%s sold_qty=%s price=%s "
+            "remaining_qty=%s freed_cash=%.4f USDT",
+            mode_tag,
+            pos.symbol,
+            format_quantity(sell_qty),
+            format_price(actual_price),
+            format_quantity(remaining_qty),
+            self._available_cash_usdt,
+        )
+        self._notifier.send_alert(
+            format_execution_alert(
+                execution=execution,
+                available_cash_usdt=self._available_cash_usdt,
+                cop_per_usdt_rate=self._capital_config.cop_per_usdt_rate,
+                is_live_order=self._live_client is not None,
+            )
+        )
+        return execution
+
     def _close_active_position(
         self,
         exit_price: float,
         timestamp: datetime,
         reason: str,
+        symbol: str | None = None,
     ) -> TradeExecution | None:
         """Close the currently open position and realize net profit or loss.
 
@@ -1081,25 +1646,33 @@ class PaperTradingEngine:
             exit_price: Market fill price per unit of base asset.
             timestamp: UTC timestamp of exit execution.
             reason: Exit trigger classifier string.
+            symbol: Optional trading symbol to scope the exit.
 
         Returns:
             TradeExecution representing the closing SELL order.
         """
-        if self._active_position is None:
+        position = self._resolve_target_position(symbol)
+        if position is None:
             return None
-
-        position = self._active_position
-        if (
-            self._risk_config.no_loss_spot_mode
-            and exit_price < position.stop_loss_price
-        ):
-            logger.info(
-                "Deferred exit on %s: price %s is below no-loss safety floor %s.",
-                position.symbol,
-                format_price(exit_price),
-                format_price(position.stop_loss_price),
+        if self._risk_config.no_loss_spot_mode:
+            safety_floor, _ = compute_no_loss_exit_levels(
+                entry_price=position.entry_price,
+                quantity=position.quantity,
+                notional_usdt=position.notional_usdt,
+                taker_fee_rate=self._exchange_config.taker_fee_rate,
+                min_target_net_profit_usdt=(
+                    self._risk_config.min_target_net_profit_usdt
+                ),
+                include_live_spread_cushion=self._live_client is not None,
             )
-            return None
+            if exit_price < safety_floor:
+                logger.info(
+                    "Deferred exit on %s: price %s is below no-loss safety floor %s.",
+                    position.symbol,
+                    format_price(exit_price),
+                    format_price(safety_floor),
+                )
+                return None
         client_order_id = generate_client_order_id(
             symbol=position.symbol,
             side=OrderSide.SELL,
@@ -1153,8 +1726,9 @@ class PaperTradingEngine:
         )
         self._total_trades += 1
         self._executed_order_ids.add(client_order_id)
-        self._active_position = None
-        self._ledger.clear_open_position()
+        self._open_positions.pop(position.symbol.upper(), None)
+        self._sync_primary_active_position()
+        self._ledger.clear_open_position_for_symbol(position.symbol)
 
         execution = TradeExecution(
             client_order_id=client_order_id,
@@ -1195,21 +1769,38 @@ class PaperTradingEngine:
         self,
         current_price: float,
         timestamp: datetime,
+        symbol: str | None = None,
+        prices_by_symbol: dict[str, float] | None = None,
     ) -> PortfolioSnapshot:
         """Calculate and persist a mark-to-market portfolio valuation snapshot.
 
         Args:
             current_price: Latest market price used to value open holdings.
             timestamp: UTC timestamp of the valuation.
+            symbol: Optional trading symbol associated with current_price.
+            prices_by_symbol: Optional mapping of latest prices across symbols.
 
         Returns:
             Persisted PortfolioSnapshot domain record.
         """
+        self._reconcile_external_clear()
         open_position_value_usdt = 0.0
-        if self._active_position is not None:
-            gross_value = self._active_position.quantity * current_price
+        for pos_sym, pos in self._open_positions.items():
+            mark_price = (
+                prices_by_symbol[pos_sym]
+                if prices_by_symbol is not None and pos_sym in prices_by_symbol
+                else (
+                    current_price
+                    if (symbol is None or symbol.upper() == pos_sym)
+                    and current_price > 0.0
+                    else pos.entry_price
+                )
+            )
+            gross_value = pos.quantity * mark_price
             estimated_exit_fee = gross_value * self._exchange_config.taker_fee_rate
-            open_position_value_usdt = round(gross_value - estimated_exit_fee, 6)
+            open_position_value_usdt = round(
+                open_position_value_usdt + (gross_value - estimated_exit_fee), 6
+            )
 
         total_equity_usdt = round(
             self._available_cash_usdt + open_position_value_usdt, 4

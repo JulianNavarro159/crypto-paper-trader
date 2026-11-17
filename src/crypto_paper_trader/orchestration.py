@@ -66,6 +66,7 @@ class RealTimeTradingOrchestrator:
         self._last_logged_signal: SignalType | None = None
         self._macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
         self._cooldown_until_ts: float = 0.0
+        self._cooldown_until_by_symbol: dict[str, float] = {}
         self._qualified_symbols: set[str] = set()
 
     def set_macro_regime(self, regime: MacroMarketRegime) -> None:
@@ -206,19 +207,21 @@ class RealTimeTradingOrchestrator:
                 rolling_candles, self._config.strategy
             )
 
-        active_pos = self._engine.active_position
+        has_pos_for_symbol = self._engine.has_position(target_symbol)
+        can_enter_symbol = self._engine.can_open_or_dca_symbol(
+            target_symbol, candle.close_price
+        )
         if (
             self._multi_symbol_mode
-            and active_pos is not None
-            and active_pos.symbol.upper() != target_symbol
+            and self._engine.has_any_position()
+            and not has_pos_for_symbol
+            and not can_enter_symbol
         ):
-            held_sym = active_pos.symbol.upper()
-            held_price = self._last_price_by_symbol.get(
-                held_sym, active_pos.entry_price
-            )
             snapshot = self._engine.capture_portfolio_snapshot(
-                current_price=held_price,
+                current_price=candle.close_price,
                 timestamp=candle.close_time,
+                symbol=target_symbol,
+                prices_by_symbol=self._last_price_by_symbol,
             )
             idle_signal = MarketSignal(
                 symbol=target_symbol,
@@ -241,16 +244,23 @@ class RealTimeTradingOrchestrator:
         protective_exit = self._engine.evaluate_protective_exits(
             current_price=candle.close_price,
             timestamp=candle.close_time,
+            symbol=target_symbol,
         )
         if protective_exit is not None:
+            cooldown_secs = 0.0
             if protective_exit.reason == ExitReason.STOP_LOSS.value:
-                self._cooldown_until_ts = candle.close_time.timestamp() + 900.0
+                cooldown_secs = 900.0
             elif protective_exit.reason in (
                 ExitReason.TRAILING_STOP.value,
                 ExitReason.TAKE_PROFIT.value,
                 ExitReason.PARTIAL_TAKE_PROFIT.value,
             ):
-                self._cooldown_until_ts = candle.close_time.timestamp() + 300.0
+                cooldown_secs = 300.0
+            if cooldown_secs > 0.0:
+                deadline = candle.close_time.timestamp() + cooldown_secs
+                self._cooldown_until_by_symbol[target_symbol] = deadline
+                if not self._multi_symbol_mode:
+                    self._cooldown_until_ts = deadline
 
         if len(rolling_candles) < min_required_rows:
             signal = MarketSignal(
@@ -272,9 +282,17 @@ class RealTimeTradingOrchestrator:
                 config=self._config.strategy,
             )
 
+        active_cooldown_deadline = (
+            self._cooldown_until_by_symbol.get(target_symbol, 0.0)
+            if self._multi_symbol_mode
+            else max(
+                self._cooldown_until_ts,
+                self._cooldown_until_by_symbol.get(target_symbol, 0.0),
+            )
+        )
         if (
             signal.signal_type == SignalType.BUY
-            and candle.close_time.timestamp() < self._cooldown_until_ts
+            and candle.close_time.timestamp() < active_cooldown_deadline
         ):
             logger.info(
                 "Suppressed BUY signal on %s during post-exit cooldown.",
@@ -349,9 +367,12 @@ class RealTimeTradingOrchestrator:
 
         tm_win_prob: float | None = None
         tm_alloc: float | None = None
+        can_enter_now = self._engine.can_open_or_dca_symbol(
+            target_symbol, candle.close_price
+        )
         if (
             protective_exit is None
-            and self._engine.active_position is None
+            and can_enter_now
             and signal.signal_type == SignalType.BUY
             and self._config.risk.enable_time_machine_gate
         ):
@@ -399,11 +420,16 @@ class RealTimeTradingOrchestrator:
                 signal_exec is not None
                 and signal_exec.reason == ExitReason.SIGNAL_REVERSAL.value
             ):
-                self._cooldown_until_ts = candle.close_time.timestamp() + 300.0
+                deadline = candle.close_time.timestamp() + 300.0
+                self._cooldown_until_by_symbol[target_symbol] = deadline
+                if not self._multi_symbol_mode:
+                    self._cooldown_until_ts = deadline
 
         snapshot = self._engine.capture_portfolio_snapshot(
             current_price=candle.close_price,
             timestamp=candle.close_time,
+            symbol=target_symbol,
+            prices_by_symbol=self._last_price_by_symbol,
         )
 
         wall_now = time.time()

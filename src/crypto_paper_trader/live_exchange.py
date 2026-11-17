@@ -388,23 +388,23 @@ class BinanceSpotAuthenticatedClient:
         """
         return self.fetch_available_asset_balance("USDT")
 
-    def fetch_active_spot_holding(
+    def fetch_active_spot_holdings(
         self,
         universe_symbols: Sequence[str],
-    ) -> tuple[str, float, float] | None:
-        """Detect an existing non-USDT holding in the user Spot account.
+    ) -> list[tuple[str, float, float, bool]]:
+        """Detect all existing non-USDT Spot holdings with residual cost basis.
 
         Args:
-            universe_symbols: Trading pair symbols to inspect such as SUIUSDT.
+            universe_symbols: Trading pair symbols to inspect such as BTCUSDT.
 
         Returns:
-            Tuple of (symbol, quantity, entry_price) if a holding >= 5 USDT exists,
-            otherwise None.
+            List of tuples (symbol, tradeable_qty, entry_price, has_partial_sell)
+            for holdings worth at least 10 USDT at entry cost.
         """
         try:
             payload = self._request_with_failover("GET", "/api/v3/account", {})
         except LiveExchangeExecutionError:
-            return None
+            return []
 
         now = time.time()
         balances_by_asset = {
@@ -416,6 +416,7 @@ class BinanceSpotAuthenticatedClient:
         if "USDT" in balances_by_asset:
             self._last_known_usdt_balance = round(balances_by_asset["USDT"], 6)
 
+        holdings: list[tuple[str, float, float, bool]] = []
         for sym in universe_symbols:
             upper_sym = sym.upper()
             if not upper_sym.endswith("USDT"):
@@ -427,37 +428,86 @@ class BinanceSpotAuthenticatedClient:
 
             try:
                 trades_resp = self._request_with_failover(
-                    "GET", "/api/v3/myTrades", {"symbol": upper_sym, "limit": 5}
+                    "GET", "/api/v3/myTrades", {"symbol": upper_sym, "limit": 10}
                 )
-                trades = trades_resp.get("result", trades_resp)
+                raw_trades = trades_resp.get("result", trades_resp)
             except LiveExchangeExecutionError:
                 continue
 
-            if isinstance(trades, list) and trades:
-                last_trade = trades[-1]
-                if not last_trade.get("isBuyer"):
-                    continue
-                entry_price = float(last_trade.get("price", 0.0))
-                last_order_id = last_trade.get("orderId")
-                last_buy_qty = sum(
-                    float(t.get("qty", 0.0))
-                    for t in trades
-                    if isinstance(t, dict)
-                    and t.get("isBuyer")
-                    and t.get("orderId") == last_order_id
+            if not isinstance(raw_trades, list) or not raw_trades:
+                continue
+
+            trades = sorted(
+                (t for t in raw_trades if isinstance(t, dict)),
+                key=lambda item: (int(item.get("time", 0)), int(item.get("id", 0))),
+            )
+            buy_indices = [idx for idx, t in enumerate(trades) if t.get("isBuyer")]
+            if not buy_indices:
+                continue
+
+            last_buy_idx = buy_indices[-1]
+            last_buy = trades[last_buy_idx]
+            last_order_id = last_buy.get("orderId")
+            buy_fills = [
+                t
+                for t in trades[: last_buy_idx + 1]
+                if t.get("isBuyer") and t.get("orderId") == last_order_id
+            ]
+            last_buy_qty = sum(float(t.get("qty", 0.0)) for t in buy_fills)
+            if last_buy_qty <= 0.0:
+                last_buy_qty = float(last_buy.get("qty", qty))
+            weighted_quote = sum(
+                float(t.get("qty", 0.0)) * float(t.get("price", 0.0))
+                for t in buy_fills
+            )
+            entry_price = (
+                weighted_quote / last_buy_qty
+                if last_buy_qty > 0.0 and weighted_quote > 0.0
+                else float(last_buy.get("price", 0.0))
+            )
+
+            sell_start = last_buy_idx + 1
+            subsequent_sell_qty = sum(
+                float(t.get("qty", 0.0))
+                for t in trades[sell_start:]
+                if not t.get("isBuyer")
+            )
+            remaining_from_buy = max(0.0, last_buy_qty - subsequent_sell_qty)
+            if remaining_from_buy <= 0.0:
+                continue
+
+            step_size = self.fetch_symbol_step_size(upper_sym)
+            raw_tradeable = (
+                max(0.0, min(qty, remaining_from_buy) - 0.0008)
+                if base_asset == "BNB"
+                else min(qty, remaining_from_buy)
+            )
+            tradeable_qty = float(quantize_step_size(raw_tradeable, step_size))
+            if entry_price > 0.0 and (tradeable_qty * entry_price) >= 4.5:
+                has_partial_sell = subsequent_sell_qty > 0.0
+                holdings.append(
+                    (upper_sym, tradeable_qty, entry_price, has_partial_sell)
                 )
-                if last_buy_qty <= 0.0:
-                    last_buy_qty = float(last_trade.get("qty", qty))
-                step_size = self.fetch_symbol_step_size(upper_sym)
-                raw_tradeable = (
-                    max(0.0, qty - 0.0008)
-                    if base_asset == "BNB"
-                    else min(qty, last_buy_qty)
-                )
-                tradeable_qty = float(quantize_step_size(raw_tradeable, step_size))
-                if entry_price > 0.0 and (tradeable_qty * entry_price) >= 12.0:
-                    return (upper_sym, tradeable_qty, entry_price)
-        return None
+
+        return holdings
+
+    def fetch_active_spot_holding(
+        self,
+        universe_symbols: Sequence[str],
+    ) -> tuple[str, float, float] | None:
+        """Detect an existing non-USDT holding in the user Spot account.
+
+        Args:
+            universe_symbols: Trading pair symbols to inspect such as SUIUSDT.
+
+        Returns:
+            Tuple of (symbol, quantity, entry_price) if a holding exists, else None.
+        """
+        holdings = self.fetch_active_spot_holdings(universe_symbols)
+        if not holdings:
+            return None
+        sym, qty, entry_price, _ = holdings[0]
+        return (sym, qty, entry_price)
 
     def fetch_symbol_step_size(self, symbol: str) -> str:
         """Fetch LOT_SIZE stepSize for a symbol from Binance exchangeInfo.

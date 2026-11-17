@@ -222,6 +222,8 @@ def translate_exit_reason(reason: str) -> str:
     translations = {
         "TAKE_PROFIT": "Meta de ganancia cumplida con exito",
         "PARTIAL_TAKE_PROFIT": "Primera meta alcanzada (50% asegurado en efectivo)",
+        "PARTIAL_UNLOCK": "Liberacion parcial 50% para activar rotacion en otra moneda",
+        "SMART_DCA": "Compra de refuerzo inteligente (promedio a la baja)",
         "STOP_LOSS": "Proteccion activada para cuidar tu dinero",
         "SIGNAL_REVERSAL": "Mercado sin fuerza; venta para asegurar ganancias",
         "TRAILING_STOP": "Ganancia protegida antes de un cambio de tendencia",
@@ -303,6 +305,17 @@ def format_execution_alert(
 
     pnl_cop = execution.realized_pnl_usdt * cop_per_usdt_rate
     sign = "+" if execution.realized_pnl_usdt >= 0 else ""
+
+    if "PARTIAL_UNLOCK" in execution.reason:
+        return (
+            f"[{mode_label}] LIBERACION PARCIAL DE {base_asset} (OPCION B)\n"
+            f"Se vendio el 50% de {base_asset} ({format_quantity(execution.quantity)} "
+            f"{base_asset}) a {format_price(execution.execution_price)} USDT.\n"
+            f"Efectivo libre disponible ahora: {available_cash_usdt:.2f} USDT "
+            f"(~{cash_cop:,.0f} COP).\n"
+            f"El otro 50% de {base_asset} sigue protegido esperando recuperacion, "
+            f"mientras el bot ya opera monedas fuertes como SOL y XRP con el efectivo."
+        )
 
     if "PARTIAL" in execution.reason:
         return (

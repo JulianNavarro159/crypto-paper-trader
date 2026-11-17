@@ -286,9 +286,10 @@ async def start_periodic_health_heartbeat(
     await asyncio.sleep(45.0)
     while True:
         try:
-            open_pos = LedgerRepository(
+            open_positions = LedgerRepository(
                 db_path=config.ledger_db_path
-            ).fetch_open_position()
+            ).fetch_all_open_positions()
+            open_pos = open_positions[0] if open_positions else None
             executions = LedgerRepository(
                 db_path=config.ledger_db_path
             ).fetch_all_executions()
@@ -318,19 +319,24 @@ async def start_periodic_health_heartbeat(
             else:
                 usdt_balance = None
 
+            held_label = (
+                " + ".join(p.symbol for p in open_positions)
+                if len(open_positions) > 1
+                else (open_pos.symbol if open_pos is not None else None)
+            )
             monitored_symbol = (
-                open_pos.symbol
-                if open_pos is not None
+                get_active_symbol()
+                if get_active_symbol is not None
                 else (
-                    get_active_symbol()
-                    if get_active_symbol is not None
+                    open_pos.symbol
+                    if open_pos is not None
                     else config.exchange.symbol
                 )
             )
             heartbeat_msg = format_heartbeat_alert(
                 symbol=monitored_symbol,
                 interval=config.exchange.interval,
-                open_position_symbol=open_pos.symbol if open_pos else None,
+                open_position_symbol=held_label,
                 open_position_entry_price=open_pos.entry_price if open_pos else None,
                 available_cash_usdt=usdt_balance,
                 cop_per_usdt_rate=config.capital.cop_per_usdt_rate,
@@ -356,6 +362,10 @@ async def run_application(args: argparse.Namespace) -> None:
     await start_cloud_health_server()
     notifier = build_notifier_from_env()
 
+    unlock_mode = (
+        os.getenv("BTC_RECOVERY_UNLOCK_MODE", "PARTIAL_50").strip().upper()
+        or "PARTIAL_50"
+    )
     config = TradingSystemConfig(
         capital=CapitalConfig(
             initial_capital_cop=args.capital_cop,
@@ -365,7 +375,7 @@ async def run_application(args: argparse.Namespace) -> None:
             symbol=args.symbol.upper(),
             interval=args.interval,
         ),
-        risk=RiskConfig.spot_no_loss_micro_profit(),
+        risk=RiskConfig.spot_no_loss_trailing_runner(btc_unlock_mode=unlock_mode),
         ledger_db_path=args.db_path,
     )
 
@@ -441,15 +451,18 @@ async def run_application(args: argparse.Namespace) -> None:
         else None
     )
 
-    existing_open_pos = (
-        LedgerRepository(db_path=config.ledger_db_path).fetch_open_position()
+    repo = LedgerRepository(db_path=config.ledger_db_path)
+    existing_open_positions = (
+        repo.fetch_all_open_positions()
         if args.mode in ("realtime", "live")
-        else None
+        else []
     )
-    if existing_open_pos is None and live_client is not None:
-        holding = live_client.fetch_active_spot_holding(config.universe.all_symbols)
-        if holding is not None:
-            held_sym, held_qty, held_entry = holding
+    partial_sell_done_by_symbol: dict[str, bool] = {}
+
+    if not existing_open_positions and live_client is not None:
+        holdings = live_client.fetch_active_spot_holdings(config.universe.all_symbols)
+        for held_sym, held_qty, held_entry, has_partial_sell in holdings:
+            partial_sell_done_by_symbol[held_sym.upper()] = has_partial_sell
             held_notional = round(held_qty * held_entry, 6)
             if config.risk.no_loss_spot_mode:
                 rec_sl, rec_tp = compute_no_loss_exit_levels(
@@ -475,17 +488,19 @@ async def run_application(args: argparse.Namespace) -> None:
                 take_profit_price=rec_tp,
                 peak_price=held_entry,
             )
-            LedgerRepository(db_path=config.ledger_db_path).save_open_position(
-                reconciled_pos
-            )
-            existing_open_pos = reconciled_pos
+            repo.save_open_position_for_symbol(reconciled_pos)
+            existing_open_positions.append(reconciled_pos)
             logger.info(
                 "Reconciled active Binance Spot holding on startup | "
-                "symbol=%s qty=%s entry=%s",
+                "symbol=%s qty=%s entry=%s partial_unlock_done=%s",
                 held_sym,
                 format_quantity(held_qty),
                 format_price(held_entry),
+                has_partial_sell,
             )
+
+    existing_open_pos = existing_open_positions[0] if existing_open_positions else None
+    held_symbols_set = {pos.symbol.upper() for pos in existing_open_positions}
 
     active_macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
     initial_universe_candles: dict[str, list[Candle]] = {}
@@ -517,12 +532,24 @@ async def run_application(args: argparse.Namespace) -> None:
             )
             log_universe_ranking(rankings)
             initial_qualified_symbols = select_qualified_universe_symbols(rankings)
-            if rankings and existing_open_pos is None:
-                best_symbol = rankings[0].symbol
-                config = replace(
-                    config,
-                    exchange=replace(config.exchange, symbol=best_symbol),
-                )
+            if rankings:
+                non_held = [
+                    item
+                    for item in rankings
+                    if item.symbol.upper() not in held_symbols_set
+                ]
+                if existing_open_pos is None:
+                    best_symbol = rankings[0].symbol
+                    config = replace(
+                        config,
+                        exchange=replace(config.exchange, symbol=best_symbol),
+                    )
+                elif config.risk.allow_secondary_symbol_slot and non_held:
+                    best_symbol = non_held[0].symbol
+                    config = replace(
+                        config,
+                        exchange=replace(config.exchange, symbol=best_symbol),
+                    )
         except Exception as exc:
             logger.warning(
                 "Initial universe scan failed (%s); defaulting to %s.",
@@ -572,6 +599,21 @@ async def run_application(args: argparse.Namespace) -> None:
         live_client=live_client,
         multi_symbol_mode=use_multi_radar,
     )
+    if (
+        args.mode == "live"
+        and live_client is not None
+        and config.risk.btc_unlock_mode == "PARTIAL_50"
+    ):
+        btc_pos = orchestrator._engine.get_open_position("BTCUSDT")
+        if (
+            btc_pos is not None
+            and not partial_sell_done_by_symbol.get("BTCUSDT", False)
+            and btc_pos.quantity >= 0.00025
+        ):
+            orchestrator._engine.execute_controlled_partial_unlock(
+                symbol="BTCUSDT",
+                fraction=0.50,
+            )
     if initial_qualified_symbols:
         orchestrator.set_qualified_symbols(initial_qualified_symbols)
     if use_multi_radar:
@@ -601,13 +643,14 @@ async def run_application(args: argparse.Namespace) -> None:
                 )
                 continue
             except TimeoutError:
-                open_pos = LedgerRepository(
-                    db_path=config.ledger_db_path
-                ).fetch_open_position()
-                if open_pos is not None:
+                if not orchestrator._engine.can_open_additional_positions():
+                    held_syms = [
+                        p.symbol for p in orchestrator._engine.active_positions
+                    ]
                     logger.info(
-                        "Skipping universe rescan while position in %s remains open.",
-                        open_pos.symbol,
+                        "Skipping universe rescan while max slots (%s) are filled "
+                        "or cash below minimum.",
+                        ",".join(held_syms),
                     )
                     continue
 

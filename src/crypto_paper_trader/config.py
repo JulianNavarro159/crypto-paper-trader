@@ -146,6 +146,17 @@ class RiskConfig:
     time_machine_min_win_prob_pct: float = 55.0
     no_loss_spot_mode: bool = False
     min_target_net_profit_usdt: float = 0.01
+    enable_no_loss_trailing_runner: bool = False
+    no_loss_trailing_arm_ratio: float = 0.0018
+    no_loss_trailing_pullback_ratio: float = 0.0035
+    allow_secondary_symbol_slot: bool = False
+    max_concurrent_positions: int = 1
+    enable_tranche_split: bool = False
+    tranche_split_min_cash_usdt: float = 11.5
+    tranche_split_fraction: float = 0.48
+    enable_dca_average_down: bool = False
+    dca_trigger_drawdown_ratio: float = 0.05
+    btc_unlock_mode: str = "NONE"
 
     @classmethod
     def spot_no_loss_micro_profit(
@@ -167,6 +178,41 @@ class RiskConfig:
             enable_partial_take_profit=False,
             no_loss_spot_mode=True,
             min_target_net_profit_usdt=min_target_net_profit_usdt,
+        )
+
+    @classmethod
+    def spot_no_loss_trailing_runner(
+        cls,
+        min_target_net_profit_usdt: float = 0.01,
+        btc_unlock_mode: str = "PARTIAL_50",
+    ) -> RiskConfig:
+        """Build Spot no-loss risk rules with trailing profit runner and multi-slot.
+
+        Args:
+            min_target_net_profit_usdt: Minimum net USDT gain required to exit.
+            btc_unlock_mode: Controlled capital unlock strategy for held BTC.
+
+        Returns:
+            Configured RiskConfig with zero-loss floor, runner, and split tranches.
+        """
+        return cls(
+            position_allocation_fraction=0.90,
+            min_net_profit_ratio=0.0003,
+            min_signal_exit_profit_ratio=0.0023,
+            enable_partial_take_profit=False,
+            no_loss_spot_mode=True,
+            min_target_net_profit_usdt=min_target_net_profit_usdt,
+            enable_no_loss_trailing_runner=True,
+            no_loss_trailing_arm_ratio=0.0018,
+            no_loss_trailing_pullback_ratio=0.0035,
+            allow_secondary_symbol_slot=True,
+            max_concurrent_positions=3,
+            enable_tranche_split=True,
+            tranche_split_min_cash_usdt=11.5,
+            tranche_split_fraction=0.48,
+            enable_dca_average_down=True,
+            dca_trigger_drawdown_ratio=0.05,
+            btc_unlock_mode=btc_unlock_mode,
         )
 
 
