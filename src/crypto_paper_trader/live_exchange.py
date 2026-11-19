@@ -388,18 +388,50 @@ class BinanceSpotAuthenticatedClient:
         """
         return self.fetch_available_asset_balance("USDT")
 
-    def fetch_active_spot_holdings(
+    def fetch_latest_spot_price(self, symbol: str) -> float:
+        """Fetch latest Spot market price for a symbol via public Binance mirrors.
+
+        Args:
+            symbol: Trading pair symbol such as BTCUSDT.
+
+        Returns:
+            Latest positive market price in USDT, or 0.0 if unavailable.
+        """
+        upper_sym = symbol.upper()
+        urls = (
+            "https://api.binance.us",
+            "https://data-api.binance.vision",
+            "https://api-gcp.binance.com",
+            "https://api4.binance.com",
+            self._config.rest_base_url,
+        )
+        for base_url in urls:
+            endpoint = f"{base_url.rstrip('/')}/api/v3/ticker/price"
+            try:
+                with httpx.Client(timeout=self._timeout_seconds) as client:
+                    response = client.get(endpoint, params={"symbol": upper_sym})
+                    if response.status_code in (418, 429):
+                        continue
+                    response.raise_for_status()
+                    price_val = float(response.json().get("price", 0.0))
+                    if price_val > 0.0:
+                        return price_val
+            except (httpx.HTTPError, ValueError, KeyError):
+                continue
+        return 0.0
+
+    def fetch_active_spot_holdings_with_timestamps(
         self,
         universe_symbols: Sequence[str],
-    ) -> list[tuple[str, float, float, bool]]:
-        """Detect all existing non-USDT Spot holdings with residual cost basis.
+    ) -> list[tuple[str, float, float, bool, int]]:
+        """Detect active non-USDT Spot holdings with entry cost and BUY timestamp.
 
         Args:
             universe_symbols: Trading pair symbols to inspect such as BTCUSDT.
 
         Returns:
-            List of tuples (symbol, tradeable_qty, entry_price, has_partial_sell)
-            for holdings worth at least 10 USDT at entry cost.
+            List of tuples (symbol, tradeable_qty, entry_price, has_partial_sell,
+            last_buy_time_ms) for holdings above minimum dust threshold.
         """
         try:
             payload = self._request_with_failover("GET", "/api/v3/account", {})
@@ -416,7 +448,7 @@ class BinanceSpotAuthenticatedClient:
         if "USDT" in balances_by_asset:
             self._last_known_usdt_balance = round(balances_by_asset["USDT"], 6)
 
-        holdings: list[tuple[str, float, float, bool]] = []
+        holdings: list[tuple[str, float, float, bool, int]] = []
         for sym in universe_symbols:
             upper_sym = sym.upper()
             if not upper_sym.endswith("USDT"):
@@ -447,6 +479,7 @@ class BinanceSpotAuthenticatedClient:
 
             last_buy_idx = buy_indices[-1]
             last_buy = trades[last_buy_idx]
+            last_buy_time_ms = int(last_buy.get("time", 0))
             last_order_id = last_buy.get("orderId")
             buy_fills = [
                 t
@@ -486,10 +519,178 @@ class BinanceSpotAuthenticatedClient:
             if entry_price > 0.0 and (tradeable_qty * entry_price) >= 4.5:
                 has_partial_sell = subsequent_sell_qty > 0.0
                 holdings.append(
-                    (upper_sym, tradeable_qty, entry_price, has_partial_sell)
+                    (
+                        upper_sym,
+                        tradeable_qty,
+                        entry_price,
+                        has_partial_sell,
+                        last_buy_time_ms,
+                    )
                 )
 
         return holdings
+
+    def liquidate_pre_cutoff_spot_holdings(
+        self,
+        universe_symbols: Sequence[str],
+        cutoff_epoch_ms: int,
+    ) -> list[dict[str, Any]]:
+        """Sell 100% of tradeable Spot holdings bought strictly before cutoff time.
+
+        Args:
+            universe_symbols: Universe trading pairs to inspect for liquidation.
+            cutoff_epoch_ms: UTC epoch cutoff in milliseconds; newer buys are safe.
+
+        Returns:
+            List of dictionaries summarizing each completed liquidation order.
+        """
+        if cutoff_epoch_ms <= 0:
+            return []
+
+        try:
+            payload = self._request_with_failover("GET", "/api/v3/account", {})
+        except LiveExchangeExecutionError as exc:
+            logger.warning("Pre-cutoff liquidation skipped (account error): %s", exc)
+            return []
+
+        now = time.time()
+        balances_by_asset = {
+            str(entry.get("asset", "")).upper(): float(entry.get("free", 0.0))
+            for entry in payload.get("balances", [])
+        }
+        for asset_code, free_val in balances_by_asset.items():
+            self._balance_cache[asset_code] = (now, free_val)
+        if "USDT" in balances_by_asset:
+            self._last_known_usdt_balance = round(balances_by_asset["USDT"], 6)
+
+        liquidated: list[dict[str, Any]] = []
+        cutoff_sec = int(cutoff_epoch_ms // 1000)
+
+        for sym in universe_symbols:
+            upper_sym = sym.upper()
+            if not upper_sym.endswith("USDT"):
+                continue
+            base_asset = upper_sym[:-4]
+            if base_asset in ("USDT", "BNB"):
+                continue
+            free_qty = balances_by_asset.get(base_asset, 0.0)
+            if free_qty <= 0.0:
+                continue
+
+            step_size = self.fetch_symbol_step_size(upper_sym)
+            sell_qty = float(quantize_step_size(free_qty, step_size))
+            if sell_qty <= 0.0:
+                continue
+
+            live_price = self.fetch_latest_spot_price(upper_sym)
+            min_req_notional = 1.05 if upper_sym == "DOGEUSDT" else 5.05
+            if live_price > 0.0 and (sell_qty * live_price) < min_req_notional:
+                continue
+
+            try:
+                trades_resp = self._request_with_failover(
+                    "GET", "/api/v3/myTrades", {"symbol": upper_sym, "limit": 10}
+                )
+                raw_trades = trades_resp.get("result", trades_resp)
+            except LiveExchangeExecutionError as exc:
+                logger.warning(
+                    "Skipping pre-cutoff liquidation check for %s (%s).",
+                    upper_sym,
+                    exc,
+                )
+                continue
+
+            if not isinstance(raw_trades, list) or not raw_trades:
+                continue
+
+            trades = sorted(
+                (t for t in raw_trades if isinstance(t, dict)),
+                key=lambda item: (int(item.get("time", 0)), int(item.get("id", 0))),
+            )
+            buy_trades = [t for t in trades if t.get("isBuyer")]
+            if not buy_trades:
+                continue
+
+            last_buy = buy_trades[-1]
+            last_buy_time_ms = int(last_buy.get("time", 0))
+            if last_buy_time_ms <= 0 or last_buy_time_ms >= cutoff_epoch_ms:
+                logger.info(
+                    "Protected post-cutoff holding %s (buy_ms=%d >= cutoff_ms=%d).",
+                    upper_sym,
+                    last_buy_time_ms,
+                    cutoff_epoch_ms,
+                )
+                continue
+
+            fallback_price = float(last_buy.get("price", 0.0))
+            ref_price = live_price if live_price > 0.0 else fallback_price
+            if ref_price <= 0.0 or (sell_qty * ref_price) < min_req_notional:
+                continue
+
+            client_order_id = f"reset100-{upper_sym.lower()}-{cutoff_sec}"
+            try:
+                res = self.place_market_sell_by_quantity(
+                    symbol=upper_sym,
+                    quantity=sell_qty,
+                    client_order_id=client_order_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Pre-cutoff 100%% liquidation failed on %s: %s",
+                    upper_sym,
+                    exc,
+                )
+                continue
+
+            exec_qty = float(res.get("executedQty", sell_qty))
+            exec_quote = float(res.get("cummulativeQuoteQty", sell_qty * ref_price))
+            exec_price = exec_quote / exec_qty if exec_qty > 0.0 else ref_price
+            liquidated.append(
+                {
+                    "symbol": upper_sym,
+                    "quantity": exec_qty,
+                    "price": exec_price,
+                    "quote_usdt": round(exec_quote, 4),
+                    "client_order_id": client_order_id,
+                }
+            )
+            logger.info(
+                "Executed LIVE FULL RESET SELL (100%%) | symbol=%s qty=%.8f "
+                "price=%.6f quote=%.4f USDT",
+                upper_sym,
+                exec_qty,
+                exec_price,
+                exec_quote,
+            )
+
+        if liquidated:
+            self._balance_cache.pop("USDT", None)
+            try:
+                refreshed_usdt = self.fetch_available_usdt_balance()
+                self._last_known_usdt_balance = round(refreshed_usdt, 6)
+            except Exception as exc:
+                logger.warning("Failed to refresh USDT balance after reset: %s", exc)
+
+        return liquidated
+
+    def fetch_active_spot_holdings(
+        self,
+        universe_symbols: Sequence[str],
+    ) -> list[tuple[str, float, float, bool]]:
+        """Detect all existing non-USDT Spot holdings with residual cost basis.
+
+        Args:
+            universe_symbols: Trading pair symbols to inspect such as BTCUSDT.
+
+        Returns:
+            List of tuples (symbol, tradeable_qty, entry_price, has_partial_sell)
+            for holdings above minimum dust threshold.
+        """
+        detailed = self.fetch_active_spot_holdings_with_timestamps(universe_symbols)
+        return [
+            (sym, qty, entry_price, has_partial)
+            for sym, qty, entry_price, has_partial, _ in detailed
+        ]
 
     def fetch_active_spot_holding(
         self,

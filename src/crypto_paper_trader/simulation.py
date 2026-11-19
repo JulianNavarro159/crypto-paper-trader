@@ -137,7 +137,10 @@ def run_time_machine_simulation(
     round_trip_fee = 2.0 * exchange_config.taker_fee_rate
 
     if risk_config.no_loss_spot_mode:
-        micro_tp_ratio = round_trip_fee + 0.0007
+        micro_tp_buffer = (
+            0.0010 if risk_config.min_target_net_profit_usdt < 0.01 else 0.0007
+        )
+        micro_tp_ratio = round_trip_fee + micro_tp_buffer
         micro_tp_price = entry_price * (1.0 + micro_tp_ratio)
         adverse_dip_price = entry_price * 0.9950
         sentinel = horizon_candles + 1
@@ -167,9 +170,10 @@ def run_time_machine_simulation(
         target_prob = round(float(np.mean(clean_micro_win) * 100.0), 2)
         stop_prob = round(float(np.mean(~hit_any_win) * 100.0), 2)
         expected_ret = round(float(np.mean(net_returns) * 100.0), 4)
+        min_clean_target_prob = 40.0 if risk_config.use_dynamic_slot_sizing else 45.0
         approved = bool(
             win_prob >= min_win_probability_pct
-            and target_prob >= 45.0
+            and target_prob >= min_clean_target_prob
             and expected_ret > 0.0
         )
         base_alloc = risk_config.position_allocation_fraction

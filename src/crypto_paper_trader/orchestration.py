@@ -255,7 +255,7 @@ class RealTimeTradingOrchestrator:
                 ExitReason.TAKE_PROFIT.value,
                 ExitReason.PARTIAL_TAKE_PROFIT.value,
             ):
-                cooldown_secs = 300.0
+                cooldown_secs = self._config.risk.fast_exit_cooldown_seconds
             if cooldown_secs > 0.0:
                 deadline = candle.close_time.timestamp() + cooldown_secs
                 self._cooldown_until_by_symbol[target_symbol] = deadline
@@ -316,8 +316,8 @@ class RealTimeTradingOrchestrator:
                     or target_symbol in self._qualified_symbols
                 )
                 and candle.close_price > candle.open_price
-                and signal.fast_ema >= (signal.slow_ema * 0.9960)
-                and 30.0 <= signal.rsi_value <= 53.5
+                and signal.fast_ema >= (signal.slow_ema * 0.9950)
+                and 28.0 <= signal.rsi_value <= 54.5
             )
             if is_oversold_dip or is_qualified_decoupled_rotation:
                 logger.info(
@@ -437,7 +437,10 @@ class RealTimeTradingOrchestrator:
                 signal_exec is not None
                 and signal_exec.reason == ExitReason.SIGNAL_REVERSAL.value
             ):
-                deadline = candle.close_time.timestamp() + 300.0
+                deadline = (
+                    candle.close_time.timestamp()
+                    + self._config.risk.fast_exit_cooldown_seconds
+                )
                 self._cooldown_until_by_symbol[target_symbol] = deadline
                 if not self._multi_symbol_mode:
                     self._cooldown_until_ts = deadline

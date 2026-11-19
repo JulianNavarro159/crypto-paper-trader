@@ -579,3 +579,44 @@ def format_balance_summary_alert(
         f"{position_line}"
         f"BALANCE TOTAL: {total_usdt:.2f} USDT (~{total_cop:,.0f} COP)"
     )
+
+
+def format_full_reset_alert(
+    liquidated_records: list[dict[str, object]],
+    available_cash_usdt: float,
+    cop_per_usdt_rate: float,
+) -> str:
+    """Format a one-time 100% portfolio liquidation summary in Spanish.
+
+    Args:
+        liquidated_records: List of executed liquidation summary dictionaries.
+        available_cash_usdt: Consolidated free USDT cash after liquidation.
+        cop_per_usdt_rate: Exchange rate from USDT to Colombian Pesos.
+
+    Returns:
+        Multi-line plain Spanish alert detailing sold coins and freed cash.
+    """
+    cash_cop = available_cash_usdt * cop_per_usdt_rate
+    lines = [
+        "[BINANCE REAL] LIQUIDACION 100% COMPLETADA (REINICIO MULTI-MONEDA)",
+        "Se vendio el 100% de las criptomonedas previas para liberar efectivo:",
+    ]
+    for rec in liquidated_records:
+        sym = str(rec.get("symbol", ""))
+        clean_sym = sym[:-4] if sym.upper().endswith("USDT") else sym
+        qty = float(rec.get("quantity", 0.0))
+        price = float(rec.get("price", 0.0))
+        quote_usdt = float(rec.get("quote_usdt", 0.0))
+        lines.append(
+            f"- {clean_sym}: {format_quantity(qty)} {clean_sym} a "
+            f"{format_price(price)} USDT (~{quote_usdt:.2f} USDT)"
+        )
+    lines.append(
+        f"Efectivo libre consolidado: {available_cash_usdt:.2f} USDT "
+        f"(~{cash_cop:,.0f} COP)"
+    )
+    lines.append(
+        "El bot ya escaneo el universo y buscara abrir hasta 4 monedas "
+        "simultaneas con ventas rapidas al 100% desde aumentos minimos netos."
+    )
+    return "\n".join(lines)

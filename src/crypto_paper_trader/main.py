@@ -37,6 +37,7 @@ from crypto_paper_trader.notifications import (
     NotificationService,
     build_notifier_from_env,
     format_balance_summary_alert,
+    format_full_reset_alert,
     format_heartbeat_alert,
     format_recovery_alert,
     format_startup_alert,
@@ -52,6 +53,7 @@ from crypto_paper_trader.scanner import (
 from crypto_paper_trader.strategy import evaluate_macro_regime
 
 logger = logging.getLogger(__name__)
+DEFAULT_FULL_RESET_BEFORE_EPOCH_MS = 1_795_113_720_000
 
 
 def configure_structured_logging(level: int = logging.INFO) -> None:
@@ -130,8 +132,8 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     parser.add_argument(
         "--rescan-hours",
         type=float,
-        default=0.25,
-        help="Hours between universe rescans in auto-select mode (default: 0.25)",
+        default=0.167,
+        help="Hours between universe rescans in auto-select mode (default: 0.167)",
     )
     parser.add_argument(
         "--db-path",
@@ -362,10 +364,11 @@ async def run_application(args: argparse.Namespace) -> None:
     await start_cloud_health_server()
     notifier = build_notifier_from_env()
 
-    unlock_mode = (
-        os.getenv("BTC_RECOVERY_UNLOCK_MODE", "PARTIAL_50").strip().upper()
-        or "PARTIAL_50"
-    )
+    reset_cutoff_raw = os.getenv(
+        "FULL_RESET_BEFORE_EPOCH_MS",
+        str(DEFAULT_FULL_RESET_BEFORE_EPOCH_MS),
+    ).strip()
+    reset_cutoff_ms = int(reset_cutoff_raw) if reset_cutoff_raw.isdigit() else 0
     config = TradingSystemConfig(
         capital=CapitalConfig(
             initial_capital_cop=args.capital_cop,
@@ -375,7 +378,11 @@ async def run_application(args: argparse.Namespace) -> None:
             symbol=args.symbol.upper(),
             interval=args.interval,
         ),
-        risk=RiskConfig.spot_no_loss_trailing_runner(btc_unlock_mode=unlock_mode),
+        risk=RiskConfig.spot_fast_multicoin_micro_scalp(
+            min_target_net_profit_usdt=0.005,
+            max_concurrent_positions=4,
+            full_reset_before_epoch_ms=reset_cutoff_ms,
+        ),
         ledger_db_path=args.db_path,
     )
 
@@ -452,6 +459,28 @@ async def run_application(args: argparse.Namespace) -> None:
     )
 
     repo = LedgerRepository(db_path=config.ledger_db_path)
+
+    if (
+        args.mode == "live"
+        and live_client is not None
+        and config.risk.full_reset_before_epoch_ms > 0
+    ):
+        liquidated_records = live_client.liquidate_pre_cutoff_spot_holdings(
+            universe_symbols=config.universe.all_symbols,
+            cutoff_epoch_ms=config.risk.full_reset_before_epoch_ms,
+        )
+        if liquidated_records:
+            for rec in liquidated_records:
+                repo.clear_open_position_for_symbol(str(rec["symbol"]))
+            consolidated_cash = live_client.get_known_usdt_balance() or 0.0
+            notifier.send_alert(
+                format_full_reset_alert(
+                    liquidated_records=liquidated_records,
+                    available_cash_usdt=consolidated_cash,
+                    cop_per_usdt_rate=config.capital.cop_per_usdt_rate,
+                )
+            )
+
     existing_open_positions = (
         repo.fetch_all_open_positions()
         if args.mode in ("realtime", "live")
@@ -531,7 +560,9 @@ async def run_application(args: argparse.Namespace) -> None:
                 config=config,
             )
             log_universe_ranking(rankings)
-            initial_qualified_symbols = select_qualified_universe_symbols(rankings)
+            initial_qualified_symbols = select_qualified_universe_symbols(
+                rankings, max_symbols=6
+            )
             if rankings:
                 non_held = [
                     item
@@ -643,12 +674,18 @@ async def run_application(args: argparse.Namespace) -> None:
                 )
                 continue
             except TimeoutError:
-                if not orchestrator._engine.can_open_additional_positions():
+                buffered_check = orchestrator.get_buffered_universe_candles(
+                    min_candles=60
+                )
+                if (
+                    not orchestrator._engine.can_open_additional_positions()
+                    and len(buffered_check) < len(config.universe.all_symbols)
+                ):
                     held_syms = [
                         p.symbol for p in orchestrator._engine.active_positions
                     ]
                     logger.info(
-                        "Skipping universe rescan while max slots (%s) are filled "
+                        "Skipping REST universe rescan while max slots (%s) are filled "
                         "or cash below minimum.",
                         ",".join(held_syms),
                     )
@@ -696,7 +733,7 @@ async def run_application(args: argparse.Namespace) -> None:
                     )
                     log_universe_ranking(rankings)
                     orchestrator.set_qualified_symbols(
-                        select_qualified_universe_symbols(rankings)
+                        select_qualified_universe_symbols(rankings, max_symbols=6)
                     )
                     for sym_candles in universe_candles.values():
                         for seed_candle in sym_candles:

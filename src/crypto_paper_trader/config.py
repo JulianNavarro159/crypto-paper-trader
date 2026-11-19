@@ -157,6 +157,9 @@ class RiskConfig:
     enable_dca_average_down: bool = False
     dca_trigger_drawdown_ratio: float = 0.05
     btc_unlock_mode: str = "NONE"
+    use_dynamic_slot_sizing: bool = False
+    fast_exit_cooldown_seconds: float = 300.0
+    full_reset_before_epoch_ms: int = 0
 
     @classmethod
     def spot_no_loss_micro_profit(
@@ -213,6 +216,42 @@ class RiskConfig:
             enable_dca_average_down=True,
             dca_trigger_drawdown_ratio=0.05,
             btc_unlock_mode=btc_unlock_mode,
+        )
+
+    @classmethod
+    def spot_fast_multicoin_micro_scalp(
+        cls,
+        min_target_net_profit_usdt: float = 0.005,
+        max_concurrent_positions: int = 4,
+        full_reset_before_epoch_ms: int = 0,
+    ) -> RiskConfig:
+        """Build high-turnover multi-slot Spot config with immediate minimal exit.
+
+        Args:
+            min_target_net_profit_usdt: Minimum net USDT gain required per exit.
+            max_concurrent_positions: Simultaneous independent coins to hold.
+            full_reset_before_epoch_ms: Optional UTC cutoff for one-time reset.
+
+        Returns:
+            Configured RiskConfig for rapid 100% micro-profit exits across slots.
+        """
+        return cls(
+            position_allocation_fraction=0.95,
+            min_net_profit_ratio=0.0003,
+            min_signal_exit_profit_ratio=0.0023,
+            enable_partial_take_profit=False,
+            time_machine_min_win_prob_pct=52.0,
+            no_loss_spot_mode=True,
+            min_target_net_profit_usdt=min_target_net_profit_usdt,
+            enable_no_loss_trailing_runner=False,
+            allow_secondary_symbol_slot=True,
+            max_concurrent_positions=max_concurrent_positions,
+            enable_tranche_split=False,
+            use_dynamic_slot_sizing=True,
+            enable_dca_average_down=False,
+            fast_exit_cooldown_seconds=60.0,
+            btc_unlock_mode="NONE",
+            full_reset_before_epoch_ms=full_reset_before_epoch_ms,
         )
 
 

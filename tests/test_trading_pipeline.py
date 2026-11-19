@@ -2479,3 +2479,276 @@ def test_qualified_altcoin_rotation_operates_when_btc_macro_is_bearish(
             assert engine.has_position("XRPUSDT") is True
         finally:
             ledger.close()
+
+
+def test_pre_cutoff_full_liquidation_sells_100pct_and_protects_new_buys() -> None:
+    """Verify cutoff liquidation sells 100% of old coins and skips post-cutoff buys."""
+    from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
+    from crypto_paper_trader.notifications import format_full_reset_alert
+
+    cutoff_ms = 1_795_113_720_000
+    client = BinanceSpotAuthenticatedClient(
+        config=ExchangeConfig(),
+        api_key="k",
+        api_secret="s",
+    )
+    client._step_size_cache["BTCUSDT"] = "0.00001000"
+    client._step_size_cache["SUIUSDT"] = "0.10000000"
+    client._step_size_cache["SOLUSDT"] = "0.00100000"
+    client._step_size_cache["ETHUSDT"] = "0.00010000"
+
+    price_map = {
+        "BTCUSDT": 63_280.0,
+        "SUIUSDT": 0.721,
+        "SOLUSDT": 74.65,
+        "ETHUSDT": 1_788.0,
+    }
+    client.fetch_latest_spot_price = lambda sym: price_map.get(sym.upper(), 0.0)
+
+    sold_orders: list[tuple[str, float, str]] = []
+
+    def fake_sell(
+        symbol: str, quantity: float, client_order_id: str
+    ) -> dict[str, object]:
+        sold_orders.append((symbol, quantity, client_order_id))
+        quote = round(quantity * price_map[symbol], 4)
+        return {
+            "executedQty": str(quantity),
+            "cummulativeQuoteQty": str(quote),
+        }
+
+    client.place_market_sell_by_quantity = fake_sell
+
+    def fake_request(
+        method: str, path: str, params: dict[str, object]
+    ) -> dict[str, object]:
+        if path == "/api/v3/account":
+            usdt_after = 27.95 if sold_orders else 0.90
+            return {
+                "balances": [
+                    {"asset": "USDT", "free": str(usdt_after)},
+                    {"asset": "BNB", "free": "0.00075000"},
+                    {"asset": "BTC", "free": "0.00019961"},
+                    {"asset": "SUI", "free": "10.50000000"},
+                    {"asset": "SOL", "free": "0.10000000"},
+                    {"asset": "ETH", "free": "0.00010000"},
+                ]
+            }
+        if path == "/api/v3/myTrades":
+            sym = str(params.get("symbol", ""))
+            if sym == "BTCUSDT":
+                return {
+                    "result": [
+                        {
+                            "id": 1,
+                            "orderId": 10,
+                            "isBuyer": True,
+                            "qty": "0.00038000",
+                            "price": "73852.00",
+                            "time": cutoff_ms - 500_000,
+                        }
+                    ]
+                }
+            if sym == "SUIUSDT":
+                return {
+                    "result": [
+                        {
+                            "id": 2,
+                            "orderId": 11,
+                            "isBuyer": True,
+                            "qty": "10.50000000",
+                            "price": "0.7258",
+                            "time": cutoff_ms - 100_000,
+                        }
+                    ]
+                }
+            if sym == "SOLUSDT":
+                return {
+                    "result": [
+                        {
+                            "id": 3,
+                            "orderId": 12,
+                            "isBuyer": True,
+                            "qty": "0.10000000",
+                            "price": "74.65",
+                            "time": cutoff_ms + 15_000,
+                        }
+                    ]
+                }
+        return {"result": []}
+
+    client._request_with_failover = fake_request
+    records = client.liquidate_pre_cutoff_spot_holdings(
+        universe_symbols=("BTCUSDT", "SUIUSDT", "SOLUSDT", "ETHUSDT"),
+        cutoff_epoch_ms=cutoff_ms,
+    )
+    sold_syms = [r["symbol"] for r in records]
+    assert sold_syms == ["BTCUSDT", "SUIUSDT"]
+    assert sold_orders[0][1] == pytest.approx(0.00019, abs=1e-8)
+    assert sold_orders[1][1] == pytest.approx(10.5, abs=1e-8)
+    assert client.get_known_usdt_balance() == pytest.approx(27.95, abs=1e-4)
+
+    alert = format_full_reset_alert(
+        liquidated_records=records,
+        available_cash_usdt=27.95,
+        cop_per_usdt_rate=3_194.0,
+    )
+    assert "LIQUIDACION 100% COMPLETADA" in alert
+    assert "BTC" in alert and "SUI" in alert
+
+
+def test_dynamic_4_slot_multicoin_fast_micro_scalp_and_60s_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify 4 simultaneous slots split ~28 USDT and exit fast on micro rise."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_4slot_fast.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            config = TradingSystemConfig(
+                capital=CapitalConfig(
+                    initial_capital_cop=89_432.0,
+                    cop_per_usdt_rate=3_194.0,
+                ),
+                exchange=ExchangeConfig(symbol="SOLUSDT", taker_fee_rate=0.001),
+                risk=replace(
+                    RiskConfig.spot_fast_multicoin_micro_scalp(
+                        min_target_net_profit_usdt=0.005,
+                        max_concurrent_positions=4,
+                    ),
+                    enable_time_machine_gate=False,
+                ),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            provider = BinanceMarketDataClient(
+                config=config.exchange,
+                symbols=("SOLUSDT", "XRPUSDT", "SUIUSDT", "AVAXUSDT"),
+            )
+            orchestrator = RealTimeTradingOrchestrator(
+                config=config,
+                market_data_provider=provider,
+                trading_engine=engine,
+                multi_symbol_mode=True,
+            )
+
+            specs = [
+                ("SOLUSDT", 74.0),
+                ("XRPUSDT", 0.97),
+                ("SUIUSDT", 0.72),
+                ("AVAXUSDT", 7.10),
+            ]
+            last_candles: dict[str, Candle] = {}
+            for sym, base_p in specs:
+                sym_candles = [
+                    replace(c, symbol=sym)
+                    for c in build_synthetic_candles(
+                        count=35, start_price=base_p, step=base_p * 0.001
+                    )
+                ]
+                for c in sym_candles[:-1]:
+                    orchestrator._upsert_candle(c)
+                last_candles[sym] = sym_candles[-1]
+
+            for sym, _ in specs:
+                target_c = last_candles[sym]
+                monkeypatch.setattr(
+                    "crypto_paper_trader.orchestration.evaluate_market_signal",
+                    lambda candles, symbol, config, tc=target_c: MarketSignal(
+                        symbol=symbol,
+                        evaluated_at=tc.close_time,
+                        signal_type=SignalType.BUY,
+                        reference_price=tc.close_price,
+                        stop_loss_price=tc.close_price * 0.995,
+                        take_profit_price=tc.close_price * 1.008,
+                        atr_value=tc.close_price * 0.004,
+                        rsi_value=45.0,
+                        fast_ema=tc.close_price,
+                        slow_ema=tc.close_price * 0.999,
+                    ),
+                )
+                res = orchestrator.process_candle_event(target_c)
+                assert res.signal.signal_type == SignalType.BUY
+
+            assert len(engine.active_positions) == 4
+            for pos in engine.active_positions:
+                assert 5.5 <= pos.notional_usdt <= 8.0
+
+            sol_pos = engine.get_open_position("SOLUSDT")
+            assert sol_pos is not None
+            sol_tp = sol_pos.take_profit_price
+            exit_open = last_candles["SOLUSDT"].open_time + timedelta(minutes=2)
+            exit_tick = Candle(
+                symbol="SOLUSDT",
+                open_time=exit_open,
+                close_time=exit_open + timedelta(seconds=10),
+                open_price=sol_pos.entry_price,
+                high_price=sol_tp * 1.0005,
+                low_price=sol_pos.entry_price,
+                close_price=sol_tp * 1.0002,
+                volume=500.0,
+                is_closed=False,
+            )
+            orchestrator.process_candle_event(exit_tick)
+            assert engine.has_position("SOLUSDT") is False
+            assert len(engine.active_positions) == 3
+
+            sell_execs = [
+                e for e in ledger.fetch_all_executions() if e.side == OrderSide.SELL
+            ]
+            assert len(sell_execs) == 1
+            assert sell_execs[0].reason == ExitReason.TAKE_PROFIT.value
+            assert sell_execs[0].realized_pnl_usdt >= 0.005
+
+            blocked_tick = Candle(
+                symbol="SOLUSDT",
+                open_time=exit_tick.open_time + timedelta(seconds=30),
+                close_time=exit_tick.close_time + timedelta(seconds=30),
+                open_price=sol_tp,
+                high_price=sol_tp * 1.001,
+                low_price=sol_tp * 0.999,
+                close_price=sol_tp,
+                volume=300.0,
+                is_closed=False,
+            )
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda candles, symbol, config: MarketSignal(
+                    symbol=symbol,
+                    evaluated_at=candles[-1].close_time,
+                    signal_type=SignalType.BUY,
+                    reference_price=candles[-1].close_price,
+                    stop_loss_price=candles[-1].close_price * 0.995,
+                    take_profit_price=candles[-1].close_price * 1.008,
+                    atr_value=0.30,
+                    rsi_value=45.0,
+                    fast_ema=candles[-1].close_price,
+                    slow_ema=candles[-1].close_price * 0.999,
+                ),
+            )
+            res_blocked = orchestrator.process_candle_event(blocked_tick)
+            assert res_blocked.signal.signal_type == SignalType.HOLD
+            assert engine.has_position("SOLUSDT") is False
+
+            reentry_tick = Candle(
+                symbol="SOLUSDT",
+                open_time=exit_tick.open_time + timedelta(seconds=65),
+                close_time=exit_tick.close_time + timedelta(seconds=65),
+                open_price=sol_tp,
+                high_price=sol_tp * 1.001,
+                low_price=sol_tp * 0.999,
+                close_price=sol_tp,
+                volume=300.0,
+                is_closed=False,
+            )
+            res_reentry = orchestrator.process_candle_event(reentry_tick)
+            assert res_reentry.signal.signal_type == SignalType.BUY
+            assert engine.has_position("SOLUSDT") is True
+            assert len(engine.active_positions) == 4
+        finally:
+            ledger.close()

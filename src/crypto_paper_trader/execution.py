@@ -65,13 +65,16 @@ def compute_no_loss_exit_levels(
     net_denom = safe_qty * safe_net_factor
 
     min_profit_usdt = max(0.0, min_target_net_profit_usdt)
-    rounding_guard_usdt = 0.0015
+    rounding_guard_usdt = 0.0010 if min_profit_usdt <= 0.01 else 0.0015
     raw_floor_price = (
         effective_cost_usdt + min_profit_usdt + rounding_guard_usdt
     ) / net_denom
     safety_floor_price = round(max(entry_price, raw_floor_price), 10)
 
-    cushion_ratio = 0.00035 if include_live_spread_cushion else 0.00005
+    if include_live_spread_cushion:
+        cushion_ratio = 0.00025 if min_profit_usdt <= 0.01 else 0.00035
+    else:
+        cushion_ratio = 0.00005
     target_take_profit_price = round(
         max(safety_floor_price, safety_floor_price * (1.0 + cushion_ratio)),
         10,
@@ -1166,21 +1169,43 @@ class PaperTradingEngine:
             if live_usdt is not None and live_usdt > 0.0:
                 self._available_cash_usdt = round(live_usdt, 6)
 
-        if (
-            self._risk_config.enable_tranche_split
-            and self._available_cash_usdt
-            >= self._risk_config.tranche_split_min_cash_usdt
-        ):
-            effective_alloc = self._risk_config.tranche_split_fraction
-        elif allocation_fraction is not None and allocation_fraction > 0.0:
-            effective_alloc = allocation_fraction
+        if self._risk_config.use_dynamic_slot_sizing:
+            remaining_slots = max(
+                1,
+                self._risk_config.max_concurrent_positions - len(self._open_positions),
+            )
+            reserve_ratio = 0.95 if remaining_slots == 1 else 0.96
+            raw_slot_budget = (
+                self._available_cash_usdt * reserve_ratio
+            ) / remaining_slots
+            min_safe_slot = self._exchange_config.min_notional_usdt + 0.75
+            if (
+                raw_slot_budget < min_safe_slot
+                and self._available_cash_usdt
+                >= (self._exchange_config.min_notional_usdt + 0.50)
+            ):
+                proposed_notional_usdt = round(
+                    min(self._available_cash_usdt * 0.95, min_safe_slot),
+                    4,
+                )
+            else:
+                proposed_notional_usdt = round(raw_slot_budget, 4)
         else:
-            effective_alloc = self._risk_config.position_allocation_fraction
+            if (
+                self._risk_config.enable_tranche_split
+                and self._available_cash_usdt
+                >= self._risk_config.tranche_split_min_cash_usdt
+            ):
+                effective_alloc = self._risk_config.tranche_split_fraction
+            elif allocation_fraction is not None and allocation_fraction > 0.0:
+                effective_alloc = allocation_fraction
+            else:
+                effective_alloc = self._risk_config.position_allocation_fraction
 
-        proposed_notional_usdt = round(
-            self._available_cash_usdt * effective_alloc,
-            4,
-        )
+            proposed_notional_usdt = round(
+                self._available_cash_usdt * effective_alloc,
+                4,
+            )
 
         try:
             validate_entry_order_viability(
