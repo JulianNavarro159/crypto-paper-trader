@@ -61,7 +61,7 @@ from crypto_paper_trader.scanner import (
 from crypto_paper_trader.strategy import evaluate_macro_regime
 
 logger = logging.getLogger(__name__)
-DEFAULT_FULL_RESET_BEFORE_EPOCH_MS = 1_795_113_720_000
+DEFAULT_FULL_RESET_BEFORE_EPOCH_MS = 1_795_189_140_000
 
 
 def configure_structured_logging(level: int = logging.INFO) -> None:
