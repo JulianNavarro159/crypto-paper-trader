@@ -57,6 +57,11 @@ class BinanceSpotAuthenticatedClient:
         """Return True if Binance authenticated account REST is in 418 cooldown."""
         return time.time() < cls._ip_cooldown_until
 
+    @classmethod
+    def remaining_cooldown_seconds(cls) -> float:
+        """Return remaining seconds of Binance 418 IP cooldown, or 0.0."""
+        return max(0.0, cls._ip_cooldown_until - time.time())
+
     def __init__(
         self,
         config: ExchangeConfig,

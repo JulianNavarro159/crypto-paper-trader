@@ -61,7 +61,7 @@ from crypto_paper_trader.scanner import (
 from crypto_paper_trader.strategy import evaluate_macro_regime
 
 logger = logging.getLogger(__name__)
-DEFAULT_FULL_RESET_BEFORE_EPOCH_MS = 1_795_189_140_000
+DEFAULT_FULL_RESET_BEFORE_EPOCH_MS = 1_795_189_680_000
 
 
 def configure_structured_logging(level: int = logging.INFO) -> None:
@@ -519,6 +519,18 @@ async def run_application(args: argparse.Namespace) -> None:
             universe_symbols=config.universe.all_symbols,
             cutoff_epoch_ms=config.risk.full_reset_before_epoch_ms,
         )
+        if live_client.is_cooldown_active():
+            wait_secs = min(live_client.remaining_cooldown_seconds() + 5.0, 320.0)
+            logger.warning(
+                "Binance 418 cooldown active on startup; waiting %.0fs before "
+                "retrying 100%% reset and Spot reconciliation...",
+                wait_secs,
+            )
+            await asyncio.sleep(wait_secs)
+            liquidated_records = live_client.liquidate_pre_cutoff_spot_holdings(
+                universe_symbols=config.universe.all_symbols,
+                cutoff_epoch_ms=config.risk.full_reset_before_epoch_ms,
+            )
         if liquidated_records:
             for rec in liquidated_records:
                 repo.clear_open_position_for_symbol(str(rec["symbol"]))
