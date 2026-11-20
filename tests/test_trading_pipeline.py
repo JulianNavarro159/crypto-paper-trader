@@ -2752,3 +2752,348 @@ def test_dynamic_4_slot_multicoin_fast_micro_scalp_and_60s_cooldown(
             assert len(engine.active_positions) == 4
         finally:
             ledger.close()
+
+
+def _build_daily_btc_series(closes: list[float], lows: list[float]) -> list[Candle]:
+    """Build synthetic daily BTCUSDT candles for stabilization unit tests."""
+    base_time = datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc)
+    candles: list[Candle] = []
+    for idx, (close_p, low_p) in enumerate(zip(closes, lows)):
+        open_t = base_time + timedelta(days=idx)
+        close_t = open_t + timedelta(hours=23, minutes=59)
+        open_p = closes[idx - 1] if idx > 0 else close_p
+        high_p = max(open_p, close_p) + 300.0
+        low_val = min(low_p, open_p, close_p)
+        candles.append(
+            Candle(
+                symbol="BTCUSDT",
+                open_time=open_t,
+                close_time=close_t,
+                open_price=open_p,
+                high_price=high_p,
+                low_price=low_val,
+                close_price=close_p,
+                volume=10_000.0,
+                is_closed=True,
+            )
+        )
+    return candles
+
+
+def test_btc_stabilization_hysteresis_lock_unlock_and_relock() -> None:
+    """Verify BTC lock stays LOCKED in downtrend, unlocks after 2 checks, relocks."""
+    from crypto_paper_trader.market_intelligence import (
+        BtcLockState,
+        MarketIntelligenceService,
+        evaluate_btc_stabilization,
+    )
+
+    down_closes = [75_000.0 - (idx * 650.0) for idx in range(25)]
+    down_lows = [p - 400.0 for p in down_closes]
+    down_candles = _build_daily_btc_series(down_closes, down_lows)
+
+    state_down, reasons_down = evaluate_btc_stabilization(
+        down_candles, previous_state=BtcLockState.LOCKED
+    )
+    assert state_down == BtcLockState.LOCKED
+    assert len(reasons_down) >= 1
+
+    rec_closes = [75_000.0 - (idx * 500.0) for idx in range(20)] + [
+        65_200.0,
+        66_000.0,
+        67_500.0,
+        68_800.0,
+        69_500.0,
+    ]
+    rec_lows = [p - 300.0 for p in rec_closes]
+    rec_lows[17] = 63_000.0
+    rec_lows[-3:] = [65_500.0, 66_800.0, 67_900.0]
+    rec_candles = _build_daily_btc_series(rec_closes, rec_lows)
+
+    async def _run_service() -> None:
+        async def fetch_rec() -> list[Candle]:
+            return rec_candles
+
+        async def fetch_fg() -> int:
+            return 45
+
+        async def fetch_mcap() -> float:
+            return 1.2
+
+        service = MarketIntelligenceService(
+            exchange_config=ExchangeConfig(),
+            mode="AUTO",
+            daily_candles_fetcher=fetch_rec,
+            fear_greed_fetcher=fetch_fg,
+            global_mcap_fetcher=fetch_mcap,
+        )
+        first = await service.refresh(force=True)
+        assert first.btc_lock_state == BtcLockState.LOCKED
+        second = await service.refresh(force=True)
+        assert second.btc_lock_state == BtcLockState.OPEN
+
+    asyncio.run(_run_service())
+
+    relock_closes = rec_closes + [61_000.0]
+    relock_lows = rec_lows + [60_500.0]
+    relock_candles = _build_daily_btc_series(relock_closes, relock_lows)
+    state_relock, _ = evaluate_btc_stabilization(
+        relock_candles, previous_state=BtcLockState.OPEN
+    )
+    assert state_relock == BtcLockState.LOCKED
+
+
+def test_locked_btc_blocks_new_buys_and_dca_but_allows_altcoins_and_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify locked BTC blocks BTC BUY/DCA while altcoins and exits work normally."""
+    from crypto_paper_trader.domain import Position
+    from crypto_paper_trader.market_intelligence import (
+        BtcLockState,
+        MarketIntelligenceReport,
+        MarketRiskLevel,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_btc_lock_exec.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            t0 = datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc)
+            btc_pos = Position(
+                position_id="pos-btc-1",
+                symbol="BTCUSDT",
+                opened_at=t0 - timedelta(hours=12),
+                entry_price=62_880.40,
+                quantity=0.000100,
+                notional_usdt=6.28804,
+                entry_fee_usdt=0.0063,
+                stop_loss_price=63_066.41,
+                take_profit_price=63_082.18,
+                peak_price=62_880.40,
+            )
+            ledger.save_open_position_for_symbol(btc_pos)
+
+            config = TradingSystemConfig(
+                capital=CapitalConfig(
+                    initial_capital_cop=90_000.0,
+                    cop_per_usdt_rate=3_194.0,
+                ),
+                exchange=ExchangeConfig(symbol="SOLUSDT"),
+                risk=replace(
+                    RiskConfig.spot_fast_multicoin_micro_scalp(),
+                    enable_time_machine_gate=False,
+                    enable_dca_average_down=True,
+                ),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=config.capital,
+                exchange_config=config.exchange,
+                risk_config=config.risk,
+                ledger=ledger,
+            )
+            provider = BinanceMarketDataClient(
+                config=config.exchange,
+                symbols=("BTCUSDT", "SOLUSDT"),
+            )
+            orchestrator = RealTimeTradingOrchestrator(
+                config=config,
+                market_data_provider=provider,
+                trading_engine=engine,
+                multi_symbol_mode=True,
+            )
+            intel_report = MarketIntelligenceReport(
+                evaluated_at=t0,
+                btc_lock_state=BtcLockState.LOCKED,
+                risk_level=MarketRiskLevel.PANIC,
+                btc_price=61_448.0,
+                btc_daily_ema10=65_838.0,
+                btc_daily_ema20=69_722.0,
+                btc_change_24h_pct=-4.0,
+                fear_greed_value=12,
+                global_market_cap_change_24h_pct=-5.9,
+                universe_breadth_pct=0.0,
+                reasons=("BTC debajo de EMA10 diaria",),
+            )
+            orchestrator.set_market_intelligence(intel_report)
+
+            assert engine.can_open_or_dca_symbol("BTCUSDT", 58_000.0) is False
+            assert engine.can_open_position_for_symbol("SOLUSDT") is True
+
+            btc_candles = [
+                replace(c, symbol="BTCUSDT")
+                for c in build_synthetic_candles(
+                    count=35, start_price=60_000.0, step=10.0
+                )
+            ]
+            for c in btc_candles[:-1]:
+                orchestrator._upsert_candle(c)
+
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda **kwargs: MarketSignal(
+                    symbol="BTCUSDT",
+                    evaluated_at=btc_candles[-1].close_time,
+                    signal_type=SignalType.BUY,
+                    reference_price=58_500.0,
+                    stop_loss_price=58_000.0,
+                    take_profit_price=59_000.0,
+                    atr_value=300.0,
+                    rsi_value=42.0,
+                    fast_ema=58_500.0,
+                    slow_ema=58_400.0,
+                ),
+            )
+            btc_res = orchestrator.process_candle_event(btc_candles[-1])
+            assert btc_res.signal.signal_type == SignalType.HOLD
+            assert engine.get_open_position("BTCUSDT").quantity == pytest.approx(
+                0.000100, abs=1e-8
+            )
+
+            sol_candles = [
+                replace(c, symbol="SOLUSDT")
+                for c in build_synthetic_candles(count=35, start_price=70.0, step=0.1)
+            ]
+            for c in sol_candles[:-1]:
+                orchestrator._upsert_candle(c)
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda **kwargs: MarketSignal(
+                    symbol="SOLUSDT",
+                    evaluated_at=sol_candles[-1].close_time,
+                    signal_type=SignalType.BUY,
+                    reference_price=sol_candles[-1].close_price,
+                    stop_loss_price=sol_candles[-1].close_price * 0.995,
+                    take_profit_price=sol_candles[-1].close_price * 1.008,
+                    atr_value=0.35,
+                    rsi_value=45.0,
+                    fast_ema=sol_candles[-1].close_price,
+                    slow_ema=sol_candles[-1].close_price * 0.999,
+                ),
+            )
+            sol_res = orchestrator.process_candle_event(sol_candles[-1])
+            assert sol_res.signal.signal_type == SignalType.BUY
+            assert engine.has_position("SOLUSDT") is True
+
+            btc_tp_tick = Candle(
+                symbol="BTCUSDT",
+                open_time=btc_candles[-1].open_time + timedelta(minutes=15),
+                close_time=btc_candles[-1].close_time + timedelta(minutes=15),
+                open_price=63_000.0,
+                high_price=63_120.0,
+                low_price=62_990.0,
+                close_price=63_100.0,
+                volume=100.0,
+                is_closed=False,
+            )
+            orchestrator.process_candle_event(btc_tp_tick)
+            assert engine.has_position("BTCUSDT") is False
+        finally:
+            ledger.close()
+
+
+def test_market_intelligence_failsafe_and_api_error_survival() -> None:
+    """Verify service defaults to LOCKED without data and survives API errors."""
+    from crypto_paper_trader.market_intelligence import (
+        BtcLockState,
+        MarketIntelligenceService,
+    )
+
+    async def _run() -> None:
+        async def fail_daily() -> list[Candle]:
+            raise RuntimeError("Network down")
+
+        async def fail_fg() -> int | None:
+            return None
+
+        async def fail_mcap() -> float | None:
+            return None
+
+        service = MarketIntelligenceService(
+            exchange_config=ExchangeConfig(),
+            mode="AUTO",
+            daily_candles_fetcher=fail_daily,
+            fear_greed_fetcher=fail_fg,
+            global_mcap_fetcher=fail_mcap,
+        )
+        report = await service.refresh(force=True)
+        assert report.btc_lock_state == BtcLockState.LOCKED
+        assert report.fear_greed_value is None
+        assert report.global_market_cap_change_24h_pct is None
+
+    asyncio.run(_run())
+
+
+def test_force_modes_risk_classification_and_spanish_alerts() -> None:
+    """Verify FORCE_LOCK, FORCE_OPEN, PANIC risk tier, and Spanish alerts."""
+    from crypto_paper_trader.market_intelligence import (
+        BtcLockState,
+        MarketIntelligenceService,
+        MarketRiskLevel,
+        classify_market_risk,
+    )
+    from crypto_paper_trader.notifications import format_market_intelligence_alert
+
+    assert classify_market_risk(12, 0.0) == MarketRiskLevel.PANIC
+    assert classify_market_risk(30, 50.0) == MarketRiskLevel.CAUTION
+    assert classify_market_risk(65, 70.0) == MarketRiskLevel.CONSTRUCTIVE
+
+    down_closes = [75_000.0 - (idx * 650.0) for idx in range(25)]
+    down_candles = _build_daily_btc_series(
+        down_closes, [p - 400.0 for p in down_closes]
+    )
+
+    async def _run_overrides() -> None:
+        async def fetch_down() -> list[Candle]:
+            return down_candles
+
+        async def fetch_fg() -> int:
+            return 12
+
+        async def fetch_mcap() -> float:
+            return -5.9
+
+        svc_open = MarketIntelligenceService(
+            exchange_config=ExchangeConfig(),
+            mode="FORCE_OPEN",
+            daily_candles_fetcher=fetch_down,
+            fear_greed_fetcher=fetch_fg,
+            global_mcap_fetcher=fetch_mcap,
+        )
+        rep_open = await svc_open.refresh(force=True)
+        assert rep_open.btc_lock_state == BtcLockState.OPEN
+        assert rep_open.risk_level == MarketRiskLevel.PANIC
+
+        svc_lock = MarketIntelligenceService(
+            exchange_config=ExchangeConfig(),
+            mode="FORCE_LOCK",
+            daily_candles_fetcher=fetch_down,
+            fear_greed_fetcher=fetch_fg,
+            global_mcap_fetcher=fetch_mcap,
+        )
+        rep_lock = await svc_lock.refresh(force=True)
+        assert rep_lock.btc_lock_state == BtcLockState.LOCKED
+
+        alert_text = format_market_intelligence_alert(rep_lock)
+        assert "INVESTIGACION DEL MERCADO CRIPTO" in alert_text
+        assert "BLOQUEADO" in alert_text
+        assert "PANICO EXTREMO" in alert_text
+        assert "12/100" in alert_text
+
+    asyncio.run(_run_overrides())
+
+    multi_hb = format_heartbeat_alert(
+        symbol="ETHUSDT",
+        interval="15m",
+        open_position_symbol="BTCUSDT + ETHUSDT",
+        open_position_entry_price=62_880.40,
+        available_cash_usdt=0.40,
+        cop_per_usdt_rate=3_194.0,
+        total_realized_pnl_usdt=0.0293,
+        closed_trades_count=2,
+        win_rate_pct=100.0,
+        open_positions_detail=[("BTCUSDT", 62_880.40), ("ETHUSDT", 1_777.12)],
+        market_intelligence_summary="Compras en BTC: BLOQUEADO hasta estabilizacion",
+    )
+    assert "BTC (62880.40 USDT), ETH (1777.12 USDT)" in multi_hb
+    assert "BLOQUEADO" in multi_hb

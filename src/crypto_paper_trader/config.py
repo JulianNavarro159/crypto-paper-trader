@@ -160,6 +160,8 @@ class RiskConfig:
     use_dynamic_slot_sizing: bool = False
     fast_exit_cooldown_seconds: float = 300.0
     full_reset_before_epoch_ms: int = 0
+    btc_buy_lock_mode: str = "AUTO"
+    btc_lock_strict_mode: bool = False
 
     @classmethod
     def spot_no_loss_micro_profit(
@@ -224,6 +226,8 @@ class RiskConfig:
         min_target_net_profit_usdt: float = 0.005,
         max_concurrent_positions: int = 4,
         full_reset_before_epoch_ms: int = 0,
+        btc_buy_lock_mode: str = "AUTO",
+        btc_lock_strict_mode: bool = False,
     ) -> RiskConfig:
         """Build high-turnover multi-slot Spot config with immediate minimal exit.
 
@@ -231,6 +235,8 @@ class RiskConfig:
             min_target_net_profit_usdt: Minimum net USDT gain required per exit.
             max_concurrent_positions: Simultaneous independent coins to hold.
             full_reset_before_epoch_ms: Optional UTC cutoff for one-time reset.
+            btc_buy_lock_mode: BTC stabilization lock mode (AUTO/FORCE_LOCK/FORCE_OPEN).
+            btc_lock_strict_mode: Require daily EMA10 >= EMA20 to unlock BTC buys.
 
         Returns:
             Configured RiskConfig for rapid 100% micro-profit exits across slots.
@@ -252,6 +258,8 @@ class RiskConfig:
             fast_exit_cooldown_seconds=60.0,
             btc_unlock_mode="NONE",
             full_reset_before_epoch_ms=full_reset_before_epoch_ms,
+            btc_buy_lock_mode=btc_buy_lock_mode,
+            btc_lock_strict_mode=btc_lock_strict_mode,
         )
 
 

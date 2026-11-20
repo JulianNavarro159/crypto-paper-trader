@@ -3,12 +3,15 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol, Sequence
 
 import httpx
 
 from crypto_paper_trader.domain import OrderSide, TradeExecution
 from crypto_paper_trader.formatting import format_price, format_quantity
+
+if TYPE_CHECKING:
+    from crypto_paper_trader.market_intelligence import MarketIntelligenceReport
 
 logger = logging.getLogger(__name__)
 
@@ -413,6 +416,8 @@ def format_heartbeat_alert(
     total_realized_pnl_usdt: float,
     closed_trades_count: int,
     win_rate_pct: float,
+    open_positions_detail: Sequence[tuple[str, float]] | None = None,
+    market_intelligence_summary: str | None = None,
 ) -> str:
     """Format a two-hour health status report into clear, human-friendly Spanish.
 
@@ -426,13 +431,26 @@ def format_heartbeat_alert(
         total_realized_pnl_usdt: Cumulative realized profit or loss.
         closed_trades_count: Number of closed trades executed.
         win_rate_pct: Percentage of winning trades.
+        open_positions_detail: Optional sequence of (symbol, entry_price) pairs.
+        market_intelligence_summary: Optional Spanish market research snippet.
 
     Returns:
         Clear status notification understandable without trading knowledge.
     """
     clean_symbol = symbol[:-4] if symbol.upper().endswith("USDT") else symbol
 
-    if open_position_symbol and open_position_entry_price is not None:
+    if open_positions_detail and len(open_positions_detail) > 1:
+        pos_items = [
+            f"{sym[:-4] if sym.upper().endswith('USDT') else sym} "
+            f"({format_price(entry)} USDT)"
+            for sym, entry in open_positions_detail
+        ]
+        pos_line = (
+            "Operaciones actuales: "
+            + ", ".join(pos_items)
+            + ". El bot vigila cada moneda para vender con ganancia."
+        )
+    elif open_position_symbol and open_position_entry_price is not None:
         pos_clean = (
             open_position_symbol[:-4]
             if open_position_symbol.upper().endswith("USDT")
@@ -467,6 +485,10 @@ def format_heartbeat_alert(
             f"operaciones ({win_rate_pct:.0f}% exitosas)"
         )
 
+    intel_line = (
+        f"\n{market_intelligence_summary}" if market_intelligence_summary else ""
+    )
+
     return (
         "REPORTE PERIODICO DE ESTADO 24/7\n"
         "Tu bot esta funcionando correctamente en la nube 24/7.\n"
@@ -474,6 +496,52 @@ def format_heartbeat_alert(
         f"{pos_line}"
         f"{cash_line}"
         f"{perf_line}"
+        f"{intel_line}"
+    )
+
+
+def format_market_intelligence_alert(report: MarketIntelligenceReport) -> str:
+    """Format a Spanish mobile alert describing BTC lock state and market research.
+
+    Args:
+        report: Latest MarketIntelligenceReport from MarketIntelligenceService.
+
+    Returns:
+        Clear multi-line Spanish notification explaining the market regime.
+    """
+    risk_labels = {
+        "PANIC": "PANICO EXTREMO",
+        "CAUTION": "PRECAUCION",
+        "NEUTRAL": "NEUTRAL",
+        "CONSTRUCTIVE": "CONSTRUCTIVO",
+    }
+    risk_text = risk_labels.get(report.risk_level.value, report.risk_level.value)
+    lock_line = (
+        "BLOQUEADO: El bot NO comprara Bitcoin (BTC) hasta ver estabilizacion."
+        if report.btc_lock_state.value == "LOCKED"
+        else "HABILITADO: Bitcoin (BTC) mostro estabilizacion y vuelve a operar."
+    )
+    fg_text = (
+        f"{report.fear_greed_value}/100"
+        if report.fear_greed_value is not None
+        else "No disponible"
+    )
+    mcap_text = (
+        f"{report.global_market_cap_change_24h_pct:+.2f}%"
+        if report.global_market_cap_change_24h_pct is not None
+        else "No disponible"
+    )
+    reasons_text = "; ".join(report.reasons)
+    return (
+        "INVESTIGACION DEL MERCADO CRIPTO\n"
+        f"Estado de compras en BTC: {lock_line}\n"
+        f"Clima del mercado: {risk_text} | Fear & Greed: {fg_text}\n"
+        f"BTC hoy: {format_price(report.btc_price)} USDT "
+        f"(EMA10 diaria: {format_price(report.btc_daily_ema10)} USDT | "
+        f"24h: {report.btc_change_24h_pct:+.2f}%)\n"
+        f"Mercado global 24h: {mcap_text} | Monedas al alza: "
+        f"{report.universe_breadth_pct:.0f}%\n"
+        f"Motivo: {reasons_text}"
     )
 
 

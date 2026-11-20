@@ -577,6 +577,7 @@ class PaperTradingEngine:
         self._dca_applied_position_ids: set[str] = {
             e.position_id for e in past_execs if e.reason == "SMART_DCA"
         }
+        self._buy_blocked_symbols: set[str] = set()
         loaded_positions = self._ledger.fetch_all_open_positions()
         self._open_positions: dict[str, Position] = {
             pos.symbol.upper(): pos for pos in loaded_positions
@@ -676,6 +677,14 @@ class PaperTradingEngine:
         self._reconcile_external_clear()
         return symbol.upper() in self._open_positions
 
+    def set_buy_blocked_symbols(self, symbols: set[str]) -> None:
+        """Configure symbols prohibited from opening new BUY or DCA orders.
+
+        Args:
+            symbols: Set of uppercase symbol names blocked from new entries.
+        """
+        self._buy_blocked_symbols = {sym.upper() for sym in symbols}
+
     def get_open_position(self, symbol: str) -> Position | None:
         """Return the open position for a specific symbol or None."""
         self._reconcile_external_clear()
@@ -685,6 +694,8 @@ class PaperTradingEngine:
         """Return True if a new slot is available to open a position for symbol."""
         self._reconcile_external_clear()
         upper_sym = symbol.upper()
+        if upper_sym in self._buy_blocked_symbols:
+            return False
         if upper_sym in self._open_positions:
             return False
         if not self._open_positions:
@@ -714,6 +725,8 @@ class PaperTradingEngine:
 
     def _can_dca_position(self, pos: Position, current_price: float) -> bool:
         """Return True if a held non-reconciled position qualifies for Smart DCA."""
+        if pos.symbol.upper() in self._buy_blocked_symbols:
+            return False
         if not self._risk_config.enable_dca_average_down:
             return False
         if pos.position_id.startswith("reconciled-"):
@@ -733,7 +746,10 @@ class PaperTradingEngine:
     def can_open_or_dca_symbol(self, symbol: str, current_price: float) -> bool:
         """Return True if symbol can open a fresh slot or execute a Smart DCA buy."""
         self._reconcile_external_clear()
-        pos = self._open_positions.get(symbol.upper())
+        upper_sym = symbol.upper()
+        if upper_sym in self._buy_blocked_symbols:
+            return False
+        pos = self._open_positions.get(upper_sym)
         if pos is None:
             return self.can_open_position_for_symbol(symbol)
         return self._can_dca_position(pos, current_price)

@@ -33,12 +33,20 @@ from crypto_paper_trader.execution import LedgerRepository, compute_no_loss_exit
 from crypto_paper_trader.formatting import format_price, format_quantity
 from crypto_paper_trader.ingestion import BinanceMarketDataClient
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
+from crypto_paper_trader.market_intelligence import (
+    BtcLockState,
+    MarketIntelligenceReport,
+    MarketIntelligenceService,
+    MarketRiskLevel,
+    format_market_intelligence_log,
+)
 from crypto_paper_trader.notifications import (
     NotificationService,
     build_notifier_from_env,
     format_balance_summary_alert,
     format_full_reset_alert,
     format_heartbeat_alert,
+    format_market_intelligence_alert,
     format_recovery_alert,
     format_startup_alert,
 )
@@ -271,11 +279,37 @@ async def start_cloud_health_server() -> None:
         asyncio.create_task(keep_alive_ping())
 
 
+def _build_heartbeat_intel_summary(
+    report: MarketIntelligenceReport | None,
+) -> str | None:
+    """Format a compact Spanish market intelligence summary for 2h heartbeats."""
+    if report is None:
+        return None
+    lock_label = (
+        "BLOQUEADO hasta estabilizacion"
+        if report.btc_lock_state == BtcLockState.LOCKED
+        else "HABILITADO"
+    )
+    fg_label = (
+        f"{report.fear_greed_value}/100"
+        if report.fear_greed_value is not None
+        else "NA"
+    )
+    return (
+        f"Investigacion de mercado: Clima {report.risk_level.value} "
+        f"(Fear & Greed: {fg_label} | Al alza: {report.universe_breadth_pct:.0f}%)\n"
+        f"Compras en BTC: {lock_label}"
+    )
+
+
 async def start_periodic_health_heartbeat(
     notifier: NotificationService,
     config: TradingSystemConfig,
     live_client: BinanceSpotAuthenticatedClient | None,
     get_active_symbol: Callable[[], str] | None = None,
+    get_intelligence_report: (
+        Callable[[], MarketIntelligenceReport | None] | None
+    ) = None,
 ) -> None:
     """Send periodic health confirmation alerts to ntfy every two hours.
 
@@ -335,6 +369,11 @@ async def start_periodic_health_heartbeat(
                     else config.exchange.symbol
                 )
             )
+            intel_summary = (
+                _build_heartbeat_intel_summary(get_intelligence_report())
+                if get_intelligence_report is not None
+                else None
+            )
             heartbeat_msg = format_heartbeat_alert(
                 symbol=monitored_symbol,
                 interval=config.exchange.interval,
@@ -345,6 +384,10 @@ async def start_periodic_health_heartbeat(
                 total_realized_pnl_usdt=total_realized_pnl,
                 closed_trades_count=closed_trades,
                 win_rate_pct=win_rate,
+                open_positions_detail=[
+                    (pos.symbol, pos.entry_price) for pos in open_positions
+                ],
+                market_intelligence_summary=intel_summary,
             )
             delivered = notifier.send_alert(heartbeat_msg)
             interval_seconds = 7200.0 if delivered else 900.0
@@ -369,6 +412,11 @@ async def run_application(args: argparse.Namespace) -> None:
         str(DEFAULT_FULL_RESET_BEFORE_EPOCH_MS),
     ).strip()
     reset_cutoff_ms = int(reset_cutoff_raw) if reset_cutoff_raw.isdigit() else 0
+    btc_lock_mode = os.getenv("BTC_BUY_LOCK_MODE", "AUTO").strip().upper() or "AUTO"
+    btc_lock_strict = (
+        os.getenv("BTC_LOCK_STRICT_MODE", "false").strip().lower()
+        in ("1", "true", "yes")
+    )
     config = TradingSystemConfig(
         capital=CapitalConfig(
             initial_capital_cop=args.capital_cop,
@@ -382,6 +430,8 @@ async def run_application(args: argparse.Namespace) -> None:
             min_target_net_profit_usdt=0.005,
             max_concurrent_positions=4,
             full_reset_before_epoch_ms=reset_cutoff_ms,
+            btc_buy_lock_mode=btc_lock_mode,
+            btc_lock_strict_mode=btc_lock_strict,
         ),
         ledger_db_path=args.db_path,
     )
@@ -534,6 +584,13 @@ async def run_application(args: argparse.Namespace) -> None:
     active_macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
     initial_universe_candles: dict[str, list[Candle]] = {}
     initial_qualified_symbols: set[str] = set()
+    intel_service = MarketIntelligenceService(
+        exchange_config=config.exchange,
+        mode=config.risk.btc_buy_lock_mode,
+        strict=config.risk.btc_lock_strict_mode,
+    )
+    latest_intel_report: MarketIntelligenceReport | None = None
+    last_alerted_intel_key: tuple[BtcLockState, MarketRiskLevel] | None = None
 
     if existing_open_pos is not None:
         config = replace(
@@ -560,17 +617,31 @@ async def run_application(args: argparse.Namespace) -> None:
                 config=config,
             )
             log_universe_ranking(rankings)
-            initial_qualified_symbols = select_qualified_universe_symbols(
-                rankings, max_symbols=6
+            latest_intel_report = await intel_service.refresh(
+                candles_by_symbol=initial_universe_candles,
+                force=True,
             )
-            if rankings:
+            logger.info(
+                "MARKET INTELLIGENCE | %s",
+                format_market_intelligence_log(latest_intel_report),
+            )
+            filtered_rankings = (
+                [r for r in rankings if r.symbol.upper() != "BTCUSDT"]
+                if latest_intel_report.btc_lock_state == BtcLockState.LOCKED
+                else rankings
+            )
+            initial_qualified_symbols = select_qualified_universe_symbols(
+                filtered_rankings or rankings, max_symbols=6
+            )
+            pick_pool = filtered_rankings or rankings
+            if pick_pool:
                 non_held = [
                     item
-                    for item in rankings
+                    for item in pick_pool
                     if item.symbol.upper() not in held_symbols_set
                 ]
                 if existing_open_pos is None:
-                    best_symbol = rankings[0].symbol
+                    best_symbol = pick_pool[0].symbol
                     config = replace(
                         config,
                         exchange=replace(config.exchange, symbol=best_symbol),
@@ -587,6 +658,12 @@ async def run_application(args: argparse.Namespace) -> None:
                 exc,
                 config.exchange.symbol,
             )
+    elif args.mode in ("realtime", "live"):
+        latest_intel_report = await intel_service.refresh(force=True)
+        logger.info(
+            "MARKET INTELLIGENCE | %s",
+            format_market_intelligence_log(latest_intel_report),
+        )
 
     use_multi_radar = bool(args.auto_select and args.mode != "backtest")
     provider = BinanceMarketDataClient(
@@ -612,6 +689,12 @@ async def run_application(args: argparse.Namespace) -> None:
             interval=config.exchange.interval,
         )
     )
+    if latest_intel_report is not None and args.mode == "live":
+        last_alerted_intel_key = (
+            latest_intel_report.btc_lock_state,
+            latest_intel_report.risk_level,
+        )
+        notifier.send_alert(format_market_intelligence_alert(latest_intel_report))
 
     asyncio.create_task(
         start_periodic_health_heartbeat(
@@ -619,6 +702,7 @@ async def run_application(args: argparse.Namespace) -> None:
             config=config,
             live_client=live_client,
             get_active_symbol=lambda: config.exchange.symbol,
+            get_intelligence_report=lambda: latest_intel_report,
         )
     )
 
@@ -630,6 +714,8 @@ async def run_application(args: argparse.Namespace) -> None:
         live_client=live_client,
         multi_symbol_mode=use_multi_radar,
     )
+    if latest_intel_report is not None:
+        orchestrator.set_market_intelligence(latest_intel_report)
     if (
         args.mode == "live"
         and live_client is not None
@@ -732,14 +818,42 @@ async def run_application(args: argparse.Namespace) -> None:
                         config=config,
                     )
                     log_universe_ranking(rankings)
+                    latest_intel_report = await intel_service.refresh(
+                        candles_by_symbol=universe_candles
+                    )
+                    logger.info(
+                        "MARKET INTELLIGENCE | %s",
+                        format_market_intelligence_log(latest_intel_report),
+                    )
+                    orchestrator.set_market_intelligence(latest_intel_report)
+                    current_intel_key = (
+                        latest_intel_report.btc_lock_state,
+                        latest_intel_report.risk_level,
+                    )
+                    if (
+                        args.mode == "live"
+                        and current_intel_key != last_alerted_intel_key
+                    ):
+                        last_alerted_intel_key = current_intel_key
+                        notifier.send_alert(
+                            format_market_intelligence_alert(latest_intel_report)
+                        )
+                    filtered_rankings = (
+                        [r for r in rankings if r.symbol.upper() != "BTCUSDT"]
+                        if latest_intel_report.btc_lock_state == BtcLockState.LOCKED
+                        else rankings
+                    )
                     orchestrator.set_qualified_symbols(
-                        select_qualified_universe_symbols(rankings, max_symbols=6)
+                        select_qualified_universe_symbols(
+                            filtered_rankings or rankings, max_symbols=6
+                        )
                     )
                     for sym_candles in universe_candles.values():
                         for seed_candle in sym_candles:
                             orchestrator._upsert_candle(seed_candle)
-                    if rankings and rankings[0].symbol != config.exchange.symbol:
-                        new_symbol = rankings[0].symbol
+                    pick_pool = filtered_rankings or rankings
+                    if pick_pool and pick_pool[0].symbol != config.exchange.symbol:
+                        new_symbol = pick_pool[0].symbol
                         config = replace(
                             config,
                             exchange=replace(config.exchange, symbol=new_symbol),

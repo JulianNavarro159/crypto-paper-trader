@@ -17,6 +17,10 @@ from crypto_paper_trader.execution import LedgerRepository, PaperTradingEngine
 from crypto_paper_trader.formatting import format_price
 from crypto_paper_trader.ingestion import MarketDataProvider
 from crypto_paper_trader.live_exchange import BinanceSpotAuthenticatedClient
+from crypto_paper_trader.market_intelligence import (
+    BtcLockState,
+    MarketIntelligenceReport,
+)
 from crypto_paper_trader.notifications import NotificationService
 from crypto_paper_trader.simulation import run_time_machine_simulation
 from crypto_paper_trader.strategy import evaluate_macro_regime, evaluate_market_signal
@@ -68,6 +72,8 @@ class RealTimeTradingOrchestrator:
         self._cooldown_until_ts: float = 0.0
         self._cooldown_until_by_symbol: dict[str, float] = {}
         self._qualified_symbols: set[str] = set()
+        self._buy_blocked_symbols: set[str] = set()
+        self._btc_lock_reasons: tuple[str, ...] = ()
 
     def set_macro_regime(self, regime: MacroMarketRegime) -> None:
         """Update the active macro market regime classification.
@@ -83,7 +89,31 @@ class RealTimeTradingOrchestrator:
         Args:
             symbols: Set of uppercase symbol identifiers approved by the scanner.
         """
-        self._qualified_symbols = {sym.upper() for sym in symbols}
+        self._qualified_symbols = {
+            sym.upper()
+            for sym in symbols
+            if sym.upper() not in self._buy_blocked_symbols
+        }
+
+    def set_market_intelligence(self, report: MarketIntelligenceReport) -> None:
+        """Apply BTC stabilization lock and market intelligence state to engine.
+
+        Args:
+            report: Latest MarketIntelligenceReport from MarketIntelligenceService.
+        """
+        if report.btc_lock_state == BtcLockState.LOCKED:
+            self._buy_blocked_symbols = {"BTCUSDT"}
+            self._btc_lock_reasons = report.reasons
+        else:
+            self._buy_blocked_symbols = set()
+            self._btc_lock_reasons = ()
+        self._engine.set_buy_blocked_symbols(self._buy_blocked_symbols)
+        if self._qualified_symbols:
+            self._qualified_symbols = {
+                sym
+                for sym in self._qualified_symbols
+                if sym not in self._buy_blocked_symbols
+            }
 
     def _upsert_candle(self, candle: Candle) -> list[Candle]:
         """Insert or update a candle in the rolling window by open_time epoch.
@@ -281,6 +311,22 @@ class RealTimeTradingOrchestrator:
                 symbol=target_symbol,
                 config=self._config.strategy,
             )
+
+        if (
+            signal.signal_type == SignalType.BUY
+            and target_symbol in self._buy_blocked_symbols
+        ):
+            reason_msg = (
+                "; ".join(self._btc_lock_reasons)
+                if self._btc_lock_reasons
+                else "mercado bajista"
+            )
+            logger.info(
+                "Suppressed BUY signal on %s: BTC stabilization lock active (%s).",
+                signal.symbol,
+                reason_msg,
+            )
+            signal = replace(signal, signal_type=SignalType.HOLD)
 
         active_cooldown_deadline = (
             self._cooldown_until_by_symbol.get(target_symbol, 0.0)
