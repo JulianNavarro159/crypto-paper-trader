@@ -3531,3 +3531,58 @@ def test_dual_target_scanner_candidates_time_machine_and_alerts() -> None:
     assert "Monedas abiertas: Ninguna" not in sell_alert
     assert "BALANCE TOTAL: 26.40 USDT" in sell_alert
     assert translate_exit_reason(ExitReason.BREAKEVEN_RECOVERY.value) != ""
+
+
+def test_btc_short_term_stabilization_unlock_and_relock_without_ping_pong() -> None:
+    """Verify 2-day higher lows + EMA5 unlocks BTC cleanly and relocks on breakdown."""
+    from crypto_paper_trader.market_intelligence import (
+        BtcLockState,
+        evaluate_btc_stabilization,
+    )
+
+    base_closes = [72_000.0 - (idx * 550.0) for idx in range(18)]
+    base_lows = [p - 400.0 for p in base_closes]
+
+    crash_closes = base_closes + [61_986.7, 58_951.5, 60_215.8]
+    crash_lows = base_lows + [61_428.3, 57_778.3, 55_130.0]
+    crash_candles = _build_daily_btc_series(crash_closes, crash_lows)
+    state_day1, _ = evaluate_btc_stabilization(
+        crash_candles, previous_state=BtcLockState.LOCKED, repaired_streak=2
+    )
+    assert state_day1 == BtcLockState.LOCKED
+
+    stab_closes = crash_closes + [61_271.1, 61_480.0]
+    stab_lows = crash_lows + [58_768.5, 60_386.0]
+    stab_candles = _build_daily_btc_series(stab_closes, stab_lows)
+
+    state_first, _ = evaluate_btc_stabilization(
+        stab_candles, previous_state=BtcLockState.LOCKED, repaired_streak=1
+    )
+    assert state_first == BtcLockState.LOCKED
+
+    state_open, open_reasons = evaluate_btc_stabilization(
+        stab_candles, previous_state=BtcLockState.LOCKED, repaired_streak=2
+    )
+    assert state_open == BtcLockState.OPEN
+    assert "EMA5" in open_reasons[0]
+
+    state_strict, _ = evaluate_btc_stabilization(
+        stab_candles,
+        previous_state=BtcLockState.LOCKED,
+        strict=True,
+        repaired_streak=2,
+    )
+    assert state_strict == BtcLockState.LOCKED
+
+    state_hold_open, _ = evaluate_btc_stabilization(
+        stab_candles, previous_state=BtcLockState.OPEN
+    )
+    assert state_hold_open == BtcLockState.OPEN
+
+    breakdown_closes = stab_closes + [59_900.0]
+    breakdown_lows = stab_lows + [58_600.0]
+    breakdown_candles = _build_daily_btc_series(breakdown_closes, breakdown_lows)
+    state_relock, _ = evaluate_btc_stabilization(
+        breakdown_candles, previous_state=BtcLockState.OPEN
+    )
+    assert state_relock == BtcLockState.LOCKED

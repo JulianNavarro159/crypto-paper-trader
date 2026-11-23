@@ -91,9 +91,11 @@ def evaluate_btc_stabilization(
     ordered = sorted(daily_candles, key=lambda c: c.open_time)
     closes = pd.Series([float(c.close_price) for c in ordered], dtype=float)
     lows = [float(c.low_price) for c in ordered]
+    ema5 = float(compute_ema(closes, 5).iloc[-1])
     ema10 = float(compute_ema(closes, 10).iloc[-1])
     ema20 = float(compute_ema(closes, 20).iloc[-1])
     last_close = float(closes.iloc[-1])
+    close_2d_ago = float(closes.iloc[-3])
     last_low = lows[-1]
 
     recent_3d_low = min(lows[-3:])
@@ -101,17 +103,32 @@ def evaluate_btc_stabilization(
     has_higher_low = recent_3d_low > prior_14d_low
     above_ema10 = last_close > ema10
     ema_aligned = (ema10 >= ema20) if strict else True
+    full_repair = has_higher_low and above_ema10 and ema_aligned
+
+    has_2d_higher_lows = lows[-1] > lows[-2] > lows[-3]
+    positive_2d_close = last_close > close_2d_ago
+    near_or_above_ema5 = last_close >= (ema5 * 0.995)
+    short_term_stabilized = (
+        (not strict)
+        and has_2d_higher_lows
+        and positive_2d_close
+        and near_or_above_ema5
+    )
 
     if previous_state == BtcLockState.LOCKED:
-        if has_higher_low and above_ema10 and ema_aligned:
+        if full_repair or short_term_stabilized:
             if repaired_streak >= 2:
-                return (
-                    BtcLockState.OPEN,
-                    (
-                        "Estructura diaria reparada (minimo ascendente y "
-                        "cierre sobre EMA10 diaria confirmado)",
-                    ),
+                unlock_reason = (
+                    "Estructura diaria reparada (minimo ascendente y "
+                    "cierre sobre EMA10 diaria confirmado)"
+                    if full_repair
+                    else (
+                        "Estabilizacion de corto plazo confirmada (2 dias "
+                        "con minimos ascendentes y precio sosteniendo "
+                        f"EMA5 diaria en {ema5:,.0f})"
+                    )
                 )
+                return (BtcLockState.OPEN, (unlock_reason,))
             return (
                 BtcLockState.LOCKED,
                 (
@@ -121,12 +138,16 @@ def evaluate_btc_stabilization(
             )
 
         reasons: list[str] = []
-        if not has_higher_low:
+        if not has_higher_low and not has_2d_higher_lows:
             reasons.append(
-                f"BTC sigue marcando minimos bajos ({recent_3d_low:,.0f} <= "
-                f"{prior_14d_low:,.0f})"
+                f"BTC aun sin 2 dias de minimos ascendentes "
+                f"(3d: {recent_3d_low:,.0f} vs 14d: {prior_14d_low:,.0f})"
             )
-        if not above_ema10:
+        if not near_or_above_ema5:
+            reasons.append(
+                f"Cierre diario ({last_close:,.0f}) debajo de EMA5 ({ema5:,.0f})"
+            )
+        elif not above_ema10:
             reasons.append(
                 f"Cierre diario ({last_close:,.0f}) debajo de EMA10 ({ema10:,.0f})"
             )
@@ -136,15 +157,30 @@ def evaluate_btc_stabilization(
             )
         return (BtcLockState.LOCKED, tuple(reasons))
 
-    below_ema10_2pct = last_close < (ema10 * 0.98)
     prior_7d_low = min(lows[-8:-1])
     new_7d_low = last_low < prior_7d_low
-    if below_ema10_2pct or new_7d_low:
+    if strict:
+        below_ema_limit = last_close < (ema10 * 0.98)
+        broke_short_support = False
+    else:
+        below_ema_limit = last_close < (ema5 * 0.98)
+        broke_short_support = (
+            last_low < lows[-2] and last_close < (ema5 * 0.990)
+        )
+
+    if below_ema_limit or new_7d_low or broke_short_support:
         relock_reasons: list[str] = []
-        if below_ema10_2pct:
+        if below_ema_limit:
+            ref_label = "EMA10" if strict else "EMA5"
+            ref_val = ema10 if strict else ema5
             relock_reasons.append(
-                f"BTC cayo mas de 2% bajo EMA10 diaria ({last_close:,.0f} < "
-                f"{ema10 * 0.98:,.0f})"
+                f"BTC cayo mas de 2% bajo {ref_label} diaria "
+                f"({last_close:,.0f} < {ref_val * 0.98:,.0f})"
+            )
+        if broke_short_support:
+            relock_reasons.append(
+                f"BTC rompio minimo del dia previo ({last_low:,.0f} < "
+                f"{lows[-2]:,.0f}) debajo de EMA5 ({ema5:,.0f})"
             )
         if new_7d_low:
             relock_reasons.append(
@@ -153,10 +189,12 @@ def evaluate_btc_stabilization(
             )
         return (BtcLockState.LOCKED, tuple(relock_reasons))
 
-    return (
-        BtcLockState.OPEN,
-        ("Estructura diaria de BTC estable sobre soporte y EMA10",),
+    stable_reason = (
+        "Estructura diaria de BTC estable sobre soporte y EMA10"
+        if strict
+        else "Estructura diaria de BTC estable sobre soporte y EMA5"
     )
+    return (BtcLockState.OPEN, (stable_reason,))
 
 
 def classify_market_risk(
