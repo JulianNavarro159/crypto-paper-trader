@@ -6,7 +6,7 @@ from typing import Sequence
 import numpy as np
 
 from crypto_paper_trader.config import ExchangeConfig, RiskConfig
-from crypto_paper_trader.domain import Candle, MarketSignal
+from crypto_paper_trader.domain import Candle, MarketSignal, SlotRole
 
 
 @dataclass(frozen=True)
@@ -44,6 +44,7 @@ def run_time_machine_simulation(
     replays_count: int = 10_000,
     horizon_candles: int = 16,
     min_win_probability_pct: float = 55.0,
+    target_role: SlotRole = SlotRole.SCALP,
 ) -> TimeMachineSimulationReport:
     """Replay 10,000 bootstrapped forward price paths from the asset's own candles.
 
@@ -55,6 +56,7 @@ def run_time_machine_simulation(
         replays_count: Number of Monte Carlo / Empirical Bootstrap sessions to run.
         horizon_candles: Forward lookahead window in candles per simulated session.
         min_win_probability_pct: Minimum win probability required to approve entry.
+        target_role: SlotRole profile (SCALP or SWING) guiding entry validation.
 
     Returns:
         TimeMachineSimulationReport summarizing the 10,000 simulated outcomes.
@@ -137,12 +139,25 @@ def run_time_machine_simulation(
     round_trip_fee = 2.0 * exchange_config.taker_fee_rate
 
     if risk_config.no_loss_spot_mode:
-        micro_tp_buffer = (
-            0.0010 if risk_config.min_target_net_profit_usdt < 0.01 else 0.0007
-        )
+        if target_role == SlotRole.SWING:
+            micro_tp_buffer = 0.0050
+            adverse_dip_ratio = 0.9925
+            min_clean_target_prob = 36.0
+        elif risk_config.min_target_net_profit_usdt >= 0.02:
+            micro_tp_buffer = 0.0040
+            adverse_dip_ratio = 0.9935
+            min_clean_target_prob = 36.0
+        else:
+            micro_tp_buffer = (
+                0.0010 if risk_config.min_target_net_profit_usdt < 0.01 else 0.0007
+            )
+            adverse_dip_ratio = 0.9950
+            min_clean_target_prob = (
+                40.0 if risk_config.use_dynamic_slot_sizing else 45.0
+            )
         micro_tp_ratio = round_trip_fee + micro_tp_buffer
         micro_tp_price = entry_price * (1.0 + micro_tp_ratio)
-        adverse_dip_price = entry_price * 0.9950
+        adverse_dip_price = entry_price * adverse_dip_ratio
         sentinel = horizon_candles + 1
         tp_mask = high_paths >= micro_tp_price
         dip_mask = low_paths <= adverse_dip_price
@@ -170,7 +185,6 @@ def run_time_machine_simulation(
         target_prob = round(float(np.mean(clean_micro_win) * 100.0), 2)
         stop_prob = round(float(np.mean(~hit_any_win) * 100.0), 2)
         expected_ret = round(float(np.mean(net_returns) * 100.0), 4)
-        min_clean_target_prob = 40.0 if risk_config.use_dynamic_slot_sizing else 45.0
         approved = bool(
             win_prob >= min_win_probability_pct
             and target_prob >= min_clean_target_prob

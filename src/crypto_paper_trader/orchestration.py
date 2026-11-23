@@ -12,6 +12,7 @@ from crypto_paper_trader.domain import (
     MarketSignal,
     PortfolioSnapshot,
     SignalType,
+    SlotRole,
 )
 from crypto_paper_trader.execution import LedgerRepository, PaperTradingEngine
 from crypto_paper_trader.formatting import format_price
@@ -72,6 +73,7 @@ class RealTimeTradingOrchestrator:
         self._cooldown_until_ts: float = 0.0
         self._cooldown_until_by_symbol: dict[str, float] = {}
         self._qualified_symbols: set[str] = set()
+        self._swing_candidate_symbols: set[str] = set()
         self._buy_blocked_symbols: set[str] = set()
         self._btc_lock_reasons: tuple[str, ...] = ()
 
@@ -95,6 +97,19 @@ class RealTimeTradingOrchestrator:
             if sym.upper() not in self._buy_blocked_symbols
         }
 
+    def set_swing_candidate_symbols(self, symbols: set[str]) -> None:
+        """Configure universe symbols eligible to open the high-target SWING slot.
+
+        Args:
+            symbols: Set of uppercase symbol identifiers approved for Swing holds.
+        """
+        self._swing_candidate_symbols = {
+            sym.upper()
+            for sym in symbols
+            if sym.upper() not in self._buy_blocked_symbols
+        }
+        self._engine.set_swing_candidate_symbols(self._swing_candidate_symbols)
+
     def set_market_intelligence(self, report: MarketIntelligenceReport) -> None:
         """Apply BTC stabilization lock and market intelligence state to engine.
 
@@ -114,6 +129,13 @@ class RealTimeTradingOrchestrator:
                 for sym in self._qualified_symbols
                 if sym not in self._buy_blocked_symbols
             }
+        if self._swing_candidate_symbols:
+            self._swing_candidate_symbols = {
+                sym
+                for sym in self._swing_candidate_symbols
+                if sym not in self._buy_blocked_symbols
+            }
+            self._engine.set_swing_candidate_symbols(self._swing_candidate_symbols)
 
     def _upsert_candle(self, candle: Candle) -> list[Candle]:
         """Insert or update a candle in the rolling window by open_time epoch.
@@ -439,6 +461,9 @@ class RealTimeTradingOrchestrator:
             and signal.signal_type == SignalType.BUY
             and self._config.risk.enable_time_machine_gate
         ):
+            planned_role = (
+                self._engine.resolve_next_slot_role(target_symbol) or SlotRole.SCALP
+            )
             tm_report = run_time_machine_simulation(
                 candles=rolling_candles,
                 signal=signal,
@@ -446,6 +471,7 @@ class RealTimeTradingOrchestrator:
                 exchange_config=self._config.exchange,
                 replays_count=self._config.risk.time_machine_replays,
                 min_win_probability_pct=self._config.risk.time_machine_min_win_prob_pct,
+                target_role=planned_role,
             )
             if not tm_report.approved:
                 logger.info(
@@ -481,7 +507,11 @@ class RealTimeTradingOrchestrator:
             )
             if (
                 signal_exec is not None
-                and signal_exec.reason == ExitReason.SIGNAL_REVERSAL.value
+                and signal_exec.reason
+                in (
+                    ExitReason.SIGNAL_REVERSAL.value,
+                    ExitReason.BREAKEVEN_RECOVERY.value,
+                )
             ):
                 deadline = (
                     candle.close_time.timestamp()

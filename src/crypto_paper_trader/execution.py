@@ -16,6 +16,7 @@ from crypto_paper_trader.domain import (
     PortfolioSnapshot,
     Position,
     SignalType,
+    SlotRole,
     TradeExecution,
 )
 from crypto_paper_trader.formatting import format_price, format_quantity
@@ -43,16 +44,19 @@ def compute_no_loss_exit_levels(
     taker_fee_rate: float,
     min_target_net_profit_usdt: float,
     include_live_spread_cushion: bool = False,
+    min_floor_net_profit_usdt: float | None = None,
 ) -> tuple[float, float]:
-    """Compute fee-covered safety floor and micro-profit target price.
+    """Compute fee-covered safety floor and target profit exit price.
 
     Args:
         entry_price: Executed purchase price per unit of base asset.
         quantity: Base asset quantity held in the position.
         notional_usdt: Total USDT cost basis allocated to the position.
         taker_fee_rate: Fractional exchange fee rate per side.
-        min_target_net_profit_usdt: Minimum net USDT gain required to sell.
+        min_target_net_profit_usdt: Target net USDT gain required for take profit.
         include_live_spread_cushion: Add bid-ask spread cushion for live fills.
+        min_floor_net_profit_usdt: Optional separate net USDT gain for the safety
+            floor; defaults to min_target_net_profit_usdt when omitted.
 
     Returns:
         Tuple of (safety_floor_price, target_take_profit_price) strictly
@@ -64,19 +68,32 @@ def compute_no_loss_exit_levels(
     effective_cost_usdt = max(notional_usdt, implied_entry_cost)
     net_denom = safe_qty * safe_net_factor
 
-    min_profit_usdt = max(0.0, min_target_net_profit_usdt)
-    rounding_guard_usdt = 0.0010 if min_profit_usdt <= 0.01 else 0.0015
+    floor_profit_usdt = max(
+        0.0,
+        min_floor_net_profit_usdt
+        if min_floor_net_profit_usdt is not None
+        else min_target_net_profit_usdt,
+    )
+    target_profit_usdt = max(floor_profit_usdt, min_target_net_profit_usdt)
+
+    floor_guard_usdt = 0.0010 if floor_profit_usdt <= 0.01 else 0.0015
     raw_floor_price = (
-        effective_cost_usdt + min_profit_usdt + rounding_guard_usdt
+        effective_cost_usdt + floor_profit_usdt + floor_guard_usdt
     ) / net_denom
     safety_floor_price = round(max(entry_price, raw_floor_price), 10)
 
+    target_guard_usdt = 0.0010 if target_profit_usdt <= 0.01 else 0.0015
+    raw_target_price = (
+        effective_cost_usdt + target_profit_usdt + target_guard_usdt
+    ) / net_denom
+    base_target_price = max(safety_floor_price, raw_target_price)
+
     if include_live_spread_cushion:
-        cushion_ratio = 0.00025 if min_profit_usdt <= 0.01 else 0.00035
+        cushion_ratio = 0.00025 if target_profit_usdt <= 0.01 else 0.00035
     else:
         cushion_ratio = 0.00005
     target_take_profit_price = round(
-        max(safety_floor_price, safety_floor_price * (1.0 + cushion_ratio)),
+        max(safety_floor_price, base_target_price * (1.0 + cushion_ratio)),
         10,
     )
     return safety_floor_price, target_take_profit_price
@@ -87,6 +104,7 @@ def generate_client_order_id(
     side: OrderSide,
     timestamp: datetime,
     reason: str,
+    slot_role: SlotRole | None = None,
 ) -> str:
     """Generate a deterministic idempotency key for an order execution.
 
@@ -95,12 +113,18 @@ def generate_client_order_id(
         side: Order direction (BUY or SELL).
         timestamp: UTC timestamp of the triggering event.
         reason: Execution trigger reason.
+        slot_role: Optional SCALP or SWING role prefix embedded for auditing.
 
     Returns:
-        Hexadecimal digest string uniquely identifying the order.
+        Deterministic identifier string uniquely identifying the order.
     """
     raw_key = f"{symbol}:{side.value}:{timestamp.isoformat()}:{reason}"
     digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:20]
+    if slot_role is not None:
+        return (
+            f"{slot_role.value.lower()}-{symbol.lower()}-"
+            f"{side.value.lower()}-{digest[:14]}"
+        )
     return f"paper-{symbol.lower()}-{side.value.lower()}-{digest}"
 
 
@@ -198,24 +222,30 @@ class LedgerRepository:
                 stop_loss_price REAL NOT NULL,
                 take_profit_price REAL NOT NULL,
                 peak_price REAL NOT NULL DEFAULT 0.0,
-                is_partially_closed INTEGER NOT NULL DEFAULT 0
+                is_partially_closed INTEGER NOT NULL DEFAULT 0,
+                slot_role TEXT NOT NULL DEFAULT 'SCALP',
+                target_net_profit_usdt REAL NOT NULL DEFAULT 0.0,
+                trough_price REAL NOT NULL DEFAULT 0.0
             )
             """
         )
-        try:
-            connection.execute(
-                "ALTER TABLE open_positions "
-                "ADD COLUMN peak_price REAL NOT NULL DEFAULT 0.0"
-            )
-        except sqlite3.OperationalError:
-            pass
-        try:
-            connection.execute(
-                "ALTER TABLE open_positions "
-                "ADD COLUMN is_partially_closed INTEGER NOT NULL DEFAULT 0"
-            )
-        except sqlite3.OperationalError:
-            pass
+        migration_statements = (
+            "ALTER TABLE open_positions "
+            "ADD COLUMN peak_price REAL NOT NULL DEFAULT 0.0",
+            "ALTER TABLE open_positions "
+            "ADD COLUMN is_partially_closed INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE open_positions "
+            "ADD COLUMN slot_role TEXT NOT NULL DEFAULT 'SCALP'",
+            "ALTER TABLE open_positions "
+            "ADD COLUMN target_net_profit_usdt REAL NOT NULL DEFAULT 0.0",
+            "ALTER TABLE open_positions "
+            "ADD COLUMN trough_price REAL NOT NULL DEFAULT 0.0",
+        )
+        for statement in migration_statements:
+            try:
+                connection.execute(statement)
+            except sqlite3.OperationalError:
+                pass
         connection.commit()
 
     def save_open_position(self, position: Position) -> None:
@@ -239,8 +269,11 @@ class LedgerRepository:
                 stop_loss_price,
                 take_profit_price,
                 peak_price,
-                is_partially_closed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_partially_closed,
+                slot_role,
+                target_net_profit_usdt,
+                trough_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 position.position_id,
@@ -254,6 +287,9 @@ class LedgerRepository:
                 position.take_profit_price,
                 position.peak_price,
                 1 if position.is_partially_closed else 0,
+                position.slot_role.value,
+                position.target_net_profit_usdt,
+                position.trough_price,
             ),
         )
         connection.commit()
@@ -263,6 +299,34 @@ class LedgerRepository:
         connection = self._get_connection()
         connection.execute("DELETE FROM open_positions")
         connection.commit()
+
+    @staticmethod
+    def _row_to_position(row: tuple[Any, ...]) -> Position:
+        """Deserialize a SQLite open_positions row into a Position domain object."""
+        is_partially_closed = bool(row[10]) if len(row) > 10 else False
+        raw_role = str(row[11]).upper() if len(row) > 11 and row[11] else "SCALP"
+        try:
+            slot_role = SlotRole(raw_role)
+        except ValueError:
+            slot_role = SlotRole.SCALP
+        target_profit = float(row[12]) if len(row) > 12 else 0.0
+        trough_price = float(row[13]) if len(row) > 13 else 0.0
+        return Position(
+            position_id=str(row[0]),
+            symbol=str(row[1]),
+            opened_at=datetime.fromisoformat(row[2]),
+            entry_price=float(row[3]),
+            quantity=float(row[4]),
+            notional_usdt=float(row[5]),
+            entry_fee_usdt=float(row[6]),
+            stop_loss_price=float(row[7]),
+            take_profit_price=float(row[8]),
+            peak_price=float(row[9]),
+            is_partially_closed=is_partially_closed,
+            slot_role=slot_role,
+            target_net_profit_usdt=target_profit,
+            trough_price=trough_price,
+        )
 
     def fetch_open_position(self) -> Position | None:
         """Retrieve a previously opened position if one remains active.
@@ -284,7 +348,10 @@ class LedgerRepository:
                 stop_loss_price,
                 take_profit_price,
                 peak_price,
-                is_partially_closed
+                is_partially_closed,
+                slot_role,
+                target_net_profit_usdt,
+                trough_price
             FROM open_positions
             LIMIT 1
             """
@@ -293,22 +360,7 @@ class LedgerRepository:
 
         if row is None:
             return None
-
-        is_partially_closed = bool(row[10]) if len(row) > 10 else False
-
-        return Position(
-            position_id=str(row[0]),
-            symbol=str(row[1]),
-            opened_at=datetime.fromisoformat(row[2]),
-            entry_price=float(row[3]),
-            quantity=float(row[4]),
-            notional_usdt=float(row[5]),
-            entry_fee_usdt=float(row[6]),
-            stop_loss_price=float(row[7]),
-            take_profit_price=float(row[8]),
-            peak_price=float(row[9]),
-            is_partially_closed=is_partially_closed,
-        )
+        return self._row_to_position(row)
 
     def save_open_position_for_symbol(self, position: Position) -> None:
         """Persist or replace an open position scoped by symbol.
@@ -334,8 +386,11 @@ class LedgerRepository:
                 stop_loss_price,
                 take_profit_price,
                 peak_price,
-                is_partially_closed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_partially_closed,
+                slot_role,
+                target_net_profit_usdt,
+                trough_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 position.position_id,
@@ -349,6 +404,9 @@ class LedgerRepository:
                 position.take_profit_price,
                 position.peak_price,
                 1 if position.is_partially_closed else 0,
+                position.slot_role.value,
+                position.target_net_profit_usdt,
+                position.trough_price,
             ),
         )
         connection.commit()
@@ -386,31 +444,16 @@ class LedgerRepository:
                 stop_loss_price,
                 take_profit_price,
                 peak_price,
-                is_partially_closed
+                is_partially_closed,
+                slot_role,
+                target_net_profit_usdt,
+                trough_price
             FROM open_positions
             ORDER BY opened_at ASC
             """
         )
         rows = cursor.fetchall()
-        positions: list[Position] = []
-        for row in rows:
-            is_partially_closed = bool(row[10]) if len(row) > 10 else False
-            positions.append(
-                Position(
-                    position_id=str(row[0]),
-                    symbol=str(row[1]),
-                    opened_at=datetime.fromisoformat(row[2]),
-                    entry_price=float(row[3]),
-                    quantity=float(row[4]),
-                    notional_usdt=float(row[5]),
-                    entry_fee_usdt=float(row[6]),
-                    stop_loss_price=float(row[7]),
-                    take_profit_price=float(row[8]),
-                    peak_price=float(row[9]),
-                    is_partially_closed=is_partially_closed,
-                )
-            )
-        return positions
+        return [self._row_to_position(row) for row in rows]
 
     def record_execution(self, execution: TradeExecution) -> bool:
         """Persist a trade execution idempotently using client_order_id.
@@ -578,6 +621,7 @@ class PaperTradingEngine:
             e.position_id for e in past_execs if e.reason == "SMART_DCA"
         }
         self._buy_blocked_symbols: set[str] = set()
+        self._swing_candidate_symbols: set[str] = set()
         loaded_positions = self._ledger.fetch_all_open_positions()
         self._open_positions: dict[str, Position] = {
             pos.symbol.upper(): pos for pos in loaded_positions
@@ -606,28 +650,40 @@ class PaperTradingEngine:
             )
         for sym_key, pos in list(self._open_positions.items()):
             if self._risk_config.no_loss_spot_mode:
-                upgraded_sl, upgraded_tp = compute_no_loss_exit_levels(
-                    entry_price=pos.entry_price,
-                    quantity=pos.quantity,
-                    notional_usdt=pos.notional_usdt,
-                    taker_fee_rate=self._exchange_config.taker_fee_rate,
-                    min_target_net_profit_usdt=(
-                        self._risk_config.min_target_net_profit_usdt
-                    ),
-                    include_live_spread_cushion=self._live_client is not None,
+                upgraded_sl, upgraded_tp = self._compute_position_exit_levels(pos)
+                target_profit = (
+                    pos.target_net_profit_usdt
+                    if pos.target_net_profit_usdt > 0.0
+                    else (
+                        self._risk_config.swing_target_net_profit_usdt
+                        if pos.slot_role == SlotRole.SWING
+                        else self._risk_config.min_target_net_profit_usdt
+                    )
                 )
-                if pos.stop_loss_price < upgraded_sl:
+                needs_update = (
+                    pos.stop_loss_price < upgraded_sl
+                    or (
+                        pos.slot_role == SlotRole.SWING
+                        and pos.take_profit_price < upgraded_tp
+                    )
+                    or pos.target_net_profit_usdt <= 0.0
+                )
+                if needs_update:
                     pos = replace(
                         pos,
-                        stop_loss_price=upgraded_sl,
-                        take_profit_price=upgraded_tp,
+                        stop_loss_price=max(pos.stop_loss_price, upgraded_sl),
+                        take_profit_price=max(pos.take_profit_price, upgraded_tp)
+                        if pos.slot_role == SlotRole.SWING
+                        else upgraded_tp,
+                        target_net_profit_usdt=target_profit,
                     )
                     self._open_positions[sym_key] = pos
                     self._ledger.save_open_position_for_symbol(pos)
             logger.info(
-                "Resumed open position from ledger | symbol=%s entry=%s "
+                "Resumed open position from ledger | symbol=%s role=%s entry=%s "
                 "qty=%s sl=%s tp=%s",
                 pos.symbol,
+                pos.slot_role.value,
                 format_price(pos.entry_price),
                 format_quantity(pos.quantity),
                 format_price(pos.stop_loss_price),
@@ -684,6 +740,200 @@ class PaperTradingEngine:
             symbols: Set of uppercase symbol names blocked from new entries.
         """
         self._buy_blocked_symbols = {sym.upper() for sym in symbols}
+        if self._swing_candidate_symbols:
+            self._swing_candidate_symbols = {
+                sym
+                for sym in self._swing_candidate_symbols
+                if sym not in self._buy_blocked_symbols
+            }
+
+    def set_swing_candidate_symbols(self, symbols: set[str]) -> None:
+        """Configure symbols eligible to occupy the high-target SWING slot.
+
+        Args:
+            symbols: Set of uppercase symbol identifiers approved for Swing holds.
+        """
+        self._swing_candidate_symbols = {
+            sym.upper()
+            for sym in symbols
+            if sym.upper() not in self._buy_blocked_symbols
+        }
+
+    def _count_positions_by_role(self) -> tuple[int, int]:
+        """Return counts of currently open (SWING, SCALP) positions."""
+        swing_count = sum(
+            1
+            for pos in self._open_positions.values()
+            if pos.slot_role == SlotRole.SWING
+        )
+        scalp_count = len(self._open_positions) - swing_count
+        return swing_count, scalp_count
+
+    def _estimated_total_equity_usdt(self) -> float:
+        """Estimate total portfolio value in USDT from cash plus open notionals."""
+        open_notional = sum(pos.notional_usdt for pos in self._open_positions.values())
+        return round(self._available_cash_usdt + open_notional, 6)
+
+    def _build_open_positions_summary(self) -> list[tuple[str, float, str]]:
+        """Build summary tuples (symbol, notional_usdt, role) for notifications."""
+        return [
+            (pos.symbol, pos.notional_usdt, pos.slot_role.value)
+            for pos in self._open_positions.values()
+        ]
+
+    def _compute_position_exit_levels(self, pos: Position) -> tuple[float, float]:
+        """Compute zero-loss safety floor and take-profit price for a position role."""
+        if pos.slot_role == SlotRole.SWING:
+            swing_target = (
+                pos.target_net_profit_usdt
+                if pos.target_net_profit_usdt > 0.0
+                else self._risk_config.swing_target_net_profit_usdt
+            )
+            return compute_no_loss_exit_levels(
+                entry_price=pos.entry_price,
+                quantity=pos.quantity,
+                notional_usdt=pos.notional_usdt,
+                taker_fee_rate=self._exchange_config.taker_fee_rate,
+                min_target_net_profit_usdt=swing_target,
+                include_live_spread_cushion=self._live_client is not None,
+                min_floor_net_profit_usdt=0.002,
+            )
+        scalp_target = (
+            pos.target_net_profit_usdt
+            if pos.target_net_profit_usdt > 0.0
+            else self._risk_config.min_target_net_profit_usdt
+        )
+        return compute_no_loss_exit_levels(
+            entry_price=pos.entry_price,
+            quantity=pos.quantity,
+            notional_usdt=pos.notional_usdt,
+            taker_fee_rate=self._exchange_config.taker_fee_rate,
+            min_target_net_profit_usdt=scalp_target,
+            include_live_spread_cushion=self._live_client is not None,
+        )
+
+    def _compute_breakeven_floor_price(self, pos: Position) -> float:
+        """Compute pure fee-covered breakeven price strictly above entry_price."""
+        floor_price, _ = compute_no_loss_exit_levels(
+            entry_price=pos.entry_price,
+            quantity=pos.quantity,
+            notional_usdt=pos.notional_usdt,
+            taker_fee_rate=self._exchange_config.taker_fee_rate,
+            min_target_net_profit_usdt=0.002,
+            include_live_spread_cushion=self._live_client is not None,
+            min_floor_net_profit_usdt=0.002,
+        )
+        return floor_price
+
+    def resolve_next_slot_role(self, symbol: str) -> SlotRole | None:
+        """Determine whether symbol can open a SWING or SCALP slot right now.
+
+        Args:
+            symbol: Candidate trading pair symbol.
+
+        Returns:
+            Assigned SlotRole if entry is permitted, otherwise None.
+        """
+        self._reconcile_external_clear()
+        upper_sym = symbol.upper()
+        if upper_sym in self._buy_blocked_symbols:
+            return None
+        if upper_sym in self._open_positions:
+            return None
+
+        max_slots = max(1, self._risk_config.max_concurrent_positions)
+        if self._open_positions and not self._risk_config.allow_secondary_symbol_slot:
+            return None
+        if len(self._open_positions) >= max_slots:
+            return None
+
+        min_required_cash = self._exchange_config.min_notional_usdt + 0.50
+        if (
+            not self._risk_config.enable_dual_target_slots
+            or self._risk_config.swing_slot_count <= 0
+        ):
+            if (
+                not self._open_positions
+                or self._available_cash_usdt >= min_required_cash
+            ):
+                return SlotRole.SCALP
+            return None
+
+        if self._available_cash_usdt < min_required_cash:
+            return None
+
+        swing_limit = min(self._risk_config.swing_slot_count, max_slots)
+        scalp_limit = max(0, max_slots - swing_limit)
+        open_swing, open_scalp = self._count_positions_by_role()
+
+        is_swing_candidate = (
+            not self._swing_candidate_symbols
+            or upper_sym in self._swing_candidate_symbols
+        )
+        if open_swing < swing_limit and is_swing_candidate:
+            return SlotRole.SWING
+
+        if open_scalp < scalp_limit:
+            remaining_swings = max(0, swing_limit - open_swing)
+            if remaining_swings == 0:
+                return SlotRole.SCALP
+            total_equity = self._estimated_total_equity_usdt()
+            reserved_swing = (
+                remaining_swings
+                * total_equity
+                * self._risk_config.swing_allocation_fraction
+            )
+            scalp_pool = (self._available_cash_usdt * 0.96) - reserved_swing
+            if scalp_pool >= min_required_cash:
+                return SlotRole.SCALP
+            if total_equity < (min_required_cash * 2.5) and open_scalp == 0:
+                return SlotRole.SCALP
+
+        return None
+
+    def _compute_dual_slot_notional_usdt(self, slot_role: SlotRole) -> float:
+        """Calculate asymmetric USDT budget for a SWING or SCALP slot."""
+        min_notional = self._exchange_config.min_notional_usdt
+        min_safe_slot = min_notional + 0.75
+        max_slots = max(1, self._risk_config.max_concurrent_positions)
+        swing_limit = min(self._risk_config.swing_slot_count, max_slots)
+        scalp_limit = max(0, max_slots - swing_limit)
+        open_swing, open_scalp = self._count_positions_by_role()
+        total_equity = self._estimated_total_equity_usdt()
+        target_swing = total_equity * self._risk_config.swing_allocation_fraction
+
+        if slot_role == SlotRole.SWING:
+            remaining_scalps = max(0, scalp_limit - open_scalp)
+            reserved_for_scalps = remaining_scalps * (min_notional + 0.85)
+            max_feasible = (self._available_cash_usdt * 0.96) - reserved_for_scalps
+            if max_feasible >= min_safe_slot:
+                proposed = min(target_swing, max_feasible)
+                if remaining_scalps == 0:
+                    proposed = min(
+                        max(proposed, self._available_cash_usdt * 0.94),
+                        self._available_cash_usdt * 0.96,
+                    )
+                return round(max(min_safe_slot, proposed), 4)
+            return round(min(self._available_cash_usdt * 0.95, min_safe_slot), 4)
+
+        remaining_scalps = max(1, scalp_limit - open_scalp)
+        remaining_swings = max(0, swing_limit - open_swing)
+        reserved_for_swings = remaining_swings * target_swing
+        reserve_ratio = (
+            0.95 if (remaining_scalps == 1 and remaining_swings == 0) else 0.96
+        )
+        available_for_scalps = max(
+            0.0,
+            (self._available_cash_usdt * reserve_ratio) - reserved_for_swings,
+        )
+        raw_scalp = available_for_scalps / remaining_scalps
+        max_scalp_cap = max(min_safe_slot, total_equity * 0.34)
+        capped_scalp = min(raw_scalp, max_scalp_cap)
+        if capped_scalp < min_safe_slot and self._available_cash_usdt >= (
+            min_notional + 0.50
+        ):
+            return round(min(self._available_cash_usdt * 0.95, min_safe_slot), 4)
+        return round(capped_scalp, 4)
 
     def get_open_position(self, symbol: str) -> Position | None:
         """Return the open position for a specific symbol or None."""
@@ -692,22 +942,7 @@ class PaperTradingEngine:
 
     def can_open_position_for_symbol(self, symbol: str) -> bool:
         """Return True if a new slot is available to open a position for symbol."""
-        self._reconcile_external_clear()
-        upper_sym = symbol.upper()
-        if upper_sym in self._buy_blocked_symbols:
-            return False
-        if upper_sym in self._open_positions:
-            return False
-        if not self._open_positions:
-            return True
-        if not self._risk_config.allow_secondary_symbol_slot:
-            return False
-        if len(self._open_positions) >= max(
-            1, self._risk_config.max_concurrent_positions
-        ):
-            return False
-        min_required_cash = self._exchange_config.min_notional_usdt + 0.50
-        return self._available_cash_usdt >= min_required_cash
+        return self.resolve_next_slot_role(symbol) is not None
 
     def can_open_additional_positions(self) -> bool:
         """Return True if additional slots and cash remain for concurrent trades."""
@@ -788,18 +1023,85 @@ class PaperTradingEngine:
             return None
 
         new_peak = max(pos.peak_price, current_price, pos.entry_price)
+        base_trough = pos.trough_price if pos.trough_price > 0.0 else pos.entry_price
+        new_trough = min(base_trough, current_price)
 
         if self._risk_config.no_loss_spot_mode:
-            safety_floor, _ = compute_no_loss_exit_levels(
-                entry_price=pos.entry_price,
-                quantity=pos.quantity,
-                notional_usdt=pos.notional_usdt,
-                taker_fee_rate=self._exchange_config.taker_fee_rate,
-                min_target_net_profit_usdt=(
-                    self._risk_config.min_target_net_profit_usdt
-                ),
-                include_live_spread_cushion=self._live_client is not None,
-            )
+            safety_floor, role_take_profit = self._compute_position_exit_levels(pos)
+
+            if pos.slot_role == SlotRole.SWING:
+                effective_tp = max(pos.take_profit_price, role_take_profit)
+                effective_floor = max(pos.stop_loss_price, safety_floor)
+                swing_arm_price = round(
+                    pos.entry_price
+                    * (1.0 + self._risk_config.swing_trailing_arm_ratio),
+                    10,
+                )
+                if (
+                    self._risk_config.enable_swing_trailing_lock
+                    and new_peak >= swing_arm_price
+                ):
+                    min_lock_floor, _ = compute_no_loss_exit_levels(
+                        entry_price=pos.entry_price,
+                        quantity=pos.quantity,
+                        notional_usdt=pos.notional_usdt,
+                        taker_fee_rate=self._exchange_config.taker_fee_rate,
+                        min_target_net_profit_usdt=(
+                            self._risk_config.swing_trailing_min_lock_profit_usdt
+                        ),
+                        include_live_spread_cushion=self._live_client is not None,
+                    )
+                    trail_floor = round(
+                        new_peak
+                        * (1.0 - self._risk_config.swing_trailing_pullback_ratio),
+                        10,
+                    )
+                    effective_floor = max(
+                        effective_floor,
+                        safety_floor,
+                        min_lock_floor,
+                        trail_floor,
+                    )
+
+                if (
+                    new_peak > pos.peak_price
+                    or new_trough < base_trough
+                    or pos.trough_price <= 0.0
+                    or effective_floor > pos.stop_loss_price
+                    or effective_tp > pos.take_profit_price
+                ):
+                    pos = replace(
+                        pos,
+                        stop_loss_price=effective_floor,
+                        take_profit_price=effective_tp,
+                        peak_price=new_peak,
+                        trough_price=new_trough,
+                    )
+                    self._persist_position_update(pos)
+
+                if current_price >= effective_tp and current_price >= safety_floor:
+                    return self._close_active_position(
+                        exit_price=current_price,
+                        timestamp=timestamp,
+                        reason=ExitReason.TAKE_PROFIT.value,
+                        symbol=pos.symbol,
+                    )
+
+                if (
+                    self._risk_config.enable_swing_trailing_lock
+                    and new_peak >= swing_arm_price
+                    and current_price <= effective_floor
+                    and current_price >= safety_floor
+                ):
+                    return self._close_active_position(
+                        exit_price=current_price,
+                        timestamp=timestamp,
+                        reason=ExitReason.TRAILING_STOP.value,
+                        symbol=pos.symbol,
+                    )
+
+                return None
+
             effective_floor = max(pos.stop_loss_price, safety_floor)
             round_trip_fee = 2.0 * self._exchange_config.taker_fee_rate
             arm_price = max(
@@ -822,11 +1124,17 @@ class PaperTradingEngine:
                 trail_floor = round(new_peak * (1.0 - pullback_ratio), 10)
                 effective_floor = max(effective_floor, safety_floor, trail_floor)
 
-            if new_peak > pos.peak_price or effective_floor > pos.stop_loss_price:
+            if (
+                new_peak > pos.peak_price
+                or new_trough < base_trough
+                or pos.trough_price <= 0.0
+                or effective_floor > pos.stop_loss_price
+            ):
                 pos = replace(
                     pos,
                     stop_loss_price=effective_floor,
                     peak_price=new_peak,
+                    trough_price=new_trough,
                 )
                 self._persist_position_update(pos)
 
@@ -1099,27 +1407,66 @@ class PaperTradingEngine:
 
         if target_pos is not None and signal.signal_type == SignalType.SELL:
             if self._risk_config.no_loss_spot_mode:
-                safety_floor, _ = compute_no_loss_exit_levels(
-                    entry_price=target_pos.entry_price,
-                    quantity=target_pos.quantity,
-                    notional_usdt=target_pos.notional_usdt,
-                    taker_fee_rate=self._exchange_config.taker_fee_rate,
-                    min_target_net_profit_usdt=(
-                        self._risk_config.min_target_net_profit_usdt
-                    ),
-                    include_live_spread_cushion=self._live_client is not None,
+                safety_floor, role_take_profit = self._compute_position_exit_levels(
+                    target_pos
                 )
+                if target_pos.slot_role == SlotRole.SWING:
+                    effective_tp = max(target_pos.take_profit_price, role_take_profit)
+                    if signal.reference_price >= effective_tp:
+                        return self._close_active_position(
+                            exit_price=signal.reference_price,
+                            timestamp=signal.evaluated_at,
+                            reason=ExitReason.SIGNAL_REVERSAL.value,
+                            symbol=target_pos.symbol,
+                        )
+                    if self._risk_config.enable_drawdown_breakeven_escape:
+                        trigger_low = target_pos.entry_price * (
+                            1.0 - self._risk_config.drawdown_escape_trigger_ratio
+                        )
+                        if (
+                            0.0 < target_pos.trough_price <= trigger_low
+                            and signal.reference_price >= safety_floor
+                        ):
+                            return self._close_active_position(
+                                exit_price=signal.reference_price,
+                                timestamp=signal.evaluated_at,
+                                reason=ExitReason.BREAKEVEN_RECOVERY.value,
+                                symbol=target_pos.symbol,
+                            )
+                    return None
                 min_profitable_exit = max(
                     target_pos.stop_loss_price,
                     safety_floor,
                 )
-            else:
-                min_ratio = max(
-                    self._risk_config.min_signal_exit_profit_ratio,
-                    (self._exchange_config.taker_fee_rate * 2.0)
-                    + self._risk_config.min_net_profit_ratio,
-                )
-                min_profitable_exit = target_pos.entry_price * (1.0 + min_ratio)
+                if signal.reference_price >= min_profitable_exit:
+                    return self._close_active_position(
+                        exit_price=signal.reference_price,
+                        timestamp=signal.evaluated_at,
+                        reason=ExitReason.SIGNAL_REVERSAL.value,
+                        symbol=target_pos.symbol,
+                    )
+                if self._risk_config.enable_drawdown_breakeven_escape:
+                    trigger_low = target_pos.entry_price * (
+                        1.0 - self._risk_config.drawdown_escape_trigger_ratio
+                    )
+                    breakeven_floor = self._compute_breakeven_floor_price(target_pos)
+                    if (
+                        0.0 < target_pos.trough_price <= trigger_low
+                        and signal.reference_price >= breakeven_floor
+                    ):
+                        return self._close_active_position(
+                            exit_price=signal.reference_price,
+                            timestamp=signal.evaluated_at,
+                            reason=ExitReason.BREAKEVEN_RECOVERY.value,
+                            symbol=target_pos.symbol,
+                        )
+                return None
+            min_ratio = max(
+                self._risk_config.min_signal_exit_profit_ratio,
+                (self._exchange_config.taker_fee_rate * 2.0)
+                + self._risk_config.min_net_profit_ratio,
+            )
+            min_profitable_exit = target_pos.entry_price * (1.0 + min_ratio)
             if signal.reference_price >= min_profitable_exit:
                 return self._close_active_position(
                     exit_price=signal.reference_price,
@@ -1163,14 +1510,20 @@ class PaperTradingEngine:
         Returns:
             TradeExecution if the order passed validation and filled, else None.
         """
-        if not self.can_open_position_for_symbol(signal.symbol):
+        assigned_role = self.resolve_next_slot_role(signal.symbol)
+        if assigned_role is None:
             return None
 
+        use_dual_profile = (
+            self._risk_config.enable_dual_target_slots
+            and self._risk_config.swing_slot_count > 0
+        )
         client_order_id = generate_client_order_id(
             symbol=signal.symbol,
             side=OrderSide.BUY,
             timestamp=signal.evaluated_at,
             reason="SIGNAL_ENTRY",
+            slot_role=assigned_role if use_dual_profile else None,
         )
         if client_order_id in self._executed_order_ids:
             return None
@@ -1185,7 +1538,11 @@ class PaperTradingEngine:
             if live_usdt is not None and live_usdt > 0.0:
                 self._available_cash_usdt = round(live_usdt, 6)
 
-        if self._risk_config.use_dynamic_slot_sizing:
+        if use_dual_profile:
+            proposed_notional_usdt = self._compute_dual_slot_notional_usdt(
+                assigned_role
+            )
+        elif self._risk_config.use_dynamic_slot_sizing:
             remaining_slots = max(
                 1,
                 self._risk_config.max_concurrent_positions - len(self._open_positions),
@@ -1307,16 +1664,22 @@ class PaperTradingEngine:
                 stop_loss_price = round(signal.stop_loss_price + price_delta, 8)
                 take_profit_price = round(signal.take_profit_price + price_delta, 8)
 
+        target_net_profit_usdt = (
+            self._risk_config.swing_target_net_profit_usdt
+            if assigned_role == SlotRole.SWING
+            else self._risk_config.min_target_net_profit_usdt
+        )
         if self._risk_config.no_loss_spot_mode:
             stop_loss_price, take_profit_price = compute_no_loss_exit_levels(
                 entry_price=entry_price,
                 quantity=quantity,
                 notional_usdt=proposed_notional_usdt,
                 taker_fee_rate=self._exchange_config.taker_fee_rate,
-                min_target_net_profit_usdt=(
-                    self._risk_config.min_target_net_profit_usdt
-                ),
+                min_target_net_profit_usdt=target_net_profit_usdt,
                 include_live_spread_cushion=self._live_client is not None,
+                min_floor_net_profit_usdt=(
+                    0.002 if assigned_role == SlotRole.SWING else None
+                ),
             )
 
         position_id = f"pos-{client_order_id[-12:]}"
@@ -1343,6 +1706,11 @@ class PaperTradingEngine:
             stop_loss_price=stop_loss_price,
             take_profit_price=take_profit_price,
             peak_price=entry_price,
+            slot_role=assigned_role,
+            target_net_profit_usdt=(
+                target_net_profit_usdt if self._risk_config.no_loss_spot_mode else 0.0
+            ),
+            trough_price=entry_price,
         )
         self._persist_position_update(new_pos)
 
@@ -1362,10 +1730,11 @@ class PaperTradingEngine:
         self._ledger.record_execution(execution)
         mode_tag = "LIVE" if self._live_client is not None else "PAPER"
         logger.info(
-            "Executed %s BUY | symbol=%s price=%s qty=%s notional=%.4f USDT "
+            "Executed %s BUY | symbol=%s role=%s price=%s qty=%s notional=%.4f USDT "
             "sl=%s tp=%s",
             mode_tag,
             execution.symbol,
+            assigned_role.value,
             format_price(execution.execution_price),
             format_quantity(execution.quantity),
             execution.gross_notional_usdt,
@@ -1381,6 +1750,15 @@ class PaperTradingEngine:
                 stop_loss_price=stop_loss_price,
                 take_profit_price=take_profit_price,
                 win_probability_pct=win_probability_pct,
+                slot_role=assigned_role if use_dual_profile else None,
+                target_net_profit_usdt=(
+                    target_net_profit_usdt if use_dual_profile else None
+                ),
+                open_positions_summary=(
+                    self._build_open_positions_summary()
+                    if len(self._open_positions) > 1 or use_dual_profile
+                    else None
+                ),
             )
         )
         return execution
@@ -1696,16 +2074,10 @@ class PaperTradingEngine:
         if position is None:
             return None
         if self._risk_config.no_loss_spot_mode:
-            safety_floor, _ = compute_no_loss_exit_levels(
-                entry_price=position.entry_price,
-                quantity=position.quantity,
-                notional_usdt=position.notional_usdt,
-                taker_fee_rate=self._exchange_config.taker_fee_rate,
-                min_target_net_profit_usdt=(
-                    self._risk_config.min_target_net_profit_usdt
-                ),
-                include_live_spread_cushion=self._live_client is not None,
-            )
+            if reason == ExitReason.BREAKEVEN_RECOVERY.value:
+                safety_floor = self._compute_breakeven_floor_price(position)
+            else:
+                safety_floor, _ = self._compute_position_exit_levels(position)
             if exit_price < safety_floor:
                 logger.info(
                     "Deferred exit on %s: price %s is below no-loss safety floor %s.",
@@ -1786,11 +2158,17 @@ class PaperTradingEngine:
         )
         self._ledger.record_execution(execution)
         mode_tag = "LIVE" if self._live_client is not None else "PAPER"
+        use_dual_profile = (
+            self._risk_config.enable_dual_target_slots
+            and self._risk_config.swing_slot_count > 0
+        )
+        remaining_summary = self._build_open_positions_summary()
         logger.info(
-            "Executed %s SELL | symbol=%s reason=%s price=%s "
+            "Executed %s SELL | symbol=%s role=%s reason=%s price=%s "
             "net_pnl=%.4f USDT cash=%.4f USDT",
             mode_tag,
             execution.symbol,
+            position.slot_role.value,
             execution.reason,
             format_price(execution.execution_price),
             execution.realized_pnl_usdt,
@@ -1802,6 +2180,11 @@ class PaperTradingEngine:
                 available_cash_usdt=self._available_cash_usdt,
                 cop_per_usdt_rate=self._capital_config.cop_per_usdt_rate,
                 is_live_order=self._live_client is not None,
+                slot_role=position.slot_role if use_dual_profile else None,
+                target_net_profit_usdt=(
+                    position.target_net_profit_usdt if use_dual_profile else None
+                ),
+                open_positions_summary=remaining_summary or None,
             )
         )
         return execution

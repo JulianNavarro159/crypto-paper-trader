@@ -28,6 +28,14 @@ class ExitReason(str, Enum):
     PARTIAL_TAKE_PROFIT = "PARTIAL_TAKE_PROFIT"
     SIGNAL_REVERSAL = "SIGNAL_REVERSAL"
     TRAILING_STOP = "TRAILING_STOP"
+    BREAKEVEN_RECOVERY = "BREAKEVEN_RECOVERY"
+
+
+class SlotRole(str, Enum):
+    """Profit-profile role assigned to a concurrent Spot portfolio slot."""
+
+    SCALP = "SCALP"
+    SWING = "SWING"
 
 
 class MacroMarketRegime(str, Enum):
@@ -121,6 +129,9 @@ class Position:
     take_profit_price: float
     peak_price: float = 0.0
     is_partially_closed: bool = False
+    slot_role: SlotRole = SlotRole.SCALP
+    target_net_profit_usdt: float = 0.0
+    trough_price: float = 0.0
 
 
 @dataclass(frozen=True)

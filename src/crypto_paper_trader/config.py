@@ -14,7 +14,7 @@ class CapitalConfig:
     """
 
     initial_capital_cop: float = 102_200.0
-    cop_per_usdt_rate: float = 3_194.0
+    cop_per_usdt_rate: float = 3_485.0
 
     @property
     def initial_capital_usdt(self) -> float:
@@ -162,6 +162,17 @@ class RiskConfig:
     full_reset_before_epoch_ms: int = 0
     btc_buy_lock_mode: str = "AUTO"
     btc_lock_strict_mode: bool = False
+    enable_dual_target_slots: bool = False
+    swing_slot_count: int = 0
+    swing_target_net_profit_usdt: float = 1.40
+    swing_allocation_fraction: float = 0.44
+    swing_reconcile_min_notional_usdt: float = 9.0
+    enable_swing_trailing_lock: bool = True
+    swing_trailing_arm_ratio: float = 0.065
+    swing_trailing_pullback_ratio: float = 0.030
+    swing_trailing_min_lock_profit_usdt: float = 0.40
+    enable_drawdown_breakeven_escape: bool = False
+    drawdown_escape_trigger_ratio: float = 0.030
 
     @classmethod
     def spot_no_loss_micro_profit(
@@ -260,6 +271,77 @@ class RiskConfig:
             full_reset_before_epoch_ms=full_reset_before_epoch_ms,
             btc_buy_lock_mode=btc_buy_lock_mode,
             btc_lock_strict_mode=btc_lock_strict_mode,
+        )
+
+    @classmethod
+    def spot_dual_scalp_and_swing(
+        cls,
+        scalp_target_net_profit_usdt: float = 0.030,
+        swing_target_net_profit_usdt: float = 1.40,
+        max_concurrent_positions: int = 3,
+        swing_slot_count: int = 1,
+        swing_allocation_fraction: float = 0.44,
+        swing_reconcile_min_notional_usdt: float = 9.0,
+        enable_swing_trailing_lock: bool = True,
+        swing_trailing_arm_ratio: float = 0.065,
+        swing_trailing_pullback_ratio: float = 0.030,
+        swing_trailing_min_lock_profit_usdt: float = 0.40,
+        enable_drawdown_breakeven_escape: bool = False,
+        full_reset_before_epoch_ms: int = 0,
+        btc_buy_lock_mode: str = "AUTO",
+        btc_lock_strict_mode: bool = False,
+    ) -> RiskConfig:
+        """Build dual-profile multi-slot Spot config combining Scalp and Swing slots.
+
+        Args:
+            scalp_target_net_profit_usdt: Minimum net USDT gain for fast Scalp exits.
+            swing_target_net_profit_usdt: Net USDT gain target for the Swing slot.
+            max_concurrent_positions: Total simultaneous open positions allowed.
+            swing_slot_count: Number of slots dedicated to high-target Swing holds.
+            swing_allocation_fraction: Equity fraction allocated to the Swing slot.
+            swing_reconcile_min_notional_usdt: Minimum notional identifying Swing role.
+            enable_swing_trailing_lock: Enable progressive profit lock on Swing rallies.
+            swing_trailing_arm_ratio: Gross rally ratio that arms Swing trailing stop.
+            swing_trailing_pullback_ratio: Pullback ratio from peak triggering exit.
+            swing_trailing_min_lock_profit_usdt: Minimum net USDT floor once armed.
+            enable_drawdown_breakeven_escape: Permit fee-covered breakeven exit after
+                deep drawdowns on reversal signals.
+            full_reset_before_epoch_ms: Optional UTC cutoff for one-time reset.
+            btc_buy_lock_mode: BTC stabilization lock mode (AUTO/FORCE_LOCK/FORCE_OPEN).
+            btc_lock_strict_mode: Require daily EMA10 >= EMA20 to unlock BTC buys.
+
+        Returns:
+            Configured RiskConfig enforcing strict zero-loss floors across all slots.
+        """
+        return cls(
+            position_allocation_fraction=0.95,
+            min_net_profit_ratio=0.0003,
+            min_signal_exit_profit_ratio=0.0023,
+            enable_partial_take_profit=False,
+            time_machine_min_win_prob_pct=52.0,
+            no_loss_spot_mode=True,
+            min_target_net_profit_usdt=scalp_target_net_profit_usdt,
+            enable_no_loss_trailing_runner=False,
+            allow_secondary_symbol_slot=True,
+            max_concurrent_positions=max_concurrent_positions,
+            enable_tranche_split=False,
+            use_dynamic_slot_sizing=True,
+            enable_dca_average_down=False,
+            fast_exit_cooldown_seconds=60.0,
+            btc_unlock_mode="NONE",
+            full_reset_before_epoch_ms=full_reset_before_epoch_ms,
+            btc_buy_lock_mode=btc_buy_lock_mode,
+            btc_lock_strict_mode=btc_lock_strict_mode,
+            enable_dual_target_slots=True,
+            swing_slot_count=swing_slot_count,
+            swing_target_net_profit_usdt=swing_target_net_profit_usdt,
+            swing_allocation_fraction=swing_allocation_fraction,
+            swing_reconcile_min_notional_usdt=swing_reconcile_min_notional_usdt,
+            enable_swing_trailing_lock=enable_swing_trailing_lock,
+            swing_trailing_arm_ratio=swing_trailing_arm_ratio,
+            swing_trailing_pullback_ratio=swing_trailing_pullback_ratio,
+            swing_trailing_min_lock_profit_usdt=swing_trailing_min_lock_profit_usdt,
+            enable_drawdown_breakeven_escape=enable_drawdown_breakeven_escape,
         )
 
 

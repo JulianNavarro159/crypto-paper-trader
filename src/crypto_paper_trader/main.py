@@ -28,6 +28,7 @@ from crypto_paper_trader.domain import (
     MacroMarketRegime,
     OrderSide,
     Position,
+    SlotRole,
 )
 from crypto_paper_trader.execution import LedgerRepository, compute_no_loss_exit_levels
 from crypto_paper_trader.formatting import format_price, format_quantity
@@ -57,6 +58,7 @@ from crypto_paper_trader.scanner import (
     fetch_universe_candles,
     run_multi_asset_rotation_backtest,
     select_qualified_universe_symbols,
+    select_swing_candidate_symbols,
 )
 from crypto_paper_trader.strategy import evaluate_macro_regime
 
@@ -122,8 +124,8 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     parser.add_argument(
         "--cop-rate",
         type=float,
-        default=3_194.0,
-        help="Reference COP per USDT exchange rate (default: 3194.0)",
+        default=3_485.0,
+        help="Reference COP per USDT exchange rate (default: 3485.0)",
     )
     parser.add_argument(
         "--max-events",
@@ -279,6 +281,51 @@ async def start_cloud_health_server() -> None:
         asyncio.create_task(keep_alive_ping())
 
 
+def infer_reconciled_slot_roles(
+    holdings: Sequence[tuple[str, float, float, bool]],
+    free_usdt: float,
+    risk_config: RiskConfig,
+) -> dict[str, SlotRole]:
+    """Deterministically infer SWING vs SCALP roles for reconciled Spot holdings.
+
+    Args:
+        holdings: Sequence of (symbol, qty, entry_price, has_partial_sell) tuples.
+        free_usdt: Known uninvested USDT balance in the Spot wallet.
+        risk_config: Active risk configuration specifying dual-slot thresholds.
+
+    Returns:
+        Mapping from uppercase symbol to inferred SlotRole.
+    """
+    roles = {sym.upper(): SlotRole.SCALP for sym, _, _, _ in holdings}
+    if (
+        not holdings
+        or not risk_config.enable_dual_target_slots
+        or risk_config.swing_slot_count <= 0
+    ):
+        return roles
+
+    notional_by_sym = [
+        (sym.upper(), round(qty * entry, 6)) for sym, qty, entry, _ in holdings
+    ]
+    total_held_usdt = sum(val for _, val in notional_by_sym)
+    estimated_equity = max(0.0, free_usdt) + total_held_usdt
+    swing_threshold = max(
+        risk_config.swing_reconcile_min_notional_usdt,
+        estimated_equity * 0.36,
+    )
+
+    assigned_swings = 0
+    for upper_sym, notional_val in sorted(
+        notional_by_sym, key=lambda item: item[1], reverse=True
+    ):
+        if assigned_swings >= risk_config.swing_slot_count:
+            break
+        if notional_val >= swing_threshold:
+            roles[upper_sym] = SlotRole.SWING
+            assigned_swings += 1
+    return roles
+
+
 def _build_heartbeat_intel_summary(
     report: MarketIntelligenceReport | None,
 ) -> str | None:
@@ -388,6 +435,12 @@ async def start_periodic_health_heartbeat(
                     (pos.symbol, pos.entry_price) for pos in open_positions
                 ],
                 market_intelligence_summary=intel_summary,
+                open_positions_roles=[
+                    (pos.symbol, pos.entry_price, pos.slot_role.value)
+                    for pos in open_positions
+                ]
+                if open_positions
+                else None,
             )
             delivered = notifier.send_alert(heartbeat_msg)
             interval_seconds = 7200.0 if delivered else 900.0
@@ -426,9 +479,18 @@ async def run_application(args: argparse.Namespace) -> None:
             symbol=args.symbol.upper(),
             interval=args.interval,
         ),
-        risk=RiskConfig.spot_fast_multicoin_micro_scalp(
-            min_target_net_profit_usdt=0.005,
-            max_concurrent_positions=4,
+        risk=RiskConfig.spot_dual_scalp_and_swing(
+            scalp_target_net_profit_usdt=0.030,
+            swing_target_net_profit_usdt=1.40,
+            max_concurrent_positions=3,
+            swing_slot_count=1,
+            swing_allocation_fraction=0.44,
+            swing_reconcile_min_notional_usdt=9.0,
+            enable_swing_trailing_lock=True,
+            swing_trailing_arm_ratio=0.065,
+            swing_trailing_pullback_ratio=0.030,
+            swing_trailing_min_lock_profit_usdt=0.40,
+            enable_drawdown_breakeven_escape=False,
             full_reset_before_epoch_ms=reset_cutoff_ms,
             btc_buy_lock_mode=btc_lock_mode,
             btc_lock_strict_mode=btc_lock_strict,
@@ -552,17 +614,33 @@ async def run_application(args: argparse.Namespace) -> None:
 
     if not existing_open_positions and live_client is not None:
         holdings = live_client.fetch_active_spot_holdings(config.universe.all_symbols)
+        known_free_usdt = live_client.get_known_usdt_balance() or 0.0
+        inferred_roles = infer_reconciled_slot_roles(
+            holdings=holdings,
+            free_usdt=known_free_usdt,
+            risk_config=config.risk,
+        )
         for held_sym, held_qty, held_entry, has_partial_sell in holdings:
-            partial_sell_done_by_symbol[held_sym.upper()] = has_partial_sell
+            upper_held = held_sym.upper()
+            partial_sell_done_by_symbol[upper_held] = has_partial_sell
             held_notional = round(held_qty * held_entry, 6)
+            held_role = inferred_roles.get(upper_held, SlotRole.SCALP)
+            held_target_profit = (
+                config.risk.swing_target_net_profit_usdt
+                if held_role == SlotRole.SWING
+                else config.risk.min_target_net_profit_usdt
+            )
             if config.risk.no_loss_spot_mode:
                 rec_sl, rec_tp = compute_no_loss_exit_levels(
                     entry_price=held_entry,
                     quantity=held_qty,
                     notional_usdt=held_notional,
                     taker_fee_rate=config.exchange.taker_fee_rate,
-                    min_target_net_profit_usdt=config.risk.min_target_net_profit_usdt,
+                    min_target_net_profit_usdt=held_target_profit,
                     include_live_spread_cushion=True,
+                    min_floor_net_profit_usdt=(
+                        0.002 if held_role == SlotRole.SWING else None
+                    ),
                 )
             else:
                 rec_sl = round(held_entry * 0.9940, 8)
@@ -578,15 +656,20 @@ async def run_application(args: argparse.Namespace) -> None:
                 stop_loss_price=rec_sl,
                 take_profit_price=rec_tp,
                 peak_price=held_entry,
+                slot_role=held_role,
+                target_net_profit_usdt=held_target_profit,
+                trough_price=held_entry,
             )
             repo.save_open_position_for_symbol(reconciled_pos)
             existing_open_positions.append(reconciled_pos)
             logger.info(
                 "Reconciled active Binance Spot holding on startup | "
-                "symbol=%s qty=%s entry=%s partial_unlock_done=%s",
+                "symbol=%s role=%s qty=%s entry=%s tp=%s partial_unlock_done=%s",
                 held_sym,
+                held_role.value,
                 format_quantity(held_qty),
                 format_price(held_entry),
+                format_price(rec_tp),
                 has_partial_sell,
             )
 
@@ -596,6 +679,7 @@ async def run_application(args: argparse.Namespace) -> None:
     active_macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
     initial_universe_candles: dict[str, list[Candle]] = {}
     initial_qualified_symbols: set[str] = set()
+    initial_swing_candidates: set[str] = set()
     intel_service = MarketIntelligenceService(
         exchange_config=config.exchange,
         mode=config.risk.btc_buy_lock_mode,
@@ -642,8 +726,18 @@ async def run_application(args: argparse.Namespace) -> None:
                 if latest_intel_report.btc_lock_state == BtcLockState.LOCKED
                 else rankings
             )
+            blocked_initial = (
+                {"BTCUSDT"}
+                if latest_intel_report.btc_lock_state == BtcLockState.LOCKED
+                else set()
+            )
             initial_qualified_symbols = select_qualified_universe_symbols(
                 filtered_rankings or rankings, max_symbols=6
+            )
+            initial_swing_candidates = select_swing_candidate_symbols(
+                rankings=rankings,
+                blocked_symbols=blocked_initial,
+                max_symbols=4,
             )
             pick_pool = filtered_rankings or rankings
             if pick_pool:
@@ -745,6 +839,8 @@ async def run_application(args: argparse.Namespace) -> None:
             )
     if initial_qualified_symbols:
         orchestrator.set_qualified_symbols(initial_qualified_symbols)
+    if initial_swing_candidates:
+        orchestrator.set_swing_candidate_symbols(initial_swing_candidates)
     if use_multi_radar:
         for sym_candles in initial_universe_candles.values():
             for seed_candle in sym_candles:
@@ -855,9 +951,21 @@ async def run_application(args: argparse.Namespace) -> None:
                         if latest_intel_report.btc_lock_state == BtcLockState.LOCKED
                         else rankings
                     )
+                    blocked_rescan = (
+                        {"BTCUSDT"}
+                        if latest_intel_report.btc_lock_state == BtcLockState.LOCKED
+                        else set()
+                    )
                     orchestrator.set_qualified_symbols(
                         select_qualified_universe_symbols(
                             filtered_rankings or rankings, max_symbols=6
+                        )
+                    )
+                    orchestrator.set_swing_candidate_symbols(
+                        select_swing_candidate_symbols(
+                            rankings=rankings,
+                            blocked_symbols=blocked_rescan,
+                            max_symbols=4,
                         )
                     )
                     for sym_candles in universe_candles.values():

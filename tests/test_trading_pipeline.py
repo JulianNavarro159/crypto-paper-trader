@@ -1741,7 +1741,7 @@ def test_multi_symbol_radar_executes_cross_symbol_entry_and_isolates_position(
             assert res_ada.signal.signal_type == SignalType.HOLD
             assert engine.active_position is not None
             assert engine.active_position.symbol == "SOLUSDT"
-            assert res_ada.snapshot.total_equity_usdt > 30.0
+            assert res_ada.snapshot.total_equity_usdt > 28.0
 
             sol_tp_tick = Candle(
                 symbol="SOLUSDT",
@@ -3097,3 +3097,437 @@ def test_force_modes_risk_classification_and_spanish_alerts() -> None:
     )
     assert "BTC (62880.40 USDT), ETH (1777.12 USDT)" in multi_hb
     assert "BLOQUEADO" in multi_hb
+
+
+def test_dual_target_asymmetric_slot_sizing_and_strict_zero_loss_floors() -> None:
+    """Verify 1 SWING (~11.5 USDT, +1.40) + 2 SCALP (~7.3 USDT, +0.03) and no loss."""
+    from crypto_paper_trader.domain import Position, SlotRole
+    from crypto_paper_trader.execution import compute_no_loss_exit_levels
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_dual_target.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            t0 = datetime(2026, 11, 22, 23, 0, tzinfo=timezone.utc)
+            ada_sl, ada_tp = compute_no_loss_exit_levels(
+                entry_price=0.1450,
+                quantity=45.2,
+                notional_usdt=6.5540,
+                taker_fee_rate=0.001,
+                min_target_net_profit_usdt=0.030,
+            )
+            ada_pos = Position(
+                position_id="reconciled-adausdt",
+                symbol="ADAUSDT",
+                opened_at=t0 - timedelta(hours=6),
+                entry_price=0.1450,
+                quantity=45.2,
+                notional_usdt=6.5540,
+                entry_fee_usdt=0.0066,
+                stop_loss_price=ada_sl,
+                take_profit_price=ada_tp,
+                peak_price=0.1450,
+                slot_role=SlotRole.SCALP,
+                target_net_profit_usdt=0.030,
+                trough_price=0.1450,
+            )
+            ledger.save_open_position_for_symbol(ada_pos)
+
+            risk_cfg = RiskConfig.spot_dual_scalp_and_swing(
+                scalp_target_net_profit_usdt=0.030,
+                swing_target_net_profit_usdt=1.40,
+                max_concurrent_positions=3,
+                swing_slot_count=1,
+                swing_allocation_fraction=0.44,
+            )
+            capital_cfg = CapitalConfig(
+                initial_capital_cop=92_056.0,
+                cop_per_usdt_rate=3_485.0,
+            )
+            exchange_cfg = ExchangeConfig(symbol="SOLUSDT", taker_fee_rate=0.001)
+            engine = PaperTradingEngine(
+                capital_config=capital_cfg,
+                exchange_config=exchange_cfg,
+                risk_config=risk_cfg,
+                ledger=ledger,
+            )
+            engine.set_swing_candidate_symbols({"LINKUSDT", "AVAXUSDT", "SUIUSDT"})
+
+            assert engine.resolve_next_slot_role("LINKUSDT") == SlotRole.SWING
+            assert engine.resolve_next_slot_role("SOLUSDT") == SlotRole.SCALP
+
+            link_buy = MarketSignal(
+                symbol="LINKUSDT",
+                evaluated_at=t0,
+                signal_type=SignalType.BUY,
+                reference_price=10.0,
+                stop_loss_price=9.85,
+                take_profit_price=10.15,
+                atr_value=0.06,
+                rsi_value=42.0,
+                fast_ema=10.02,
+                slow_ema=9.98,
+            )
+            link_exec = engine.process_signal(link_buy)
+            assert link_exec is not None
+            assert link_exec.client_order_id.startswith("swing-linkusdt-buy-")
+            link_pos = engine.get_open_position("LINKUSDT")
+            assert link_pos is not None
+            assert link_pos.slot_role == SlotRole.SWING
+            assert 11.0 <= link_pos.notional_usdt <= 12.2
+            assert link_pos.stop_loss_price > link_pos.entry_price
+            assert link_pos.take_profit_price > link_pos.entry_price * 1.11
+
+            sol_buy = MarketSignal(
+                symbol="SOLUSDT",
+                evaluated_at=t0 + timedelta(minutes=1),
+                signal_type=SignalType.BUY,
+                reference_price=70.0,
+                stop_loss_price=69.2,
+                take_profit_price=70.8,
+                atr_value=0.40,
+                rsi_value=44.0,
+                fast_ema=70.1,
+                slow_ema=69.9,
+            )
+            sol_exec = engine.process_signal(sol_buy)
+            assert sol_exec is not None
+            assert sol_exec.client_order_id.startswith("scalp-solusdt-buy-")
+            sol_pos = engine.get_open_position("SOLUSDT")
+            assert sol_pos is not None
+            assert sol_pos.slot_role == SlotRole.SCALP
+            assert 6.5 <= sol_pos.notional_usdt <= 8.5
+            assert sol_pos.take_profit_price < sol_pos.entry_price * 1.012
+
+            assert engine.can_open_position_for_symbol("XRPUSDT") is False
+
+            assert (
+                engine.evaluate_protective_exits(
+                    current_price=9.20,
+                    timestamp=t0 + timedelta(minutes=10),
+                    symbol="LINKUSDT",
+                )
+                is None
+            )
+            assert (
+                engine.evaluate_protective_exits(
+                    current_price=66.50,
+                    timestamp=t0 + timedelta(minutes=10),
+                    symbol="SOLUSDT",
+                )
+                is None
+            )
+
+            premature_swing_sell = MarketSignal(
+                symbol="LINKUSDT",
+                evaluated_at=t0 + timedelta(minutes=20),
+                signal_type=SignalType.SELL,
+                reference_price=10.18,
+                stop_loss_price=9.90,
+                take_profit_price=10.30,
+                atr_value=0.06,
+                rsi_value=66.0,
+                fast_ema=10.12,
+                slow_ema=10.05,
+            )
+            assert engine.process_signal(premature_swing_sell) is None
+            assert engine.has_position("LINKUSDT") is True
+
+            sol_tp_exec = engine.evaluate_protective_exits(
+                current_price=sol_pos.take_profit_price + 0.01,
+                timestamp=t0 + timedelta(minutes=25),
+                symbol="SOLUSDT",
+            )
+            assert sol_tp_exec is not None
+            assert sol_tp_exec.reason == ExitReason.TAKE_PROFIT.value
+            assert sol_tp_exec.realized_pnl_usdt >= 0.030
+            assert engine.has_position("SOLUSDT") is False
+
+            link_tp_exec = engine.evaluate_protective_exits(
+                current_price=link_pos.take_profit_price + 0.02,
+                timestamp=t0 + timedelta(hours=18),
+                symbol="LINKUSDT",
+            )
+            assert link_tp_exec is not None
+            assert link_tp_exec.reason == ExitReason.TAKE_PROFIT.value
+            assert link_tp_exec.realized_pnl_usdt >= 1.40
+            assert engine.has_position("LINKUSDT") is False
+            assert engine.has_position("ADAUSDT") is True
+        finally:
+            ledger.close()
+
+
+def test_dual_target_swing_trailing_lock_and_optional_breakeven_escape() -> None:
+    """Verify SWING progressive trailing stop locks gains and breakeven escape works."""
+    from crypto_paper_trader.domain import SlotRole
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_swing_trail.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            t0 = datetime(2026, 11, 22, 23, 30, tzinfo=timezone.utc)
+            risk_cfg = RiskConfig.spot_dual_scalp_and_swing(
+                scalp_target_net_profit_usdt=0.030,
+                swing_target_net_profit_usdt=1.40,
+                enable_swing_trailing_lock=True,
+                swing_trailing_arm_ratio=0.065,
+                swing_trailing_pullback_ratio=0.030,
+                swing_trailing_min_lock_profit_usdt=0.40,
+                enable_drawdown_breakeven_escape=True,
+            )
+            engine = PaperTradingEngine(
+                capital_config=CapitalConfig(
+                    initial_capital_cop=92_000.0,
+                    cop_per_usdt_rate=3_485.0,
+                ),
+                exchange_config=ExchangeConfig(symbol="AVAXUSDT"),
+                risk_config=risk_cfg,
+                ledger=ledger,
+            )
+            engine.set_swing_candidate_symbols({"AVAXUSDT"})
+
+            buy_sig = MarketSignal(
+                symbol="AVAXUSDT",
+                evaluated_at=t0,
+                signal_type=SignalType.BUY,
+                reference_price=10.0,
+                stop_loss_price=9.85,
+                take_profit_price=10.20,
+                atr_value=0.08,
+                rsi_value=41.0,
+                fast_ema=10.02,
+                slow_ema=9.96,
+            )
+            buy_exec = engine.process_signal(buy_sig)
+            assert buy_exec is not None
+            pos = engine.get_open_position("AVAXUSDT")
+            assert pos is not None
+            assert pos.slot_role == SlotRole.SWING
+
+            assert (
+                engine.evaluate_protective_exits(
+                    current_price=10.85,
+                    timestamp=t0 + timedelta(hours=3),
+                    symbol="AVAXUSDT",
+                )
+                is None
+            )
+            trail_exec = engine.evaluate_protective_exits(
+                current_price=10.50,
+                timestamp=t0 + timedelta(hours=4),
+                symbol="AVAXUSDT",
+            )
+            assert trail_exec is not None
+            assert trail_exec.reason == ExitReason.TRAILING_STOP.value
+            assert trail_exec.realized_pnl_usdt >= 0.40
+
+            buy_scalp = MarketSignal(
+                symbol="DOGEUSDT",
+                evaluated_at=t0 + timedelta(hours=5),
+                signal_type=SignalType.BUY,
+                reference_price=0.1000,
+                stop_loss_price=0.0985,
+                take_profit_price=0.1015,
+                atr_value=0.0008,
+                rsi_value=43.0,
+                fast_ema=0.1001,
+                slow_ema=0.0998,
+            )
+            scalp_exec = engine.process_signal(buy_scalp)
+            assert scalp_exec is not None
+            doge_pos = engine.get_open_position("DOGEUSDT")
+            assert doge_pos is not None
+            assert doge_pos.slot_role == SlotRole.SCALP
+
+            assert (
+                engine.evaluate_protective_exits(
+                    current_price=0.0955,
+                    timestamp=t0 + timedelta(hours=6),
+                    symbol="DOGEUSDT",
+                )
+                is None
+            )
+            below_be_sell = MarketSignal(
+                symbol="DOGEUSDT",
+                evaluated_at=t0 + timedelta(hours=7),
+                signal_type=SignalType.SELL,
+                reference_price=0.0999,
+                stop_loss_price=0.0980,
+                take_profit_price=0.1020,
+                atr_value=0.0008,
+                rsi_value=63.0,
+                fast_ema=0.0998,
+                slow_ema=0.0996,
+            )
+            assert engine.process_signal(below_be_sell) is None
+
+            be_sell = MarketSignal(
+                symbol="DOGEUSDT",
+                evaluated_at=t0 + timedelta(hours=8),
+                signal_type=SignalType.SELL,
+                reference_price=0.10035,
+                stop_loss_price=0.0980,
+                take_profit_price=0.1020,
+                atr_value=0.0008,
+                rsi_value=64.0,
+                fast_ema=0.1003,
+                slow_ema=0.1001,
+            )
+            be_exec = engine.process_signal(be_sell)
+            assert be_exec is not None
+            assert be_exec.reason == ExitReason.BREAKEVEN_RECOVERY.value
+            assert be_exec.realized_pnl_usdt >= 0.0
+        finally:
+            ledger.close()
+
+
+def test_dual_target_persistence_and_render_restart_role_reconciliation() -> None:
+    """Verify SQLite role persistence and deterministic Render restart inference."""
+    from crypto_paper_trader.domain import Position, SlotRole
+    from crypto_paper_trader.main import infer_reconciled_slot_roles
+
+    risk_cfg = RiskConfig.spot_dual_scalp_and_swing(
+        scalp_target_net_profit_usdt=0.030,
+        swing_target_net_profit_usdt=1.40,
+        max_concurrent_positions=3,
+        swing_slot_count=1,
+        swing_reconcile_min_notional_usdt=9.0,
+    )
+
+    ada_only_roles = infer_reconciled_slot_roles(
+        holdings=[("ADAUSDT", 45.2, 0.1450, False)],
+        free_usdt=19.8611,
+        risk_config=risk_cfg,
+    )
+    assert ada_only_roles == {"ADAUSDT": SlotRole.SCALP}
+
+    full_portfolio_roles = infer_reconciled_slot_roles(
+        holdings=[
+            ("ADAUSDT", 45.2, 0.1450, False),
+            ("LINKUSDT", 1.30, 8.92, False),
+            ("SOLUSDT", 0.103, 71.30, False),
+        ],
+        free_usdt=0.90,
+        risk_config=risk_cfg,
+    )
+    assert full_portfolio_roles["LINKUSDT"] == SlotRole.SWING
+    assert full_portfolio_roles["ADAUSDT"] == SlotRole.SCALP
+    assert full_portfolio_roles["SOLUSDT"] == SlotRole.SCALP
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_role_persist.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            t0 = datetime(2026, 11, 22, 23, 0, tzinfo=timezone.utc)
+            swing_pos = Position(
+                position_id="pos-swing-1",
+                symbol="LINKUSDT",
+                opened_at=t0,
+                entry_price=8.92,
+                quantity=1.30,
+                notional_usdt=11.596,
+                entry_fee_usdt=0.0116,
+                stop_loss_price=8.942,
+                take_profit_price=10.02,
+                peak_price=9.10,
+                slot_role=SlotRole.SWING,
+                target_net_profit_usdt=1.40,
+                trough_price=8.85,
+            )
+            ledger.save_open_position_for_symbol(swing_pos)
+            reloaded = ledger.fetch_all_open_positions()
+            assert len(reloaded) == 1
+            assert reloaded[0].slot_role == SlotRole.SWING
+            assert reloaded[0].target_net_profit_usdt == pytest.approx(1.40)
+            assert reloaded[0].trough_price == pytest.approx(8.85)
+        finally:
+            ledger.close()
+
+
+def test_dual_target_scanner_candidates_time_machine_and_alerts() -> None:
+    """Verify Swing candidate selection, Time Machine dual role, and ntfy alerts."""
+    from crypto_paper_trader.domain import SlotRole
+    from crypto_paper_trader.scanner import (
+        AssetProjectionScore,
+        select_swing_candidate_symbols,
+    )
+    from crypto_paper_trader.simulation import run_time_machine_simulation
+
+    scores = [
+        AssetProjectionScore(
+            "BTCUSDT", "STABLE_CORE", 61500.0, 0.46, 0.1, 80.0, 2.0, 4, 65.0
+        ),
+        AssetProjectionScore(
+            "LINKUSDT", "HIGH_VOLATILITY", 8.88, 0.68, 0.1, 90.0, 3.0, 4, 59.0
+        ),
+        AssetProjectionScore(
+            "AVAXUSDT", "HIGH_VOLATILITY", 6.68, 0.65, 0.1, 85.0, 2.5, 4, 58.5
+        ),
+        AssetProjectionScore(
+            "LTCUSDT", "STABLE_CORE", 40.3, 0.40, 0.05, 70.0, 1.5, 3, 52.0
+        ),
+    ]
+    swing_picks = select_swing_candidate_symbols(
+        rankings=scores,
+        blocked_symbols={"BTCUSDT"},
+        max_symbols=2,
+    )
+    assert "BTCUSDT" not in swing_picks
+    assert swing_picks == {"LINKUSDT", "AVAXUSDT"}
+
+    candles = build_synthetic_candles(count=60, start_price=10.0, step=0.05)
+    dual_risk = RiskConfig.spot_dual_scalp_and_swing()
+    now = datetime(2026, 11, 22, 23, 0, tzinfo=timezone.utc)
+    good_sig = MarketSignal(
+        symbol="LINKUSDT",
+        evaluated_at=now,
+        signal_type=SignalType.BUY,
+        reference_price=candles[-1].close_price,
+        stop_loss_price=candles[-1].close_price * 0.99,
+        take_profit_price=candles[-1].close_price * 1.02,
+        atr_value=0.10,
+        rsi_value=45.0,
+        fast_ema=candles[-1].close_price,
+        slow_ema=candles[-1].close_price * 0.997,
+    )
+    swing_tm = run_time_machine_simulation(
+        candles=candles,
+        signal=good_sig,
+        risk_config=dual_risk,
+        exchange_config=ExchangeConfig(symbol="LINKUSDT"),
+        replays_count=4_000,
+        min_win_probability_pct=52.0,
+        target_role=SlotRole.SWING,
+    )
+    assert swing_tm.approved is True
+
+    sell_exec = TradeExecution(
+        client_order_id="scalp-solusdt-sell-abc",
+        position_id="pos-sol-1",
+        symbol="SOLUSDT",
+        side=OrderSide.SELL,
+        executed_at=now,
+        execution_price=71.80,
+        quantity=0.103,
+        gross_notional_usdt=7.3954,
+        fee_usdt=0.0074,
+        realized_pnl_usdt=0.0320,
+        reason=ExitReason.TAKE_PROFIT.value,
+    )
+    sell_alert = format_execution_alert(
+        execution=sell_exec,
+        available_cash_usdt=8.25,
+        cop_per_usdt_rate=3_485.0,
+        is_live_order=True,
+        slot_role=SlotRole.SCALP,
+        target_net_profit_usdt=0.030,
+        open_positions_summary=[
+            ("ADAUSDT", 6.55, "SCALP"),
+            ("LINKUSDT", 11.60, "SWING"),
+        ],
+    )
+    assert "[SCALP ~105 COP]" in sell_alert
+    assert "ADA [SCALP], LINK [SWING]" in sell_alert
+    assert "Monedas abiertas: Ninguna" not in sell_alert
+    assert "BALANCE TOTAL: 26.40 USDT" in sell_alert
+    assert translate_exit_reason(ExitReason.BREAKEVEN_RECOVERY.value) != ""

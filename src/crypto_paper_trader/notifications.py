@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Protocol, Sequence
 
 import httpx
 
-from crypto_paper_trader.domain import OrderSide, TradeExecution
+from crypto_paper_trader.domain import OrderSide, SlotRole, TradeExecution
 from crypto_paper_trader.formatting import format_price, format_quantity
 
 if TYPE_CHECKING:
@@ -230,8 +230,25 @@ def translate_exit_reason(reason: str) -> str:
         "STOP_LOSS": "Proteccion activada para cuidar tu dinero",
         "SIGNAL_REVERSAL": "Mercado sin fuerza; venta para asegurar ganancias",
         "TRAILING_STOP": "Ganancia protegida antes de un cambio de tendencia",
+        "BREAKEVEN_RECOVERY": (
+            "Recuperacion al precio de compra con comisiones cubiertas (0 perdida)"
+        ),
     }
     return translations.get(reason, "Venta completada de forma segura")
+
+
+def _format_role_badge(
+    slot_role: SlotRole | None,
+    target_net_profit_usdt: float | None,
+    cop_per_usdt_rate: float,
+) -> str:
+    """Format a concise Spanish label identifying SCALP vs SWING target profile."""
+    if slot_role is None:
+        return ""
+    if target_net_profit_usdt is not None and target_net_profit_usdt > 0.0:
+        target_cop = target_net_profit_usdt * cop_per_usdt_rate
+        return f" [{slot_role.value} ~{target_cop:,.0f} COP]"
+    return f" [{slot_role.value}]"
 
 
 def format_execution_alert(
@@ -242,6 +259,9 @@ def format_execution_alert(
     stop_loss_price: float | None = None,
     take_profit_price: float | None = None,
     win_probability_pct: float | None = None,
+    slot_role: SlotRole | None = None,
+    target_net_profit_usdt: float | None = None,
+    open_positions_summary: Sequence[tuple[str, float, str]] | None = None,
 ) -> str:
     """Format a TradeExecution into a friendly Spanish mobile notification.
 
@@ -253,11 +273,20 @@ def format_execution_alert(
         stop_loss_price: Optional protective stop loss price for BUY alerts.
         take_profit_price: Optional target take profit price for BUY alerts.
         win_probability_pct: Optional 10,000-replay Time Machine win probability.
+        slot_role: Optional SCALP or SWING profile assigned to this position.
+        target_net_profit_usdt: Optional target net USDT gain for this slot.
+        open_positions_summary: Optional sequence of (symbol, notional_usdt, role)
+            describing all currently open portfolio positions after this trade.
 
     Returns:
         Multi-line plain Spanish summary of trade details and portfolio balances.
     """
     mode_label = "BINANCE REAL" if is_live_order else "SIMULACION"
+    role_badge = _format_role_badge(
+        slot_role=slot_role,
+        target_net_profit_usdt=target_net_profit_usdt,
+        cop_per_usdt_rate=cop_per_usdt_rate,
+    )
     base_asset = (
         execution.symbol[:-4]
         if execution.symbol.upper().endswith("USDT")
@@ -268,7 +297,11 @@ def format_execution_alert(
     if execution.side == OrderSide.BUY:
         coin_usdt = execution.gross_notional_usdt - execution.fee_usdt
         coin_cop = coin_usdt * cop_per_usdt_rate
-        total_usdt = available_cash_usdt + coin_usdt
+        if open_positions_summary:
+            all_open_usdt = sum(item[1] for item in open_positions_summary)
+            total_usdt = available_cash_usdt + all_open_usdt
+        else:
+            total_usdt = available_cash_usdt + coin_usdt
         total_cop = total_usdt * cop_per_usdt_rate
         targets_block = ""
         if take_profit_price is not None and stop_loss_price is not None:
@@ -280,6 +313,12 @@ def format_execution_alert(
                 if win_probability_pct is not None
                 else ""
             )
+            target_extra = ""
+            if target_net_profit_usdt is not None and target_net_profit_usdt > 0.0:
+                target_cop = target_net_profit_usdt * cop_per_usdt_rate
+                target_extra = (
+                    f" (+{target_net_profit_usdt:.3f} USDT / ~{target_cop:,.0f} COP)"
+                )
             floor_line = (
                 f"Piso de seguridad: Protegido en {sl_str} USDT "
                 f"(nunca vende menor a tu compra)"
@@ -288,12 +327,12 @@ def format_execution_alert(
             )
             targets_block = (
                 f"\n--- PLAN DE ESTA OPERACION ---\n"
-                f"Meta de ganancia: Vender al llegar a {tp_str} USDT\n"
+                f"Meta de ganancia: Vender al llegar a {tp_str} USDT{target_extra}\n"
                 f"{floor_line}"
                 f"{tm_line}"
             )
         return (
-            f"[{mode_label}] COMPRA DE {base_asset} REALIZADA CON EXITO\n"
+            f"[{mode_label}] COMPRA DE {base_asset}{role_badge} REALIZADA CON EXITO\n"
             f"El bot detecto una buena oportunidad y compro {base_asset}.\n"
             f"Precio de compra: {format_price(execution.execution_price)} USDT\n"
             f"Monedas adquiridas: {format_quantity(execution.quantity)} {base_asset}\n"
@@ -338,19 +377,35 @@ def format_execution_alert(
         )
 
     reason_label = translate_exit_reason(execution.reason)
+    if open_positions_summary:
+        remaining_notional = sum(item[1] for item in open_positions_summary)
+        total_balance_usdt = available_cash_usdt + remaining_notional
+        total_balance_cop = total_balance_usdt * cop_per_usdt_rate
+        open_tags = ", ".join(
+            f"{sym[:-4] if sym.upper().endswith('USDT') else sym} [{role}]"
+            for sym, _, role in open_positions_summary
+        )
+        open_line = f"Monedas abiertas: {open_tags}"
+    else:
+        total_balance_usdt = available_cash_usdt
+        total_balance_cop = cash_cop
+        open_line = (
+            "Monedas abiertas: Ninguna (100% de tu dinero esta seguro en efectivo "
+            "esperando la proxima oportunidad)."
+        )
     return (
-        f"[{mode_label}] VENTA DE {base_asset} REALIZADA\n"
+        f"[{mode_label}] VENTA DE {base_asset}{role_badge} REALIZADA\n"
         f"Moneda: {base_asset}\n"
         f"Motivo: {reason_label}\n"
         f"Precio de venta: {format_price(execution.execution_price)} USDT\n"
         f"Monedas vendidas: {format_quantity(execution.quantity)} {base_asset}\n"
-        f"Resultado de esta operacion: {sign}{execution.realized_pnl_usdt:.4f} USDT "
-        f"({sign}{pnl_cop:,.0f} COP)\n"
+        f"Resultado de esta operacion: {sign}{execution.realized_pnl_usdt:.4f} "
+        f"USDT ({sign}{pnl_cop:,.0f} COP)\n"
         f"--- ESTADO DE TU DINERO ---\n"
         f"Dinero en efectivo: {available_cash_usdt:.2f} USDT (~{cash_cop:,.0f} COP)\n"
-        f"BALANCE TOTAL: {available_cash_usdt:.2f} USDT (~{cash_cop:,.0f} COP)\n"
-        f"Monedas abiertas: Ninguna (100% de tu dinero esta seguro en efectivo "
-        f"esperando la proxima oportunidad)."
+        f"BALANCE TOTAL: {total_balance_usdt:.2f} USDT (~{total_balance_cop:,.0f} "
+        f"COP)\n"
+        f"{open_line}"
     )
 
 
@@ -418,6 +473,7 @@ def format_heartbeat_alert(
     win_rate_pct: float,
     open_positions_detail: Sequence[tuple[str, float]] | None = None,
     market_intelligence_summary: str | None = None,
+    open_positions_roles: Sequence[tuple[str, float, str]] | None = None,
 ) -> str:
     """Format a two-hour health status report into clear, human-friendly Spanish.
 
@@ -433,13 +489,25 @@ def format_heartbeat_alert(
         win_rate_pct: Percentage of winning trades.
         open_positions_detail: Optional sequence of (symbol, entry_price) pairs.
         market_intelligence_summary: Optional Spanish market research snippet.
+        open_positions_roles: Optional sequence of (symbol, entry_price, role) tuples.
 
     Returns:
         Clear status notification understandable without trading knowledge.
     """
     clean_symbol = symbol[:-4] if symbol.upper().endswith("USDT") else symbol
 
-    if open_positions_detail and len(open_positions_detail) > 1:
+    if open_positions_roles:
+        pos_items = [
+            f"{sym[:-4] if sym.upper().endswith('USDT') else sym} "
+            f"({format_price(entry)} USDT | {role})"
+            for sym, entry, role in open_positions_roles
+        ]
+        pos_line = (
+            "Operaciones actuales: "
+            + ", ".join(pos_items)
+            + ". El bot vigila cada moneda para vender con ganancia."
+        )
+    elif open_positions_detail and len(open_positions_detail) > 1:
         pos_items = [
             f"{sym[:-4] if sym.upper().endswith('USDT') else sym} "
             f"({format_price(entry)} USDT)"

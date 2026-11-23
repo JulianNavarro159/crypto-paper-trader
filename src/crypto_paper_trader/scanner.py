@@ -114,10 +114,16 @@ def evaluate_universe_projection(
     core_set = set(config.universe.core_symbols)
     scores: list[AssetProjectionScore] = []
 
+    eval_risk = replace(
+        config.risk,
+        enable_dual_target_slots=False,
+        swing_slot_count=0,
+    )
     for symbol, candles in candles_by_symbol.items():
         symbol_config = replace(
             config,
             exchange=replace(config.exchange, symbol=symbol),
+            risk=eval_risk,
         )
         report = run_historical_backtest(candles=candles, config=symbol_config)
         paired_signals = generate_vectorized_signals(
@@ -217,6 +223,44 @@ def select_qualified_universe_symbols(
     if positive_top:
         return positive_top
     return {rankings[0].symbol.upper()}
+
+
+def select_swing_candidate_symbols(
+    rankings: Sequence[AssetProjectionScore],
+    blocked_symbols: set[str] | None = None,
+    max_symbols: int = 4,
+) -> set[str]:
+    """Select volatile, high-projection universe symbols suitable for Swing holds.
+
+    Args:
+        rankings: Sorted sequence of AssetProjectionScore objects.
+        blocked_symbols: Optional uppercase symbols banned from new entries.
+        max_symbols: Maximum number of Swing-eligible symbols to approve.
+
+    Returns:
+        Set of uppercase symbol strings qualified for the high-target Swing slot.
+    """
+    if not rankings:
+        return set()
+    blocked_upper = {sym.upper() for sym in (blocked_symbols or set())}
+    eligible = [
+        item for item in rankings if item.symbol.upper() not in blocked_upper
+    ]
+    if not eligible:
+        return set()
+    ordered = sorted(
+        eligible,
+        key=lambda item: item.composite_score + (item.atr_volatility_pct * 20.0),
+        reverse=True,
+    )
+    positive_top = {
+        item.symbol.upper()
+        for item in ordered[:max_symbols]
+        if item.composite_score > 0.0
+    }
+    if positive_top:
+        return positive_top
+    return {ordered[0].symbol.upper()}
 
 
 def run_multi_asset_rotation_backtest(
