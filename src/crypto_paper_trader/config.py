@@ -48,11 +48,15 @@ class UniverseConfig:
         "ADAUSDT",
         "AVAXUSDT",
         "LINKUSDT",
+        "PEPEUSDT",
+        "NEARUSDT",
+        "WIFUSDT",
+        "UNIUSDT",
     )
 
     @property
     def all_symbols(self) -> tuple[str, ...]:
-        """Return the combined 10-asset universe tuple.
+        """Return the combined multi-asset universe tuple.
 
         Returns:
             Tuple containing both core and volatile trading pair symbols.
@@ -173,6 +177,11 @@ class RiskConfig:
     swing_trailing_min_lock_profit_usdt: float = 0.40
     enable_drawdown_breakeven_escape: bool = False
     drawdown_escape_trigger_ratio: float = 0.030
+    swing_excluded_symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "LTCUSDT")
+    portfolio_entry_stagger_seconds: float = 0.0
+    enable_anti_trap_24h_filter: bool = False
+    max_24h_range_position_ratio: float = 0.72
+    enable_universal_3d_stabilization_lock: bool = False
 
     @classmethod
     def spot_no_loss_micro_profit(
@@ -277,15 +286,27 @@ class RiskConfig:
     def spot_dual_scalp_and_swing(
         cls,
         scalp_target_net_profit_usdt: float = 0.030,
-        swing_target_net_profit_usdt: float = 1.40,
+        swing_target_net_profit_usdt: float = 0.55,
         max_concurrent_positions: int = 3,
         swing_slot_count: int = 1,
         swing_allocation_fraction: float = 0.44,
         swing_reconcile_min_notional_usdt: float = 9.0,
         enable_swing_trailing_lock: bool = True,
-        swing_trailing_arm_ratio: float = 0.065,
-        swing_trailing_pullback_ratio: float = 0.030,
-        swing_trailing_min_lock_profit_usdt: float = 0.40,
+        swing_trailing_arm_ratio: float = 0.030,
+        swing_trailing_pullback_ratio: float = 0.015,
+        swing_trailing_min_lock_profit_usdt: float = 0.20,
+        enable_scalp_trailing_runner: bool = False,
+        scalp_trailing_arm_ratio: float = 0.0048,
+        scalp_trailing_pullback_ratio: float = 0.0035,
+        swing_excluded_symbols: tuple[str, ...] = (
+            "BTCUSDT",
+            "ETHUSDT",
+            "LTCUSDT",
+        ),
+        portfolio_entry_stagger_seconds: float = 0.0,
+        enable_anti_trap_24h_filter: bool = False,
+        max_24h_range_position_ratio: float = 0.72,
+        enable_universal_3d_stabilization_lock: bool = False,
         enable_drawdown_breakeven_escape: bool = False,
         full_reset_before_epoch_ms: int = 0,
         btc_buy_lock_mode: str = "AUTO",
@@ -304,11 +325,20 @@ class RiskConfig:
             swing_trailing_arm_ratio: Gross rally ratio that arms Swing trailing stop.
             swing_trailing_pullback_ratio: Pullback ratio from peak triggering exit.
             swing_trailing_min_lock_profit_usdt: Minimum net USDT floor once armed.
+            enable_scalp_trailing_runner: Trail Scalp winners above guaranteed floor.
+            scalp_trailing_arm_ratio: Net ratio above fees that arms Scalp trailing.
+            scalp_trailing_pullback_ratio: Pullback ratio from peak for Scalp runner.
+            swing_excluded_symbols: Slow symbols prohibited from taking the Swing slot.
+            portfolio_entry_stagger_seconds: Minimum delay between correlated buys.
+            enable_anti_trap_24h_filter: Block buys near 24h highs or falling knives.
+            max_24h_range_position_ratio: Maximum 24h range percentile allowed to buy.
+            enable_universal_3d_stabilization_lock: Enforce 3-day no-drop + EMA10 lock
+                across every symbol in the universe.
             enable_drawdown_breakeven_escape: Permit fee-covered breakeven exit after
                 deep drawdowns on reversal signals.
             full_reset_before_epoch_ms: Optional UTC cutoff for one-time reset.
             btc_buy_lock_mode: BTC stabilization lock mode (AUTO/FORCE_LOCK/FORCE_OPEN).
-            btc_lock_strict_mode: Require daily EMA10 >= EMA20 to unlock BTC buys.
+            btc_lock_strict_mode: Require daily EMA10 >= EMA20 to unlock buys.
 
         Returns:
             Configured RiskConfig enforcing strict zero-loss floors across all slots.
@@ -321,7 +351,9 @@ class RiskConfig:
             time_machine_min_win_prob_pct=52.0,
             no_loss_spot_mode=True,
             min_target_net_profit_usdt=scalp_target_net_profit_usdt,
-            enable_no_loss_trailing_runner=False,
+            enable_no_loss_trailing_runner=enable_scalp_trailing_runner,
+            no_loss_trailing_arm_ratio=scalp_trailing_arm_ratio,
+            no_loss_trailing_pullback_ratio=scalp_trailing_pullback_ratio,
             allow_secondary_symbol_slot=True,
             max_concurrent_positions=max_concurrent_positions,
             enable_tranche_split=False,
@@ -342,6 +374,13 @@ class RiskConfig:
             swing_trailing_pullback_ratio=swing_trailing_pullback_ratio,
             swing_trailing_min_lock_profit_usdt=swing_trailing_min_lock_profit_usdt,
             enable_drawdown_breakeven_escape=enable_drawdown_breakeven_escape,
+            swing_excluded_symbols=swing_excluded_symbols,
+            portfolio_entry_stagger_seconds=portfolio_entry_stagger_seconds,
+            enable_anti_trap_24h_filter=enable_anti_trap_24h_filter,
+            max_24h_range_position_ratio=max_24h_range_position_ratio,
+            enable_universal_3d_stabilization_lock=(
+                enable_universal_3d_stabilization_lock
+            ),
         )
 
 

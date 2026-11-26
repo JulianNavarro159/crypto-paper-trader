@@ -866,7 +866,10 @@ class PaperTradingEngine:
         scalp_limit = max(0, max_slots - swing_limit)
         open_swing, open_scalp = self._count_positions_by_role()
 
-        is_swing_candidate = (
+        excluded_swing = {
+            sym.upper() for sym in self._risk_config.swing_excluded_symbols
+        }
+        is_swing_candidate = upper_sym not in excluded_swing and (
             not self._swing_candidate_symbols
             or upper_sym in self._swing_candidate_symbols
         )
@@ -1438,6 +1441,25 @@ class PaperTradingEngine:
                     target_pos.stop_loss_price,
                     safety_floor,
                 )
+                if self._risk_config.enable_no_loss_trailing_runner:
+                    round_trip_fee = 2.0 * self._exchange_config.taker_fee_rate
+                    arm_price = max(
+                        round(safety_floor * 1.0008, 10),
+                        round(
+                            target_pos.entry_price
+                            * (
+                                1.0
+                                + round_trip_fee
+                                + self._risk_config.no_loss_trailing_arm_ratio
+                            ),
+                            10,
+                        ),
+                    )
+                    if (
+                        target_pos.peak_price >= arm_price
+                        and signal.reference_price > target_pos.stop_loss_price
+                    ):
+                        return None
                 if signal.reference_price >= min_profitable_exit:
                     return self._close_active_position(
                         exit_price=signal.reference_price,

@@ -229,6 +229,7 @@ def select_swing_candidate_symbols(
     rankings: Sequence[AssetProjectionScore],
     blocked_symbols: set[str] | None = None,
     max_symbols: int = 4,
+    excluded_symbols: Sequence[str] = (),
 ) -> set[str]:
     """Select volatile, high-projection universe symbols suitable for Swing holds.
 
@@ -236,13 +237,16 @@ def select_swing_candidate_symbols(
         rankings: Sorted sequence of AssetProjectionScore objects.
         blocked_symbols: Optional uppercase symbols banned from new entries.
         max_symbols: Maximum number of Swing-eligible symbols to approve.
+        excluded_symbols: Optional slow core symbols excluded from Swing role.
 
     Returns:
         Set of uppercase symbol strings qualified for the high-target Swing slot.
     """
     if not rankings:
         return set()
-    blocked_upper = {sym.upper() for sym in (blocked_symbols or set())}
+    blocked_upper = {sym.upper() for sym in (blocked_symbols or set())} | {
+        sym.upper() for sym in excluded_symbols
+    }
     eligible = [
         item for item in rankings if item.symbol.upper() not in blocked_upper
     ]

@@ -4,12 +4,15 @@ import logging
 import time
 from dataclasses import dataclass, replace
 
+from typing import Sequence
+
 from crypto_paper_trader.config import TradingSystemConfig
 from crypto_paper_trader.domain import (
     Candle,
     ExitReason,
     MacroMarketRegime,
     MarketSignal,
+    OrderSide,
     PortfolioSnapshot,
     SignalType,
     SlotRole,
@@ -72,10 +75,57 @@ class RealTimeTradingOrchestrator:
         self._macro_regime: MacroMarketRegime = MacroMarketRegime.NEUTRAL
         self._cooldown_until_ts: float = 0.0
         self._cooldown_until_by_symbol: dict[str, float] = {}
+        self._last_portfolio_buy_ts: float = 0.0
         self._qualified_symbols: set[str] = set()
         self._swing_candidate_symbols: set[str] = set()
         self._buy_blocked_symbols: set[str] = set()
         self._btc_lock_reasons: tuple[str, ...] = ()
+
+    @staticmethod
+    def _evaluate_anti_trap_24h_filter(
+        rolling_candles: Sequence[Candle],
+        max_range_position_ratio: float,
+    ) -> tuple[bool, str]:
+        """Reject overextended 24h-top buys and falling-knife entries below 1h EMA21.
+
+        Args:
+            rolling_candles: Chronological buffered 15m candles for the symbol.
+            max_range_position_ratio: Maximum allowed percentile in the 24h range.
+
+        Returns:
+            Tuple of (passed, diagnostic_reason).
+        """
+        if len(rolling_candles) < 60:
+            return True, ""
+
+        window = rolling_candles[-96:]
+        high_24h = max(c.high_price for c in window)
+        low_24h = min(c.low_price for c in window)
+        range_24h = high_24h - low_24h
+        last_close = window[-1].close_price
+        if range_24h <= 1e-12:
+            return True, ""
+
+        pos_in_24h = (last_close - low_24h) / range_24h
+        if pos_in_24h > max_range_position_ratio:
+            return (
+                False,
+                f"price near 24h high (range_pos={pos_in_24h:.2f} > "
+                f"{max_range_position_ratio:.2f})",
+            )
+
+        alpha = 2.0 / (84.0 + 1.0)
+        ema_84 = rolling_candles[0].close_price
+        for item in rolling_candles[1:]:
+            ema_84 = (alpha * item.close_price) + ((1.0 - alpha) * ema_84)
+
+        if last_close < (ema_84 * 0.985) and pos_in_24h > 0.22:
+            return (
+                False,
+                f"falling structure below 1h EMA21 (close={format_price(last_close)} "
+                f"< ema84={format_price(ema_84)}, range_pos={pos_in_24h:.2f})",
+            )
+        return True, ""
 
     def set_macro_regime(self, regime: MacroMarketRegime) -> None:
         """Update the active macro market regime classification.
@@ -111,17 +161,23 @@ class RealTimeTradingOrchestrator:
         self._engine.set_swing_candidate_symbols(self._swing_candidate_symbols)
 
     def set_market_intelligence(self, report: MarketIntelligenceReport) -> None:
-        """Apply BTC stabilization lock and market intelligence state to engine.
+        """Apply 3-day stabilization locks and market intelligence state to engine.
 
         Args:
             report: Latest MarketIntelligenceReport from MarketIntelligenceService.
         """
+        blocked: set[str] = set()
+        if (
+            self._config.risk.enable_universal_3d_stabilization_lock
+            and report.locked_symbols
+        ):
+            blocked.update(sym.upper() for sym in report.locked_symbols)
         if report.btc_lock_state == BtcLockState.LOCKED:
-            self._buy_blocked_symbols = {"BTCUSDT"}
+            blocked.add("BTCUSDT")
             self._btc_lock_reasons = report.reasons
         else:
-            self._buy_blocked_symbols = set()
             self._btc_lock_reasons = ()
+        self._buy_blocked_symbols = blocked
         self._engine.set_buy_blocked_symbols(self._buy_blocked_symbols)
         if self._qualified_symbols:
             self._qualified_symbols = {
@@ -334,20 +390,37 @@ class RealTimeTradingOrchestrator:
                 config=self._config.strategy,
             )
 
+        can_enter_now = self._engine.can_open_or_dca_symbol(
+            target_symbol, candle.close_price
+        )
+        if (
+            signal.signal_type == SignalType.BUY
+            and self._engine.has_position(target_symbol)
+            and not can_enter_now
+        ):
+            signal = replace(signal, signal_type=SignalType.HOLD)
+
         if (
             signal.signal_type == SignalType.BUY
             and target_symbol in self._buy_blocked_symbols
         ):
-            reason_msg = (
-                "; ".join(self._btc_lock_reasons)
-                if self._btc_lock_reasons
-                else "mercado bajista"
-            )
-            logger.info(
-                "Suppressed BUY signal on %s: BTC stabilization lock active (%s).",
-                signal.symbol,
-                reason_msg,
-            )
+            if target_symbol == "BTCUSDT":
+                reason_msg = (
+                    "; ".join(self._btc_lock_reasons)
+                    if self._btc_lock_reasons
+                    else "mercado bajista"
+                )
+                logger.info(
+                    "Suppressed BUY signal on %s: BTC stabilization lock active (%s).",
+                    signal.symbol,
+                    reason_msg,
+                )
+            else:
+                logger.info(
+                    "Suppressed BUY signal on %s: 3-day stabilization lock active "
+                    "(waiting for 3d higher low + close above daily EMA10).",
+                    signal.symbol,
+                )
             signal = replace(signal, signal_type=SignalType.HOLD)
 
         active_cooldown_deadline = (
@@ -450,6 +523,41 @@ class RealTimeTradingOrchestrator:
             )
             signal = replace(signal, signal_type=SignalType.HOLD)
 
+        if (
+            signal.signal_type == SignalType.BUY
+            and self._config.risk.enable_anti_trap_24h_filter
+        ):
+            passed_anti_trap, trap_reason = self._evaluate_anti_trap_24h_filter(
+                rolling_candles=rolling_candles,
+                max_range_position_ratio=(
+                    self._config.risk.max_24h_range_position_ratio
+                ),
+            )
+            if not passed_anti_trap:
+                logger.info(
+                    "Suppressed BUY signal on %s by 24h/1h anti-trap filter (%s).",
+                    signal.symbol,
+                    trap_reason,
+                )
+                signal = replace(signal, signal_type=SignalType.HOLD)
+
+        stagger_secs = self._config.risk.portfolio_entry_stagger_seconds
+        if (
+            signal.signal_type == SignalType.BUY
+            and stagger_secs > 0.0
+            and self._engine.has_any_position()
+            and self._last_portfolio_buy_ts > 0.0
+            and signal.rsi_value > 30.0
+            and (candle.close_time.timestamp() - self._last_portfolio_buy_ts)
+            < stagger_secs
+        ):
+            logger.info(
+                "Suppressed BUY signal on %s: portfolio entry stagger active (%.0fs).",
+                signal.symbol,
+                stagger_secs,
+            )
+            signal = replace(signal, signal_type=SignalType.HOLD)
+
         tm_win_prob: float | None = None
         tm_alloc: float | None = None
         can_enter_now = self._engine.can_open_or_dca_symbol(
@@ -505,6 +613,8 @@ class RealTimeTradingOrchestrator:
                 win_probability_pct=tm_win_prob,
                 allocation_fraction=tm_alloc,
             )
+            if signal_exec is not None and signal_exec.side == OrderSide.BUY:
+                self._last_portfolio_buy_ts = candle.close_time.timestamp()
             if (
                 signal_exec is not None
                 and signal_exec.reason

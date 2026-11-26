@@ -600,6 +600,23 @@ def format_market_intelligence_alert(report: MarketIntelligenceReport) -> str:
         else "No disponible"
     )
     reasons_text = "; ".join(report.reasons)
+    total_tracked = len(report.locked_symbols) + len(report.unlocked_symbols)
+    universe_lock_line = ""
+    if total_tracked > 1:
+        open_names = ", ".join(
+            sym[:-4] if sym.endswith("USDT") else sym
+            for sym in report.unlocked_symbols
+        )
+        open_display = (
+            open_names
+            if open_names
+            else "En observacion (esperando 2da confirmacion)"
+        )
+        universe_lock_line = (
+            f"\nCandado 3 dias sin caidas (todas las monedas): "
+            f"{len(report.unlocked_symbols)}/{total_tracked} habilitadas "
+            f"({open_display})"
+        )
     return (
         "INVESTIGACION DEL MERCADO CRIPTO\n"
         f"Estado de compras en BTC: {lock_line}\n"
@@ -608,7 +625,8 @@ def format_market_intelligence_alert(report: MarketIntelligenceReport) -> str:
         f"(EMA10 diaria: {format_price(report.btc_daily_ema10)} USDT | "
         f"24h: {report.btc_change_24h_pct:+.2f}%)\n"
         f"Mercado global 24h: {mcap_text} | Monedas al alza: "
-        f"{report.universe_breadth_pct:.0f}%\n"
+        f"{report.universe_breadth_pct:.0f}%"
+        f"{universe_lock_line}\n"
         f"Motivo: {reasons_text}"
     )
 

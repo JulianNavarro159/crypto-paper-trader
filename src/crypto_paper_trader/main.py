@@ -314,12 +314,15 @@ def infer_reconciled_slot_roles(
         estimated_equity * 0.36,
     )
 
+    excluded_swing = {sym.upper() for sym in risk_config.swing_excluded_symbols}
     assigned_swings = 0
     for upper_sym, notional_val in sorted(
         notional_by_sym, key=lambda item: item[1], reverse=True
     ):
         if assigned_swings >= risk_config.swing_slot_count:
             break
+        if upper_sym in excluded_swing:
+            continue
         if notional_val >= swing_threshold:
             roles[upper_sym] = SlotRole.SWING
             assigned_swings += 1
@@ -333,7 +336,7 @@ def _build_heartbeat_intel_summary(
     if report is None:
         return None
     lock_label = (
-        "BLOQUEADO hasta estabilizacion"
+        "BLOQUEADO hasta estabilizacion (3d + EMA10)"
         if report.btc_lock_state == BtcLockState.LOCKED
         else "HABILITADO"
     )
@@ -342,10 +345,23 @@ def _build_heartbeat_intel_summary(
         if report.fear_greed_value is not None
         else "NA"
     )
+    total_tracked = len(report.locked_symbols) + len(report.unlocked_symbols)
+    universe_line = ""
+    if total_tracked > 1:
+        open_names = ", ".join(
+            sym[:-4] if sym.endswith("USDT") else sym
+            for sym in report.unlocked_symbols
+        )
+        open_display = open_names if open_names else "Ninguna aun"
+        universe_line = (
+            f"\nCandado 3 dias (universo): {len(report.unlocked_symbols)}/"
+            f"{total_tracked} habilitadas ({open_display})"
+        )
     return (
         f"Investigacion de mercado: Clima {report.risk_level.value} "
         f"(Fear & Greed: {fg_label} | Al alza: {report.universe_breadth_pct:.0f}%)\n"
         f"Compras en BTC: {lock_label}"
+        f"{universe_line}"
     )
 
 
@@ -481,15 +497,23 @@ async def run_application(args: argparse.Namespace) -> None:
         ),
         risk=RiskConfig.spot_dual_scalp_and_swing(
             scalp_target_net_profit_usdt=0.030,
-            swing_target_net_profit_usdt=1.40,
+            swing_target_net_profit_usdt=0.55,
             max_concurrent_positions=3,
             swing_slot_count=1,
             swing_allocation_fraction=0.44,
             swing_reconcile_min_notional_usdt=9.0,
             enable_swing_trailing_lock=True,
-            swing_trailing_arm_ratio=0.065,
-            swing_trailing_pullback_ratio=0.030,
-            swing_trailing_min_lock_profit_usdt=0.40,
+            swing_trailing_arm_ratio=0.030,
+            swing_trailing_pullback_ratio=0.015,
+            swing_trailing_min_lock_profit_usdt=0.20,
+            enable_scalp_trailing_runner=True,
+            scalp_trailing_arm_ratio=0.0048,
+            scalp_trailing_pullback_ratio=0.0035,
+            swing_excluded_symbols=("BTCUSDT", "ETHUSDT", "LTCUSDT"),
+            portfolio_entry_stagger_seconds=2700.0,
+            enable_anti_trap_24h_filter=True,
+            max_24h_range_position_ratio=0.72,
+            enable_universal_3d_stabilization_lock=True,
             enable_drawdown_breakeven_escape=False,
             full_reset_before_epoch_ms=reset_cutoff_ms,
             btc_buy_lock_mode=btc_lock_mode,
@@ -684,9 +708,14 @@ async def run_application(args: argparse.Namespace) -> None:
         exchange_config=config.exchange,
         mode=config.risk.btc_buy_lock_mode,
         strict=config.risk.btc_lock_strict_mode,
+        tracked_symbols=(
+            config.universe.all_symbols
+            if config.risk.enable_universal_3d_stabilization_lock
+            else ("BTCUSDT",)
+        ),
     )
     latest_intel_report: MarketIntelligenceReport | None = None
-    last_alerted_intel_key: tuple[BtcLockState, MarketRiskLevel] | None = None
+    last_alerted_intel_key: tuple[BtcLockState, MarketRiskLevel, bool] | None = None
 
     if existing_open_pos is not None:
         config = replace(
@@ -721,23 +750,24 @@ async def run_application(args: argparse.Namespace) -> None:
                 "MARKET INTELLIGENCE | %s",
                 format_market_intelligence_log(latest_intel_report),
             )
-            filtered_rankings = (
-                [r for r in rankings if r.symbol.upper() != "BTCUSDT"]
-                if latest_intel_report.btc_lock_state == BtcLockState.LOCKED
-                else rankings
-            )
-            blocked_initial = (
-                {"BTCUSDT"}
-                if latest_intel_report.btc_lock_state == BtcLockState.LOCKED
-                else set()
-            )
+            blocked_initial: set[str] = set()
+            if config.risk.enable_universal_3d_stabilization_lock:
+                blocked_initial.update(
+                    sym.upper() for sym in latest_intel_report.locked_symbols
+                )
+            if latest_intel_report.btc_lock_state == BtcLockState.LOCKED:
+                blocked_initial.add("BTCUSDT")
+            filtered_rankings = [
+                r for r in rankings if r.symbol.upper() not in blocked_initial
+            ]
             initial_qualified_symbols = select_qualified_universe_symbols(
-                filtered_rankings or rankings, max_symbols=6
+                filtered_rankings or rankings, max_symbols=8
             )
             initial_swing_candidates = select_swing_candidate_symbols(
                 rankings=rankings,
                 blocked_symbols=blocked_initial,
-                max_symbols=4,
+                max_symbols=5,
+                excluded_symbols=config.risk.swing_excluded_symbols,
             )
             pick_pool = filtered_rankings or rankings
             if pick_pool:
@@ -799,6 +829,7 @@ async def run_application(args: argparse.Namespace) -> None:
         last_alerted_intel_key = (
             latest_intel_report.btc_lock_state,
             latest_intel_report.risk_level,
+            bool(latest_intel_report.unlocked_symbols),
         )
         notifier.send_alert(format_market_intelligence_alert(latest_intel_report))
 
@@ -937,6 +968,7 @@ async def run_application(args: argparse.Namespace) -> None:
                     current_intel_key = (
                         latest_intel_report.btc_lock_state,
                         latest_intel_report.risk_level,
+                        bool(latest_intel_report.unlocked_symbols),
                     )
                     if (
                         args.mode == "live"
@@ -946,26 +978,27 @@ async def run_application(args: argparse.Namespace) -> None:
                         notifier.send_alert(
                             format_market_intelligence_alert(latest_intel_report)
                         )
-                    filtered_rankings = (
-                        [r for r in rankings if r.symbol.upper() != "BTCUSDT"]
-                        if latest_intel_report.btc_lock_state == BtcLockState.LOCKED
-                        else rankings
-                    )
-                    blocked_rescan = (
-                        {"BTCUSDT"}
-                        if latest_intel_report.btc_lock_state == BtcLockState.LOCKED
-                        else set()
-                    )
+                    blocked_rescan: set[str] = set()
+                    if config.risk.enable_universal_3d_stabilization_lock:
+                        blocked_rescan.update(
+                            sym.upper() for sym in latest_intel_report.locked_symbols
+                        )
+                    if latest_intel_report.btc_lock_state == BtcLockState.LOCKED:
+                        blocked_rescan.add("BTCUSDT")
+                    filtered_rankings = [
+                        r for r in rankings if r.symbol.upper() not in blocked_rescan
+                    ]
                     orchestrator.set_qualified_symbols(
                         select_qualified_universe_symbols(
-                            filtered_rankings or rankings, max_symbols=6
+                            filtered_rankings or rankings, max_symbols=8
                         )
                     )
                     orchestrator.set_swing_candidate_symbols(
                         select_swing_candidate_symbols(
                             rankings=rankings,
                             blocked_symbols=blocked_rescan,
-                            max_symbols=4,
+                            max_symbols=5,
+                            excluded_symbols=config.risk.swing_excluded_symbols,
                         )
                     )
                     for sym_candles in universe_candles.values():

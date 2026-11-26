@@ -3533,56 +3533,423 @@ def test_dual_target_scanner_candidates_time_machine_and_alerts() -> None:
     assert translate_exit_reason(ExitReason.BREAKEVEN_RECOVERY.value) != ""
 
 
-def test_btc_short_term_stabilization_unlock_and_relock_without_ping_pong() -> None:
-    """Verify 2-day higher lows + EMA5 unlocks BTC cleanly and relocks on breakdown."""
+def test_universal_3d_stabilization_lock_across_all_symbols_and_orchestrator() -> None:
+    """Verify strict 3-day no-drop + EMA10 lock applies independently to all coins."""
     from crypto_paper_trader.market_intelligence import (
         BtcLockState,
+        MarketIntelligenceService,
         evaluate_btc_stabilization,
+        evaluate_symbol_stabilization,
     )
+    from crypto_paper_trader.notifications import format_market_intelligence_alert
 
     base_closes = [72_000.0 - (idx * 550.0) for idx in range(18)]
     base_lows = [p - 400.0 for p in base_closes]
-
-    crash_closes = base_closes + [61_986.7, 58_951.5, 60_215.8]
-    crash_lows = base_lows + [61_428.3, 57_778.3, 55_130.0]
-    crash_candles = _build_daily_btc_series(crash_closes, crash_lows)
-    state_day1, _ = evaluate_btc_stabilization(
-        crash_candles, previous_state=BtcLockState.LOCKED, repaired_streak=2
+    bounce_below_ema10_closes = base_closes + [
+        61_986.7,
+        58_951.5,
+        60_215.8,
+        61_271.1,
+        61_480.0,
+    ]
+    bounce_below_ema10_lows = base_lows + [
+        61_428.3,
+        57_778.3,
+        55_130.0,
+        58_768.5,
+        60_386.0,
+    ]
+    btc_below_ema10 = _build_daily_btc_series(
+        bounce_below_ema10_closes, bounce_below_ema10_lows
     )
-    assert state_day1 == BtcLockState.LOCKED
-
-    stab_closes = crash_closes + [61_271.1, 61_480.0]
-    stab_lows = crash_lows + [58_768.5, 60_386.0]
-    stab_candles = _build_daily_btc_series(stab_closes, stab_lows)
-
-    state_first, _ = evaluate_btc_stabilization(
-        stab_candles, previous_state=BtcLockState.LOCKED, repaired_streak=1
+    state_btc, _ = evaluate_btc_stabilization(
+        btc_below_ema10, previous_state=BtcLockState.LOCKED, repaired_streak=2
     )
-    assert state_first == BtcLockState.LOCKED
+    assert state_btc == BtcLockState.LOCKED
 
-    state_open, open_reasons = evaluate_btc_stabilization(
-        stab_candles, previous_state=BtcLockState.LOCKED, repaired_streak=2
-    )
-    assert state_open == BtcLockState.OPEN
-    assert "EMA5" in open_reasons[0]
+    healthy_closes = [100.0 - (idx * 0.8) for idx in range(18)] + [
+        88.0,
+        90.0,
+        93.0,
+        96.0,
+        98.5,
+    ]
+    healthy_lows = [p - 0.5 for p in healthy_closes]
+    healthy_lows[15] = 82.0
+    healthy_lows[-3:] = [91.0, 94.0, 96.5]
+    sol_healthy = [
+        replace(c, symbol="SOLUSDT")
+        for c in _build_daily_btc_series(healthy_closes, healthy_lows)
+    ]
+    wif_healthy = [
+        replace(c, symbol="WIFUSDT")
+        for c in _build_daily_btc_series(healthy_closes, healthy_lows)
+    ]
+    eth_weak = [replace(c, symbol="ETHUSDT") for c in btc_below_ema10]
 
-    state_strict, _ = evaluate_btc_stabilization(
-        stab_candles,
+    state_sol_open, _ = evaluate_symbol_stabilization(
+        "SOLUSDT",
+        sol_healthy,
         previous_state=BtcLockState.LOCKED,
-        strict=True,
         repaired_streak=2,
     )
-    assert state_strict == BtcLockState.LOCKED
+    assert state_sol_open == BtcLockState.OPEN
 
-    state_hold_open, _ = evaluate_btc_stabilization(
-        stab_candles, previous_state=BtcLockState.OPEN
-    )
-    assert state_hold_open == BtcLockState.OPEN
+    series_map = {
+        "BTCUSDT": btc_below_ema10,
+        "ETHUSDT": eth_weak,
+        "SOLUSDT": sol_healthy,
+        "WIFUSDT": wif_healthy,
+    }
 
-    breakdown_closes = stab_closes + [59_900.0]
-    breakdown_lows = stab_lows + [58_600.0]
-    breakdown_candles = _build_daily_btc_series(breakdown_closes, breakdown_lows)
-    state_relock, _ = evaluate_btc_stabilization(
-        breakdown_candles, previous_state=BtcLockState.OPEN
+    async def _run_multi() -> None:
+        async def fetch_by_sym(sym: str) -> list[Candle]:
+            return series_map[sym]
+
+        async def fetch_fg() -> int:
+            return 25
+
+        async def fetch_mcap() -> float:
+            return 0.5
+
+        svc = MarketIntelligenceService(
+            exchange_config=ExchangeConfig(),
+            mode="AUTO",
+            tracked_symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT", "WIFUSDT"),
+            daily_candles_by_symbol_fetcher=fetch_by_sym,
+            fear_greed_fetcher=fetch_fg,
+            global_mcap_fetcher=fetch_mcap,
+        )
+        rep1 = await svc.refresh(force=True)
+        assert rep1.unlocked_symbols == ()
+        assert set(rep1.locked_symbols) == {"BTCUSDT", "ETHUSDT", "SOLUSDT", "WIFUSDT"}
+
+        rep2 = await svc.refresh(force=False)
+        assert rep2.btc_lock_state == BtcLockState.LOCKED
+        assert rep2.unlocked_symbols == ("SOLUSDT", "WIFUSDT")
+        assert rep2.locked_symbols == ("BTCUSDT", "ETHUSDT")
+
+        alert_txt = format_market_intelligence_alert(rep2)
+        assert "Candado 3 dias sin caidas (todas las monedas): 2/4" in alert_txt
+        assert "SOL, WIF" in alert_txt
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "universal_lock.db"
+            ledger = LedgerRepository(db_path=db_path)
+            try:
+                cfg = TradingSystemConfig(
+                    risk=RiskConfig.spot_dual_scalp_and_swing(
+                        enable_universal_3d_stabilization_lock=True
+                    ),
+                    ledger_db_path=db_path,
+                )
+                engine = PaperTradingEngine(
+                    capital_config=cfg.capital,
+                    exchange_config=cfg.exchange,
+                    risk_config=cfg.risk,
+                    ledger=ledger,
+                )
+                provider = BinanceMarketDataClient(
+                    config=cfg.exchange,
+                    symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT", "WIFUSDT"),
+                )
+                orch = RealTimeTradingOrchestrator(
+                    config=cfg,
+                    market_data_provider=provider,
+                    trading_engine=engine,
+                    multi_symbol_mode=True,
+                )
+                orch.set_market_intelligence(rep2)
+                assert engine.can_open_position_for_symbol("BTCUSDT") is False
+                assert engine.can_open_position_for_symbol("ETHUSDT") is False
+                assert engine.can_open_position_for_symbol("SOLUSDT") is True
+                assert engine.can_open_position_for_symbol("WIFUSDT") is True
+            finally:
+                ledger.close()
+
+    asyncio.run(_run_multi())
+
+
+def test_scalp_trailing_runner_swing_exclusion_and_btc_reclassification() -> None:
+    """Verify slow-coin Swing exclusion, BTC SCALP reclassification, and runner."""
+    from crypto_paper_trader.domain import SlotRole
+    from crypto_paper_trader.main import infer_reconciled_slot_roles
+    from crypto_paper_trader.scanner import (
+        AssetProjectionScore,
+        select_swing_candidate_symbols,
     )
-    assert state_relock == BtcLockState.LOCKED
+
+    risk_cfg = RiskConfig.spot_dual_scalp_and_swing(
+        scalp_target_net_profit_usdt=0.030,
+        swing_target_net_profit_usdt=0.55,
+        enable_scalp_trailing_runner=True,
+        scalp_trailing_arm_ratio=0.0048,
+        scalp_trailing_pullback_ratio=0.0035,
+        swing_excluded_symbols=("BTCUSDT", "ETHUSDT", "LTCUSDT"),
+    )
+
+    reconciled_nov26 = infer_reconciled_slot_roles(
+        holdings=[
+            ("BTCUSDT", 0.000190, 61_204.01, False),
+            ("ETHUSDT", 0.004300, 1_744.30, False),
+            ("AVAXUSDT", 1.0700, 6.8140, False),
+        ],
+        free_usdt=0.42,
+        risk_config=risk_cfg,
+    )
+    assert reconciled_nov26["BTCUSDT"] == SlotRole.SCALP
+    assert reconciled_nov26["ETHUSDT"] == SlotRole.SCALP
+    assert reconciled_nov26["AVAXUSDT"] == SlotRole.SCALP
+
+    reconciled_alt_swing = infer_reconciled_slot_roles(
+        holdings=[
+            ("SOLUSDT", 0.165, 71.0, False),
+            ("ADAUSDT", 45.2, 0.145, False),
+        ],
+        free_usdt=8.0,
+        risk_config=risk_cfg,
+    )
+    assert reconciled_alt_swing["SOLUSDT"] == SlotRole.SWING
+    assert reconciled_alt_swing["ADAUSDT"] == SlotRole.SCALP
+
+    scores = [
+        AssetProjectionScore(
+            "BTCUSDT", "STABLE_CORE", 60500.0, 0.35, 0.2, 100.0, 99.9, 5, 72.0
+        ),
+        AssetProjectionScore(
+            "ETHUSDT", "STABLE_CORE", 1690.0, 0.41, 0.2, 100.0, 99.9, 5, 65.0
+        ),
+        AssetProjectionScore(
+            "WIFUSDT", "HIGH_VOLATILITY", 0.14, 0.72, 0.5, 100.0, 99.9, 5, 62.0
+        ),
+        AssetProjectionScore(
+            "NEARUSDT", "HIGH_VOLATILITY", 3.08, 0.85, 0.4, 100.0, 99.9, 4, 60.0
+        ),
+    ]
+    picks = select_swing_candidate_symbols(
+        rankings=scores,
+        blocked_symbols=set(),
+        max_symbols=3,
+        excluded_symbols=("BTCUSDT", "ETHUSDT", "LTCUSDT"),
+    )
+    assert picks == {"WIFUSDT", "NEARUSDT"}
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "runner_test.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            engine = PaperTradingEngine(
+                capital_config=CapitalConfig(
+                    initial_capital_cop=92_600.0, cop_per_usdt_rate=3_485.0
+                ),
+                exchange_config=ExchangeConfig(symbol="SOLUSDT", taker_fee_rate=0.001),
+                risk_config=risk_cfg,
+                ledger=ledger,
+            )
+            assert engine.resolve_next_slot_role("BTCUSDT") == SlotRole.SCALP
+            assert engine.resolve_next_slot_role("WIFUSDT") == SlotRole.SWING
+
+            t0 = datetime(2026, 11, 26, 14, 0, tzinfo=timezone.utc)
+            btc_buy = MarketSignal(
+                symbol="BTCUSDT",
+                evaluated_at=t0,
+                signal_type=SignalType.BUY,
+                reference_price=60_000.0,
+                stop_loss_price=59_600.0,
+                take_profit_price=60_500.0,
+                atr_value=200.0,
+                rsi_value=44.0,
+                fast_ema=60_050.0,
+                slow_ema=59_950.0,
+            )
+            buy_exec = engine.process_signal(btc_buy)
+            assert buy_exec is not None
+            pos = engine.get_open_position("BTCUSDT")
+            assert pos is not None
+            assert pos.slot_role == SlotRole.SCALP
+
+            assert (
+                engine.evaluate_protective_exits(
+                    current_price=61_320.0,
+                    timestamp=t0 + timedelta(minutes=15),
+                    symbol="BTCUSDT",
+                )
+                is None
+            )
+            early_rev = MarketSignal(
+                symbol="BTCUSDT",
+                evaluated_at=t0 + timedelta(minutes=16),
+                signal_type=SignalType.SELL,
+                reference_price=61_250.0,
+                stop_loss_price=60_000.0,
+                take_profit_price=62_000.0,
+                atr_value=200.0,
+                rsi_value=66.0,
+                fast_ema=61_100.0,
+                slow_ema=60_800.0,
+            )
+            assert engine.process_signal(early_rev) is None
+
+            trail_exec = engine.evaluate_protective_exits(
+                current_price=61_080.0,
+                timestamp=t0 + timedelta(minutes=20),
+                symbol="BTCUSDT",
+            )
+            assert trail_exec is not None
+            assert trail_exec.reason == ExitReason.TRAILING_STOP.value
+            assert trail_exec.realized_pnl_usdt > 0.10
+        finally:
+            ledger.close()
+
+
+def test_anti_trap_24h_filter_stagger_and_held_buy_silence(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify 24h/1h anti-trap filter, portfolio stagger, and quiet held BUY ticks."""
+    import logging
+
+    overextended = build_synthetic_candles(count=96, start_price=100.0, step=0.25)
+    passed_top, reason_top = RealTimeTradingOrchestrator._evaluate_anti_trap_24h_filter(
+        overextended, max_range_position_ratio=0.72
+    )
+    assert passed_top is False
+    assert "24h high" in reason_top
+
+    base_t = datetime(2026, 11, 25, 0, 0, tzinfo=timezone.utc)
+    falling_knife: list[Candle] = []
+    for idx in range(96):
+        price = 100.0 + (idx * 0.2 if idx < 50 else (10.0 - (idx - 50) * 0.14))
+        falling_knife.append(
+            Candle(
+                symbol="SOLUSDT",
+                open_time=base_t + timedelta(minutes=15 * idx),
+                close_time=base_t + timedelta(minutes=15 * idx + 14),
+                open_price=price - 0.1,
+                high_price=price + 0.3,
+                low_price=price - 0.3,
+                close_price=price,
+                volume=100.0,
+                is_closed=True,
+            )
+        )
+    passed_knife, reason_knife = (
+        RealTimeTradingOrchestrator._evaluate_anti_trap_24h_filter(
+            falling_knife, max_range_position_ratio=0.72
+        )
+    )
+    assert passed_knife is False
+    assert "EMA21" in reason_knife
+
+    healthy_pullback: list[Candle] = []
+    for idx in range(96):
+        price = 100.0 + (idx * 0.10 if idx < 80 else (8.0 - (idx - 80) * 0.18))
+        healthy_pullback.append(
+            Candle(
+                symbol="SOLUSDT",
+                open_time=base_t + timedelta(minutes=15 * idx),
+                close_time=base_t + timedelta(minutes=15 * idx + 14),
+                open_price=price - 0.1,
+                high_price=price + 0.3,
+                low_price=price - 0.3,
+                close_price=price,
+                volume=100.0,
+                is_closed=True,
+            )
+        )
+    passed_pb, _ = RealTimeTradingOrchestrator._evaluate_anti_trap_24h_filter(
+        healthy_pullback, max_range_position_ratio=0.72
+    )
+    assert passed_pb is True
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "stagger_test.db"
+        ledger = LedgerRepository(db_path=db_path)
+        try:
+            cfg = TradingSystemConfig(
+                capital=CapitalConfig(
+                    initial_capital_cop=92_600.0, cop_per_usdt_rate=3_485.0
+                ),
+                exchange=ExchangeConfig(symbol="SOLUSDT"),
+                risk=replace(
+                    RiskConfig.spot_dual_scalp_and_swing(
+                        portfolio_entry_stagger_seconds=2700.0,
+                        enable_anti_trap_24h_filter=False,
+                    ),
+                    enable_time_machine_gate=False,
+                ),
+                ledger_db_path=db_path,
+            )
+            engine = PaperTradingEngine(
+                capital_config=cfg.capital,
+                exchange_config=cfg.exchange,
+                risk_config=cfg.risk,
+                ledger=ledger,
+            )
+            provider = BinanceMarketDataClient(
+                config=cfg.exchange, symbols=("SOLUSDT", "XRPUSDT")
+            )
+            orch = RealTimeTradingOrchestrator(
+                config=cfg,
+                market_data_provider=provider,
+                trading_engine=engine,
+                multi_symbol_mode=True,
+            )
+            sol_cs = [
+                replace(c, symbol="SOLUSDT")
+                for c in build_synthetic_candles(count=35, start_price=70.0, step=0.1)
+            ]
+            xrp_cs = [
+                replace(c, symbol="XRPUSDT")
+                for c in build_synthetic_candles(count=35, start_price=0.95, step=0.002)
+            ]
+            for c in sol_cs[:-1]:
+                orch._upsert_candle(c)
+            for c in xrp_cs[:-1]:
+                orch._upsert_candle(c)
+
+            monkeypatch.setattr(
+                "crypto_paper_trader.orchestration.evaluate_market_signal",
+                lambda candles, symbol, config: MarketSignal(
+                    symbol=symbol,
+                    evaluated_at=candles[-1].close_time,
+                    signal_type=SignalType.BUY,
+                    reference_price=candles[-1].close_price,
+                    stop_loss_price=candles[-1].close_price * 0.992,
+                    take_profit_price=candles[-1].close_price * 1.01,
+                    atr_value=candles[-1].close_price * 0.005,
+                    rsi_value=45.0,
+                    fast_ema=candles[-1].close_price,
+                    slow_ema=candles[-1].close_price * 0.999,
+                ),
+            )
+            orch.process_candle_event(sol_cs[-1])
+            assert engine.has_position("SOLUSDT") is True
+
+            soon_xrp = replace(
+                xrp_cs[-1],
+                open_time=sol_cs[-1].open_time + timedelta(minutes=5),
+                close_time=sol_cs[-1].close_time + timedelta(minutes=5),
+            )
+            orch.process_candle_event(soon_xrp)
+            assert engine.has_position("XRPUSDT") is False
+
+            with caplog.at_level(logging.INFO):
+                caplog.clear()
+                held_sol_tick = replace(
+                    sol_cs[-1],
+                    open_time=sol_cs[-1].open_time + timedelta(minutes=10),
+                    close_time=sol_cs[-1].close_time + timedelta(minutes=10),
+                )
+                orch.process_candle_event(held_sol_tick)
+                assert "Suppressed BUY" not in caplog.text
+
+            later_xrp = replace(
+                xrp_cs[-1],
+                open_time=sol_cs[-1].open_time + timedelta(minutes=50),
+                close_time=sol_cs[-1].close_time + timedelta(minutes=50),
+            )
+            orch.process_candle_event(later_xrp)
+            assert engine.has_position("XRPUSDT") is True
+        finally:
+            ledger.close()
